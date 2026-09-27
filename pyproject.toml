@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verifier-drift"
+version = "0.0.1"
+description = "Does a fixed verifier's error drift under RLVR and bias GRPO training?"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []  # analysis core is stdlib-only
+
+[project.optional-dependencies]
+oracle = ["sympy>=1.12"]
+train = ["torch>=2.2", "transformers>=4.44", "trl>=0.11", "datasets>=2.20", "sympy>=1.12", "numpy>=1.26"]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
