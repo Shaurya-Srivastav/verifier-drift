@@ -209,13 +209,14 @@ def test_reliability_table_uses_train_rows_and_divides_by_length() -> None:
     table = SimpleNamespace(split=split, pid=pid, V={"a": reward})
     tr = split == "train"
 
-    rows = reliability_table(features, lengths, table, {"a": 0.5}, 0.8, seed=3)
-    expected = reliability_budget(features[tr], pid[tr], reward[tr], lengths[tr], seed=3)
+    rows = reliability_table(features, lengths, table, {"a": 0.5}, 0.8)
+    expected = reliability_budget(features[tr], pid[tr], reward[tr], lengths[tr])
     assert rows["a"]["signal"] == pytest.approx(expected["signal"])
+    assert rows["a"]["within"] == pytest.approx(expected["within"])
     assert rows["a"]["measured"] == 0.5
     assert rows["a"]["predicted"] == pytest.approx(predicted_reliability(expected, n_train, n))
     assert rows["a"]["prompts_needed"] == prompts_for_reliability(expected, 0.8, n)
-    undivided = reliability_table(features, None, table, {"a": 0.5}, 0.8, seed=3)
+    undivided = reliability_table(features, None, table, {"a": 0.5}, 0.8)
     assert undivided["a"]["signal"] != pytest.approx(rows["a"]["signal"])
 
 

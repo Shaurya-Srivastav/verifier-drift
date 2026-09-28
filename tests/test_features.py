@@ -14,7 +14,7 @@ pytest.importorskip("peft")
 import torch
 
 from test_gen_hf import build_tiny_qwen, qwen_tokenizer
-from vfates.features.hidden import _truncate_left, hidden_features
+from vfates.features.hidden import _pad_batch, _truncate_left, hidden_features
 from vfates.features.lora_grad import lora_grad_features
 from vfates.features.lora_init import LORA_INIT_SCHEMA, load_lora_init
 from vfates.gen.chat import encode_completion, encode_prompt_completion, prompt_completion_ids
@@ -92,8 +92,41 @@ def test_batching_and_padding_side_are_invariant():
         batched = hidden_features(
             model, tokenizer, prompts, completions, pooling="mean", batch_size=4, device="cpu"
         )
+        bucketed = hidden_features(
+            model,
+            tokenizer,
+            prompts,
+            completions,
+            pooling="mean",
+            batch_size=4,
+            device="cpu",
+            pad_multiple=64,
+        )
         np.testing.assert_allclose(single, reference, rtol=1e-4, atol=1e-4)
         np.testing.assert_allclose(batched, reference, rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(bucketed, reference, rtol=1e-4, atol=1e-4)
+    with pytest.raises(ValueError, match="pad_multiple"):
+        hidden_features(model, tokenizer, prompts, completions, device="cpu", pad_multiple=0)
+
+
+def test_pad_batch_rounds_width_up() -> None:
+    ids, mask, offsets = _pad_batch([[5, 6, 7], [8]], 0, "left", multiple=4)
+    assert ids.shape == (2, 4) and mask.sum().item() == 4
+    assert offsets == [1, 3]
+    assert _pad_batch([[1] * 8], 0, "right", multiple=4)[0].shape == (1, 8)
+
+
+def test_peft_model_is_scored_through_its_backbone():
+    from peft import LoraConfig, get_peft_model
+
+    model, tokenizer = build_tiny_qwen(seed=1)
+    prompts, completions = ["Add 1 and 1."], ["2"]
+    reference = hidden_features(model, tokenizer, prompts, completions, device="cpu")
+    config = LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj", "v_proj"])
+    wrapped = get_peft_model(model, config)
+    # LoRA B starts at zero, so the adapter does not move the states yet.
+    got = hidden_features(wrapped, tokenizer, prompts, completions, device="cpu")
+    np.testing.assert_allclose(got, reference, rtol=1e-5, atol=1e-5)
 
 
 def test_step0_b_gradient_is_projected_weight_gradient():

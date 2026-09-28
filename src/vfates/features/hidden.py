@@ -117,11 +117,11 @@ def load_model(
 
 
 def _pad_batch(
-    sequences: list[list[int]], pad_id: int, side: str
+    sequences: list[list[int]], pad_id: int, side: str, multiple: int = 1
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
     if side not in ("left", "right"):
         raise ValueError(f"padding_side must be 'left' or 'right', got {side!r}")
-    width = max(len(seq) for seq in sequences)
+    width = -(-max(len(seq) for seq in sequences) // multiple) * multiple
     batch = len(sequences)
     input_ids = torch.full((batch, width), pad_id, dtype=torch.long)
     attention_mask = torch.zeros((batch, width), dtype=torch.long)
@@ -155,6 +155,7 @@ def hidden_features(
     device: str | torch.device | None = None,
     max_len: int | None = None,
     completion_ids: Sequence[Sequence[int]] | None = None,
+    pad_multiple: int = 1,
 ) -> np.ndarray:
     """Pooled final-layer hidden state of each completion, float32 ``[N, H]``.
 
@@ -170,6 +171,16 @@ def hidden_features(
     ``hidden_features.meta['completion_source']`` is ``'token_ids'`` or
     ``'text'``.
 
+    ``pad_multiple`` rounds every batch width up to a multiple of itself. On
+    MPS each new input shape compiles and caches a graph whose buffers sit
+    outside the torch allocator and are never freed, so exact widths grow the
+    process by about 0.2 GiB per distinct shape at batch 8 (Qwen2.5-0.5B,
+    float32). Padding does not change the real tokens' states: they never
+    attend to later positions, and left pads are masked.
+
+    A PEFT model is unwrapped with ``get_base_model()`` before its backbone is
+    taken; the injected adapter layers stay active.
+
     On MPS or CUDA the peak ``(allocated, driver_or_max)`` byte counts of the
     last call are stored on ``hidden_features.peak_memory`` for audit budgeting.
     That attribute is not part of the returned array.
@@ -178,6 +189,8 @@ def hidden_features(
         raise ValueError(f"pooling must be 'mean' or 'last', got {pooling!r}")
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    if pad_multiple < 1:
+        raise ValueError(f"pad_multiple must be >= 1, got {pad_multiple}")
     if len(prompts) != len(completions):
         raise ValueError(f"prompts ({len(prompts)}) and completions ({len(completions)}) differ")
     if completion_ids is not None and len(completion_ids) != len(prompts):
@@ -217,13 +230,14 @@ def hidden_features(
     saw_memory = False
     was_training = model.training
     model.eval()
-    backbone = getattr(model, "base_model", model)
+    inner = model.get_base_model() if hasattr(model, "get_base_model") else model
+    backbone = getattr(inner, "base_model", inner)
     try:
         with torch.inference_mode():
             for start in range(0, len(encoded), batch_size):
                 batch = encoded[start : start + batch_size]
                 input_ids, attention_mask, offsets = _pad_batch(
-                    [item[0] for item in batch], int(pad_id), side
+                    [item[0] for item in batch], int(pad_id), side, pad_multiple
                 )
                 input_ids = input_ids.to(param_device)
                 attention_mask = attention_mask.to(param_device)
@@ -258,6 +272,7 @@ def hidden_features(
                     span = final[row, pred_lo:pred_hi]
                     pooled = span[-1] if pooling == "last" else span.mean(dim=0)
                     features[start + row] = pooled.float().cpu().numpy()
+                    del span, pooled
                 del outputs, final
                 # Batch widths vary, so cached blocks rarely fit the next batch.
                 _release_memory(param_device)

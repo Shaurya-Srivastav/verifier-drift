@@ -79,8 +79,6 @@ def reliability_table(
     table: Any,
     measured: Mapping[str, float],
     target: float,
-    *,
-    seed: int = 0,
 ) -> dict[str, dict[str, Any]]:
     """Per arm: the noise model of ``g_V`` on the train rows and the pool it needs.
 
@@ -96,13 +94,11 @@ def reliability_table(
             table.pid[tr],
             np.asarray(table.V[arm])[tr],
             None if lengths is None else lengths[tr],
-            seed=seed,
         )
         k = b["samples_per_prompt"]
         out[arm] = {
             "measured": float(value),
             "predicted": transfer_mod.predicted_reliability(b, b["prompts"], k),
-            "within_share": b["within_share"],
             "prompts_needed": transfer_mod.prompts_for_reliability(b, target, k),
             **b,
         }
@@ -300,14 +296,16 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         tb,
         rel,
         rel_min,
-        seed=int(audit_cfg["forecast"].get("seed", 0)),
     )
     tables["reliability_budget"] = budget
+    model_gap = max(abs(r["predicted"] - r["measured"]) for r in budget.values())
+    gap_max = float(gates.get("noise_model_gap", 0.05))
     checks.add(
         "P3.10",
         "the noise model reproduces the measured split-half cosine",
-        max(abs(r["predicted"] - r["measured"]) for r in budget.values()),
-        True,
+        model_gap,
+        model_gap <= gap_max,
+        threshold=gap_max,
         metric="max |predicted - measured| across arms",
         documented=True,
     )
@@ -481,7 +479,8 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
             "Reliability budget",
             "Split-half cosine of `g_V` against the noise model "
             "`signal / (signal + noise / m)` with `m` prompts per half. The within-prompt "
-            "share of the noise shrinks with samples per prompt; the rest only with prompts. "
+            "share of the noise (a jackknife estimate, not capped at 1) shrinks with samples "
+            "per prompt; the rest only with prompts. "
             f"The last column is the train pool that reaches {rel_min:g} at "
             f"{int(next(iter(budget.values()))['samples_per_prompt'])} samples per prompt.\n\n"
             + budget_table,

@@ -132,6 +132,11 @@ KNIFE_RULE = (
     "and a later eval falls by >= fall below the running peak. The label does "
     "not change a hypothesis. The endpoint stays the final step."
 )
+RELIABILITY_RULE = (
+    "Documented. The split-half cosine of g_V on the locked audit, per arm, "
+    "against the P3 gate. An arm below it has a noisier forecast; no hypothesis "
+    "changes."
+)
 
 
 def audit_withdrawal_reasons(
@@ -618,6 +623,10 @@ def confirmatory_report(
     }
     natural_cfg = analysis.get("natural")
     forecasts = _locked_forecasts(audit_dir) if hypotheses or natural_cfg else {}
+    if forecasts:
+        report["reliability"] = _reliability_block(
+            forecasts, float(analysis.get("reliability_min", 0.8))
+        )
     if natural_cfg:
         report["natural"] = _natural_block(
             natural_cfg,
@@ -802,6 +811,19 @@ def _endpoints(
             "gain_mean": float(np.mean(finals) - np.mean(step0s)),
         }
     return out
+
+
+def _reliability_block(forecasts: Mapping[str, Any], threshold: float) -> dict[str, Any]:
+    arms = {}
+    for arm, forecast in forecasts.items():
+        value = _finite((forecast.get("transfer") or {}).get("reliability"))
+        arms[arm] = {"value": value, "below": value is not None and value < threshold}
+    return {
+        "rule": RELIABILITY_RULE,
+        "threshold": threshold,
+        "arms": arms,
+        "below": sorted(arm for arm, row in arms.items() if row["below"]),
+    }
 
 
 def _oracle_gain(endpoints: Mapping[str, Any], gain_min: float) -> dict[str, Any]:
@@ -1442,6 +1464,16 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         ", ".join(report.get("withdrawals", {}).get("withdrawn", [])) or "none",
         "",
     ]
+    reliability = report.get("reliability")
+    if isinstance(reliability, dict):
+        lines += [
+            "## Split-half reliability of g_V",
+            "",
+            f"Below {reliability.get('threshold')}: "
+            f"{', '.join(reliability.get('below') or []) or 'none'}. "
+            f"{reliability.get('rule', '')}",
+            "",
+        ]
     natural = report.get("natural")
     if isinstance(natural, dict):
         contrast = natural.get("contrast") or {}

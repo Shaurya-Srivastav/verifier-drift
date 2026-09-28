@@ -10,6 +10,7 @@ from vfates.analysis.confirmatory import (
     H3_PAIRS,
     _h4_block,
     _probe_auc,
+    _reliability_block,
     audit_withdrawal_reasons,
     confirmatory_report,
     decide_audit_withdrawals,
@@ -264,6 +265,10 @@ def test_confirmatory_hypotheses_hold_on_a_separated_menu(tmp_path: Path) -> Non
     assert alignment["diff_q05"] is not None
     assert report["oracle_gain"]["inconclusive"] is False
     assert report["inconclusive"] is False
+    assert report["reliability"]["threshold"] == 0.8
+    assert report["reliability"]["below"] == []
+    assert report["reliability"]["arms"]["oracle"] == {"value": 0.8, "below": False}
+    assert "## Split-half reliability of g_V\n\nBelow 0.8: none." in render_markdown(report)
     by_name = {row["name"]: row for row in report["h1"]["contrasts"]}
     contrast = by_name["noise_fp - fp_tolerance"]
     assert contrast["p_sup"] == 0.0
@@ -470,3 +475,16 @@ def test_e2_natural_block_follows_the_preregistered_tests(tmp_path: Path) -> Non
     assert weak["natural"]["differs"]["decision"] == "inconclusive"
     assert weak["natural"]["locality"]["decision"] == "inconclusive"
     assert weak["natural"]["screen_direction"]["decision"] == "inconclusive"
+
+
+def test_reliability_block_lists_arms_below_the_gate() -> None:
+    block = _reliability_block(
+        {
+            "a": {"transfer": {"reliability": 0.79}},
+            "b": {"transfer": {"reliability": 0.85}},
+            "c": {"transfer": {"reliability": float("nan")}},
+        },
+        0.8,
+    )
+    assert block["below"] == ["a"]
+    assert block["arms"]["c"] == {"value": None, "below": False}

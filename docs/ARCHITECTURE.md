@@ -92,14 +92,14 @@ A study is two stages: an **audit** (sample the base policy on frozen pools, gra
 | `lora_grad` | `lora_grad_features(model_or_id, tokenizer, prompts, completions, *, sketch_dim, lora_r, lora_alpha, target_modules, lora_seed, sketch_seed, completion_ids, save_init, ...) -> LoraGradFeatures`: per-sample gradient of the completion log-likelihood with respect to the LoRA B matrices at initialisation (the directions GRPO's first step moves), CountSketch-projected |
 | `lora_init` | `LORA_INIT_FILENAME`, `lora_a_state`, `assert_lora_a_equal`, `save_lora_init`, `load_lora_init`: the A matrices the features used, saved once (`vfates.lora_init/1`, keys are base `nn.Linear` paths, shape `(r, in)`) and loaded by both trainers so every run starts from them |
 | `sketch` | `CountSketch(dim, seed)`: unbiased inner-product sketch |
-| `hidden` | `load_model(model_id, device, dtype)`, `hidden_features(..., completion_ids)`: pooled final-layer states (ablation) |
+| `hidden` | `load_model(model_id, device, dtype)`, `hidden_features(..., completion_ids, pad_multiple)`: pooled final-layer states (ablation); `pad_multiple` bounds the number of batch shapes, which MPS caches graph memory for |
 
 ### Forecasts (`vfates.forecast`)
 
 | Module | Public API |
 | --- | --- |
 | `confusion` | `confusion`, `confusion_with_ci`: pooled and prompt-averaged FPR, FNR, J, precision; `mean_precision_forecast` (the tilt limit), `modal_precision_forecast` (the zero-KL policy-gradient limit) |
-| `transfer` | `length_division(normalize, loss_agg)`, `prompt_centered`, `group_std_advantages`, `velocity_direction`, `velocities`, `tau_pool` (primary, `PRIMARY_Q = 1/32`), `tau_pool_interval` (two-level prompt bootstrap), `tau_hard`, `tau_soft`, `first_order_slope`, `cosine`, `split_half_reliability`, `reliability_budget` (signal and within-prompt noise of `g_V`), `predicted_reliability`, `prompts_for_reliability`, `transfer_forecast -> TransferForecast` (includes the secondary `tau_pool_std`, which uses TRL's per-prompt standard-deviation scaling) |
+| `transfer` | `length_division(normalize, loss_agg)`, `prompt_centered`, `group_std_advantages`, `velocity_direction`, `velocities`, `tau_pool` (primary, `PRIMARY_Q = 1/32`), `tau_pool_interval` (two-level prompt bootstrap), `tau_hard`, `tau_soft`, `first_order_slope`, `cosine`, `split_half_reliability`, `reliability_budget` (signal and noise of `g_V`, with the within-prompt part as a jackknife), `predicted_reliability`, `prompts_for_reliability`, `transfer_forecast -> TransferForecast` (includes the secondary `tau_pool_std`, which uses TRL's per-prompt standard-deviation scaling) |
 | `probe` | `auc`, `grouped_folds`, `ridge_scores`, `probe_auc`, `arm_error_probe`, `heldout_error_probe`: is an arm's error decodable from step-0 features on unseen prompts? The locked value is `heldout_error_probe` (fit on train prompts, scored on held-out prompts) |
 | `lockbox` | `lock_forecasts(payload, path, *, config, note, artifacts)`, `verify_lock(path)`, `load_lock(path)`, `load_lock_record(path)`, `assert_matches_lock(path, payload)`; writes schema `vfates.lock/2` (payload, artifact hashes, digest) and reads `/1` |
 

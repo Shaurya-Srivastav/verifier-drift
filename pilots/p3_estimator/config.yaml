@@ -36,9 +36,13 @@ audit:
   lock: true
 
 # Pooled final-layer hidden states: the cheap feature map, for agreement only.
+# Exact batch widths ran MPS out of memory at part 10 of 44: every new shape
+# caches a graph outside the torch allocator (about 0.2 GiB each). Widths
+# rounded to 64 leave about 7 shapes and a flat 4 GiB, at the same speed.
 hidden_features:
   model_id: Qwen/Qwen2.5-0.5B-Instruct
   load: {dtype: float32}
+  pad_multiple: 64
 
 fidelity:
   n: 48          # exact LoRA-B gradients (4.4M dims each), drawn from train rows only
@@ -53,3 +57,4 @@ gates:
   sketch_corr: 0.95     # corr of off-diagonal Gram entries, exact vs CountSketch
   hash_auc_max: 0.60    # prompt-specific FP must not be decodable on unseen prompts
   shared_auc_min: 0.65  # at least one shared FP must be
+  noise_model_gap: 0.05 # P3.10 (documented): max |predicted - measured| split-half cosine

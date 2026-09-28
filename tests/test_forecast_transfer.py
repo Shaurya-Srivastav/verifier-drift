@@ -178,7 +178,7 @@ def _prompt_world(
 
 def test_reliability_budget_predicts_split_half_cosine() -> None:
     features, pid, reward = _prompt_world(240, 16, between=0.2)
-    budget = reliability_budget(features, pid, reward, seed=0)
+    budget = reliability_budget(features, pid, reward)
     assert budget["prompts"] == 240 and budget["samples_per_prompt"] == 16
     measured = split_half_reliability(features, pid, reward, n_splits=20, seed=0)
     assert abs(predicted_reliability(budget, 240, 16) - measured) < 0.05
@@ -195,17 +195,67 @@ def test_reliability_budget_predicts_split_half_cosine() -> None:
 
 
 def test_reliability_budget_separates_prompt_and_sample_noise() -> None:
-    sampling_only = reliability_budget(*_prompt_world(200, 16, between=0.0), seed=0)
-    with_prompts = reliability_budget(*_prompt_world(200, 16, between=0.6), seed=0)
-    assert sampling_only["within_share"] > 0.9
+    sampling_only = reliability_budget(*_prompt_world(200, 16, between=0.0))
+    with_prompts = reliability_budget(*_prompt_world(200, 16, between=0.6))
+    assert 0.9 < sampling_only["within_share"] < 1.15
     assert with_prompts["within_share"] < sampling_only["within_share"] - 0.1
+    assert sampling_only["within"] == pytest.approx(
+        sampling_only["within_share"] * sampling_only["noise"]
+    )
 
     features, pid, reward = _prompt_world(8, 4, between=0.0)
-    with pytest.raises(ValueError, match="two samples"):
-        reliability_budget(features[::4], pid[::4], reward[::4])
+    for size in (2, 3):
+        keep = np.arange(len(pid)) % 4 < size
+        with pytest.raises(ValueError, match="four samples"):
+            reliability_budget(features[keep], pid[keep], reward[keep])
     null = dict(sampling_only, signal=-1.0)
     assert predicted_reliability(null, 1024, 16) == 0.0
     assert prompts_for_reliability(null, 0.8, 16) is None
+    with pytest.raises(ValueError, match="positive"):
+        predicted_reliability(sampling_only, 1024, 0)
+    with pytest.raises(ValueError, match="positive"):
+        predicted_reliability(sampling_only, 0, 16)
+    with pytest.raises(ValueError, match="positive"):
+        prompts_for_reliability(sampling_only, 0.8, 0)
+
+
+def test_reliability_budget_without_prompt_noise() -> None:
+    # Every prompt repeats the same samples, so c_p does not vary across prompts.
+    rng = np.random.default_rng(0)
+    phi = rng.normal(0.0, 1.0, (5, 6))
+    reward = np.array([1.0, 0.0, 1.0, 0.0, 0.0])
+    pid = np.repeat(np.arange(10), 5)
+    budget = reliability_budget(np.tile(phi, (10, 1)), pid, np.tile(reward, 10))
+    assert budget["noise"] == pytest.approx(0.0, abs=1e-24) and budget["signal"] > 0
+    exact = dict(budget, noise=0.0, within_share=0.0)
+    assert predicted_reliability(exact, 10, 5) == 1.0
+    assert prompts_for_reliability(exact, 0.8, 5) == 4
+
+
+def test_jackknife_within_variance() -> None:
+    from vfates.forecast.transfer import _jackknife_variance, _prompt_contribution
+
+    rng = np.random.default_rng(0)
+    phi = rng.normal(0.0, 1.0, (7, 4)) + 3.0
+    reward = rng.integers(0, 2, 7).astype(float)
+    loo = np.stack(
+        [_prompt_contribution(np.delete(phi, i, 0), np.delete(reward, i)) for i in range(7)]
+    )
+    brute = float(((loo - loo.mean(0)) ** 2).sum() * 6 / 7)
+    assert _jackknife_variance(phi, reward) == pytest.approx(brute, rel=1e-10)
+
+    # Against the Monte Carlo variance of c_p, at an odd and an even group size.
+    dim, reps = 20, 4000
+    mu = rng.normal(0.0, 0.5, dim)
+    for n in (5, 16):
+        draws, jack = [], []
+        for _ in range(reps):
+            v = (rng.random(n) < 0.4).astype(float)
+            x = v[:, None] * mu + rng.normal(0.0, 1.0, (n, dim)) + 2.0
+            draws.append(_prompt_contribution(x, v))
+            jack.append(_jackknife_variance(x, v))
+        true = float(np.var(np.stack(draws), axis=0, ddof=1).sum())
+        assert 0.97 * true < float(np.mean(jack)) < 1.35 * true
 
 
 def test_reliability_coverage_and_tau_rel() -> None:

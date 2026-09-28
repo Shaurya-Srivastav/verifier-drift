@@ -323,12 +323,34 @@ def _prompt_contribution(phi: np.ndarray, reward: np.ndarray) -> np.ndarray:
     return np.asarray((adv[:, None] * phi).mean(axis=0))
 
 
+def _jackknife_variance(phi: np.ndarray, reward: np.ndarray) -> float:
+    """Jackknife estimate of ``tr Var(c_p)`` from one prompt's samples.
+
+    ``c_p`` is the plug-in covariance of ``reward`` and ``phi``; each
+    leave-one-out value is computed in closed form from the prompt's sums.
+    """
+    n = len(reward)
+    m = n - 1
+    v_loo = (reward.sum() - reward) / m
+    phi_loo = (phi.sum(axis=0)[None, :] - phi) / m
+    vphi_loo = ((reward[:, None] * phi).sum(axis=0)[None, :] - reward[:, None] * phi) / m
+    loo = vphi_loo - v_loo[:, None] * phi_loo
+    dev = loo - loo.mean(axis=0)
+    return float((dev**2).sum() * m / n)
+
+
+def _noise_at(budget: dict[str, float], samples: float) -> float:
+    if samples <= 0:
+        raise ValueError(f"samples per prompt must be positive, got {samples}")
+    w = min(max(budget["within_share"], 0.0), 1.0)
+    return budget["noise"] * ((1.0 - w) + w * budget["samples_per_prompt"] / samples)
+
+
 def reliability_budget(
     features: np.ndarray,
     pid: GroupIds,
     reward: np.ndarray,
     lengths: np.ndarray | None = None,
-    seed: int = 0,
 ) -> dict[str, float]:
     r"""Signal and noise of the velocity direction, for sizing an audit.
 
@@ -338,57 +360,58 @@ def reliability_budget(
     split-half cosine on ``m`` prompts per half is close to
     ``signal / (signal + noise / m)`` in high dimension.
 
-    ``within_share`` is the part of ``noise`` that is sampling noise inside a
-    prompt. It is estimated by recomputing every ``c_p`` on two disjoint halves
-    of that prompt's samples; it scales as one over the samples per prompt,
-    while the between-prompt rest does not. Every prompt needs two samples.
+    ``within`` is the part of ``noise`` that is sampling noise inside a prompt,
+    the mean over prompts of the jackknife variance of ``c_p`` (conservative in
+    expectation; Efron and Stein 1981). It scales as one over the samples per
+    prompt, while the between-prompt rest does not. ``within_share`` is
+    ``within / noise`` and is not capped: above 1 means the between-prompt part
+    is indistinguishable from zero. Every prompt needs four samples.
     """
     phi = np.asarray(features, dtype=np.float64)
     if lengths is not None:
         phi = phi / np.maximum(np.asarray(lengths, dtype=np.float64), 1.0)[:, None]
     v = np.asarray(reward, dtype=np.float64)
     groups = group_indices(pid)
-    if len(groups) < 2 or min(len(r) for r in groups) < 2:
-        raise ValueError("reliability_budget needs two prompts with at least two samples each")
-    rng = np.random.default_rng(seed)
+    if len(groups) < 2 or min(len(r) for r in groups) < 4:
+        raise ValueError("reliability_budget needs two prompts with at least four samples each")
     contrib = np.stack([_prompt_contribution(phi[r], v[r]) for r in groups])
-    halves = []
-    for rows in groups:
-        perm = rng.permutation(rows)
-        a, b = perm[: len(rows) // 2], perm[len(rows) // 2 :]
-        diff = _prompt_contribution(phi[a], v[a]) - _prompt_contribution(phi[b], v[b])
-        halves.append(float(diff @ diff))
+    within = float(np.mean([_jackknife_variance(phi[r], v[r]) for r in groups]))
     n_prompts = len(groups)
     mean = contrib.mean(axis=0)
     noise = float(((contrib - mean) ** 2).sum() / (n_prompts - 1))
     signal = float(mean @ mean) - noise / n_prompts
-    # E|c_a - c_b|^2 / 2 is the sampling variance of c_p at half the samples.
-    within = float(np.mean(halves)) / 4.0
     return {
         "signal": signal,
         "noise": noise,
-        "within_share": min(within / noise, 1.0) if noise > 0 else float("nan"),
+        "within": within,
+        "within_share": within / noise if noise > 0 else 0.0,
         "prompts": float(n_prompts),
         "samples_per_prompt": float(np.mean([len(r) for r in groups])),
     }
 
 
 def predicted_reliability(budget: dict[str, float], prompts: float, samples: float) -> float:
-    """Split-half cosine that :func:`reliability_budget` predicts for a pool of this shape."""
+    """Split-half cosine that :func:`reliability_budget` predicts for a pool of this shape.
+
+    ``within_share`` is clipped to ``[0, 1]`` here.
+    """
+    if prompts <= 0:
+        raise ValueError(f"prompts must be positive, got {prompts}")
     if budget["signal"] <= 0:
         return 0.0
-    w = budget["within_share"]
-    noise = budget["noise"] * ((1.0 - w) + w * budget["samples_per_prompt"] / samples)
+    noise = _noise_at(budget, samples)
     return budget["signal"] / (budget["signal"] + noise / (prompts / 2.0))
 
 
 def prompts_for_reliability(budget: dict[str, float], target: float, samples: float) -> int | None:
-    """Train prompts at which the predicted split-half cosine reaches ``target``."""
+    """Train prompts at which the predicted split-half cosine reaches ``target``.
+
+    At least 4, the fewest prompts :func:`split_half_reliability` accepts.
+    """
     if budget["signal"] <= 0 or not 0.0 < target < 1.0:
         return None
-    w = budget["within_share"]
-    noise = budget["noise"] * ((1.0 - w) + w * budget["samples_per_prompt"] / samples)
-    return int(np.ceil(2.0 * noise / budget["signal"] * target / (1.0 - target)))
+    noise = _noise_at(budget, samples)
+    return max(4, int(np.ceil(2.0 * noise / budget["signal"] * target / (1.0 - target))))
 
 
 @dataclass
