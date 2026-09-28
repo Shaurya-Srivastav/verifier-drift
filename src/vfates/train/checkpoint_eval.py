@@ -56,12 +56,15 @@ def make_eval_generator(
     ``config.vllm_tensor_parallel_size`` unless the spec already set it, plus
     LoRA loading and the run's ``chat_template_kwargs``.
     """
-    import torch
-
     from vfates.gen.factory import make_generator
 
     raw = dict(spec or {})
-    backend = _eval_backend(str(raw.pop("backend", "vllm" if torch.cuda.is_available() else "hf")))
+    name = raw.pop("backend", None)
+    if name is None:
+        import torch
+
+        name = "vllm" if torch.cuda.is_available() else "hf"
+    backend = _eval_backend(str(name))
     kwargs = dict(raw.pop("kwargs", {}))
     if backend == "vllm":
         kwargs.setdefault("tensor_parallel_size", int(config.vllm_tensor_parallel_size))

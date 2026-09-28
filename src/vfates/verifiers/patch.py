@@ -195,7 +195,7 @@ def _error_counts(
 ) -> dict[str, int]:
     counts = {category: 0 for category in menu}
     known = set(menu)
-    for index in np.flatnonzero(train):
+    for index in map(int, np.flatnonzero(train)):
         if int(base_v[index]) == int(labels[index]):
             continue
         for category in row_cats[index]:
@@ -229,7 +229,7 @@ def _errors_fixed(
 ) -> int:
     chosen = set(categories)
     fixed = 0
-    for index in np.flatnonzero(train):
+    for index in map(int, np.flatnonzero(train)):
         if int(base_v[index]) == int(labels[index]):
             continue
         if chosen & row_cats[index]:
