@@ -1,4 +1,4 @@
-# P1: harness correctness with a real model (Mac Studio, ~10 min).
+# P1: harness correctness with a real model (Mac Studio, about 2 min).
 model_id: Qwen/Qwen2.5-0.5B-Instruct
 fresh: true
 pytest: true

@@ -3,7 +3,8 @@
 Runs the full E1 audit on the pilot model (sampling, arms, LoRA-B gradient
 features) and checks the estimator before any training:
 
-* reliability: the velocity direction of every arm is stable across prompt halves;
+* reliability: the velocity direction of every arm is stable across prompt halves,
+  with a noise model of that direction that gives the train pool the gate needs;
 * sketch fidelity: CountSketch preserves inner products of exact LoRA-B gradients;
 * decodeability: shared errors are linearly decodable from step-0 features on
   unseen prompts, prompt-specific errors are not (the mechanism behind transfer);
@@ -24,6 +25,7 @@ from typing import Any
 
 import numpy as np
 
+from vfates.forecast import transfer as transfer_mod
 from vfates.pilots.common import Checks, markdown_table, write_report
 from vfates.utils.io import read_json, write_json
 from vfates.utils.stats import spearman
@@ -68,6 +70,42 @@ def _locked_length_divided(forecasts: Mapping[str, Any]) -> bool:
         if isinstance(entry, Mapping) and "length_divided" in entry:
             return bool(entry["length_divided"])
     raise ValueError("forecasts are missing length_divided")
+
+
+def reliability_table(
+    features: np.ndarray,
+    lengths: np.ndarray | None,
+    table: Any,
+    measured: Mapping[str, float],
+    target: float,
+    *,
+    seed: int = 0,
+) -> dict[str, dict[str, Any]]:
+    """Per arm: the noise model of ``g_V`` on the train rows and the pool it needs.
+
+    ``predicted`` is the split-half cosine the model gives for this pool, to be
+    compared with ``measured``. ``prompts_needed`` is the train pool that reaches
+    ``target`` at the audit's samples per prompt.
+    """
+    tr = np.asarray(table.split) == "train"
+    out: dict[str, dict[str, Any]] = {}
+    for arm, value in measured.items():
+        b = transfer_mod.reliability_budget(
+            features[tr],
+            table.pid[tr],
+            np.asarray(table.V[arm])[tr],
+            None if lengths is None else lengths[tr],
+            seed=seed,
+        )
+        k = b["samples_per_prompt"]
+        out[arm] = {
+            "measured": float(value),
+            "predicted": transfer_mod.predicted_reliability(b, b["prompts"], k),
+            "within_share": b["within_share"],
+            "prompts_needed": transfer_mod.prompts_for_reliability(b, target, k),
+            **b,
+        }
+    return out
 
 
 def compare_lora_seeds(
@@ -215,7 +253,8 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     audit_cfg = copy.deepcopy(config["audit"])
     audit = run_audit(audit_cfg, audit_dir)
     tb = audit.table
-    X = np.load(audit_dir / "features.npz")["features"]
+    with np.load(audit_dir / "features.npz") as saved:
+        X, feat_lengths = saved["features"], saved["lengths"]
     forecasts = read_json(audit_dir / "forecasts.json")
     calib = read_json(audit_dir / "calibration.json")
     checks = Checks()
@@ -253,6 +292,23 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         rel[worst] >= rel_min,
         threshold=rel_min,
         metric="split-half cosine",
+    )
+    budget = reliability_table(
+        X,
+        feat_lengths if _locked_length_divided(forecasts) else None,
+        tb,
+        rel,
+        rel_min,
+        seed=int(audit_cfg["forecast"].get("seed", 0)),
+    )
+    tables["reliability_budget"] = budget
+    checks.add(
+        "P3.10",
+        "the noise model reproduces the measured split-half cosine",
+        max(abs(r["predicted"] - r["measured"]) for r in budget.values()),
+        True,
+        metric="max |predicted - measured| across arms",
+        documented=True,
     )
 
     fid_path = out / "sketch_fidelity.json"
@@ -407,8 +463,24 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         ["arm", "type", "AUC", "rows", "errors"],
         [[r["arm"], r["type"], r["auc"], r["n"], r["n_pos"]] for r in probe],
     )
+    budget_table = markdown_table(
+        ["arm", "measured", "predicted", "within-prompt share", "train prompts for gate"],
+        [
+            [a, r["measured"], r["predicted"], r["within_share"], r["prompts_needed"]]
+            for a, r in budget.items()
+        ],
+    )
     sections = [
         ("Locked forecasts", fc_table),
+        (
+            "Reliability budget",
+            "Split-half cosine of `g_V` against the noise model "
+            "`signal / (signal + noise / m)` with `m` prompts per half. The within-prompt "
+            "share of the noise shrinks with samples per prompt; the rest only with prompts. "
+            f"The last column is the train pool that reaches {rel_min:g} at "
+            f"{int(next(iter(budget.values()))['samples_per_prompt'])} samples per prompt.\n\n"
+            + budget_table,
+        ),
         ("Decodeability probe", probe_table),
         ("Sketch fidelity", markdown_table(list(fid), [list(fid.values())])),
         (

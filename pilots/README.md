@@ -7,11 +7,11 @@ Seven pilots take the project from theory to a go/no-go decision on rented GPUs.
 | Pilot | Question it answers | Hardware | Approximate runtime |
 | --- | --- | --- | --- |
 | [P0 theory](p0_theory/README.md) | Do exactly solvable worlds reproduce the identities and the same-rate, different-fates split, and does step-0 `tau_pool` track trained held-out accuracy? | CPU | seconds |
-| [P1 harness](p1_harness/README.md) | With the real model, does every stage (sampling, grading, calibration, features, lock, GRPO, resume, analysis) compute what it claims? | Mac | 10 min |
+| [P1 harness](p1_harness/README.md) | With the real model, does every stage (sampling, grading, calibration, features, lock, GRPO, resume, analysis) compute what it claims? | Mac | 2 min |
 | [P2 base audit](p2_base_audit/README.md) | Which model and task difficulty has signal and headroom, follows the answer format, and lets every arm reach its step-0 error rate? | Mac | 1 h |
 | [P3 estimator](p3_estimator/README.md) | Is the step-0 estimator reliable, is the sketch faithful, and are shared errors decodable while prompt-specific ones are not? Locks the forecasts. | Mac | 1 h |
 | [P4 micro-GRPO](p4_micro_grpo/README.md) | On a real LLM at matched rates, do shared errors end below their resampled control on held-out prompts while prompt-specific ones stay close to it? How do the locked forecasts line up with the outcomes? (Exploratory.) | Mac | 18 h |
-| [P5 GPU gate](p5_gpu_gate/README.md) | Does the PyTorch, TRL and vLLM path work (dry run on the Mac)? On one H100, does the study model gain at least 0.10 held-out accuracy under the oracle on a development pool disjoint from E1, how much do two seeds differ, and what does one arm-seed cost? | Mac, then 1 H100 | 10 min, then about a day |
+| [P5 GPU gate](p5_gpu_gate/README.md) | Does the PyTorch, TRL and vLLM path work (dry run on the Mac)? On one H100, does the study model gain at least 0.10 held-out accuracy under the oracle on a development pool disjoint from E1, how much do two seeds differ, and what does one arm-seed cost? | Mac, then 1 H100 | 4 min, then about a day |
 | [P6 natural verifiers](p6_natural/README.md) | Do natural verifiers (MBPP base tests, IFEval checkers) have the step-0 error structure the study needs? | Mac | 30 min |
 
 Runtimes are for a Mac Studio with an M4 Max and 36 GB of memory, with model weights already downloaded. They are estimates until each pilot's committed report records a measured run.

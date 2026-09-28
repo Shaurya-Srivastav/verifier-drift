@@ -8,8 +8,11 @@ import pytest
 from vfates.forecast.transfer import (
     group_std_advantages,
     length_division,
+    predicted_reliability,
     prompt_centered,
+    prompts_for_reliability,
     q_label,
+    reliability_budget,
     split_half_reliability,
     tau_hard,
     tau_pool,
@@ -157,6 +160,52 @@ def test_tau_pool_interval_brackets_the_point_estimate() -> None:
     assert (lo, hi) == tau_pool_interval(phi, pid, O, phi, pid, O, q=1 / 8, n_boot=200, seed=0)
     assert q_label(1 / 32) == "1/32"
     assert q_label(0.3) == "0.3"
+
+
+def _prompt_world(
+    n_prompt: int, n_sample: int, between: float, seed: int = 0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Rewarded samples carry ``mu`` plus a per-prompt offset, under unit feature noise."""
+    rng = np.random.default_rng(seed)
+    dim = 300
+    mu = rng.normal(0.0, 0.1, dim)
+    pid = np.repeat(np.arange(n_prompt), n_sample)
+    reward = rng.integers(0, 2, n_prompt * n_sample).astype(float)
+    offset = rng.normal(0.0, between, (n_prompt, dim))[pid]
+    features = reward[:, None] * (mu + offset) + rng.normal(0.0, 1.0, (len(pid), dim))
+    return features, pid, reward
+
+
+def test_reliability_budget_predicts_split_half_cosine() -> None:
+    features, pid, reward = _prompt_world(240, 16, between=0.2)
+    budget = reliability_budget(features, pid, reward, seed=0)
+    assert budget["prompts"] == 240 and budget["samples_per_prompt"] == 16
+    measured = split_half_reliability(features, pid, reward, n_splits=20, seed=0)
+    assert abs(predicted_reliability(budget, 240, 16) - measured) < 0.05
+
+    # A smaller pool with fewer samples per prompt is predicted from the full one.
+    keep = (pid < 96) & (np.arange(len(pid)) % 16 < 8)
+    small = split_half_reliability(features[keep], pid[keep], reward[keep], n_splits=40, seed=1)
+    assert abs(predicted_reliability(budget, 96, 8) - small) < 0.08
+
+    needed = prompts_for_reliability(budget, 0.8, 16)
+    assert needed is not None
+    assert predicted_reliability(budget, needed, 16) >= 0.8
+    assert predicted_reliability(budget, needed - 2, 16) < 0.8
+
+
+def test_reliability_budget_separates_prompt_and_sample_noise() -> None:
+    sampling_only = reliability_budget(*_prompt_world(200, 16, between=0.0), seed=0)
+    with_prompts = reliability_budget(*_prompt_world(200, 16, between=0.6), seed=0)
+    assert sampling_only["within_share"] > 0.9
+    assert with_prompts["within_share"] < sampling_only["within_share"] - 0.1
+
+    features, pid, reward = _prompt_world(8, 4, between=0.0)
+    with pytest.raises(ValueError, match="two samples"):
+        reliability_budget(features[::4], pid[::4], reward[::4])
+    null = dict(sampling_only, signal=-1.0)
+    assert predicted_reliability(null, 1024, 16) == 0.0
+    assert prompts_for_reliability(null, 0.8, 16) is None
 
 
 def test_reliability_coverage_and_tau_rel() -> None:

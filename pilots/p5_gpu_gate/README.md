@@ -17,7 +17,7 @@ The go/no-go decision for renting the E1 compute. It has three modes:
 | P5.5 | Re-evaluation writes nothing new. |
 | P5.6 | Documented: token-rate cost of the full gate. Eval tokens are included. `audit_prompts` is 896 (512 train + 384 held-out). |
 
-Training and evaluation use the audit's 96-token budget and temperature: `train_arm` refuses a run whose model, `max_tokens`, `eval_max_tokens`, `temperature` or `eval_temperature` differs from the audit that made the lock.
+The audit has P1's shape (24 train and 12 held-out prompts, 4 samples, 256 tokens); at 96 tokens nearly every completion is truncated and no FN arm can be calibrated. Training and evaluation use the audit's 256-token budget and temperature: `train_arm` refuses a run whose model, `max_tokens`, `eval_max_tokens`, `temperature` or `eval_temperature` differs from the audit that made the lock.
 
 TRL's own evaluation reports pooled reward means only, so `train_arm` turns it off. The endpoint (per-prompt held-out oracle accuracy) comes from evaluating the saved adapters afterwards.
 
@@ -25,7 +25,7 @@ TRL's own evaluation reports pooled reward means only, so `train_arm` turns it o
 python pilots/p5_gpu_gate/run.py           # or: vfates pilot p5
 ```
 
-The dry run takes about 10 minutes on a Mac Studio with an M4 Max.
+The dry run takes about 4 minutes on a Mac Studio with an M4 Max once the weights are downloaded (254 s measured).
 
 ## Full gate (H100, `mode: full`)
 

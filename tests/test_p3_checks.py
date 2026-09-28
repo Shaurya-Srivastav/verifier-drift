@@ -12,12 +12,18 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from vfates.forecast.transfer import (
+    predicted_reliability,
+    prompts_for_reliability,
+    reliability_budget,
+)
 from vfates.pilots.p3_estimator import (
     _locked_length_divided,
     _sketch_fidelity,
     _train_row_index,
     compare_lora_seeds,
     lora_seed_shift_summary,
+    reliability_table,
     run,
 )
 from vfates.types import Completion, Problem
@@ -189,6 +195,28 @@ def test_sketch_fidelity_uses_train_rows_and_an_existing_init(
         audit, {"model_id": "m", "kind": "lora_grad", "sketch_dim": 4}, 5, 0, save_init=init
     )
     assert str(seen["save_init"]) == str(init)
+
+
+def test_reliability_table_uses_train_rows_and_divides_by_length() -> None:
+    rng = np.random.default_rng(0)
+    n_train, n_held, n = 40, 10, 8
+    split = np.array(["train"] * (n_train * n) + ["heldout"] * (n_held * n))
+    pid = np.repeat(np.arange(n_train + n_held), n)
+    reward = rng.integers(0, 2, len(pid)).astype(float)
+    features = reward[:, None] * 0.3 + rng.normal(0.0, 1.0, (len(pid), 16))
+    features[split == "heldout"] = 1e6
+    lengths = rng.integers(5, 50, len(pid)).astype(float)
+    table = SimpleNamespace(split=split, pid=pid, V={"a": reward})
+    tr = split == "train"
+
+    rows = reliability_table(features, lengths, table, {"a": 0.5}, 0.8, seed=3)
+    expected = reliability_budget(features[tr], pid[tr], reward[tr], lengths[tr], seed=3)
+    assert rows["a"]["signal"] == pytest.approx(expected["signal"])
+    assert rows["a"]["measured"] == 0.5
+    assert rows["a"]["predicted"] == pytest.approx(predicted_reliability(expected, n_train, n))
+    assert rows["a"]["prompts_needed"] == prompts_for_reliability(expected, 0.8, n)
+    undivided = reliability_table(features, None, table, {"a": 0.5}, 0.8, seed=3)
+    assert undivided["a"]["signal"] != pytest.approx(rows["a"]["signal"])
 
 
 def test_hidden_ablation_does_not_divide_by_length() -> None:

@@ -12,6 +12,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# A PyPI read timeout makes pip treat a dependency as unavailable and
+# backtrack into matplotlib sdists that no longer build.
+env:
+  PIP_RETRIES: "10"
+  PIP_TIMEOUT: "60"
+
 jobs:
   lint:
     runs-on: ubuntu-latest

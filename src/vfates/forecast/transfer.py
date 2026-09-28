@@ -318,6 +318,79 @@ def split_half_reliability(
     return float(np.nanmean(cos))
 
 
+def _prompt_contribution(phi: np.ndarray, reward: np.ndarray) -> np.ndarray:
+    adv = reward - reward.mean()
+    return np.asarray((adv[:, None] * phi).mean(axis=0))
+
+
+def reliability_budget(
+    features: np.ndarray,
+    pid: GroupIds,
+    reward: np.ndarray,
+    lengths: np.ndarray | None = None,
+    seed: int = 0,
+) -> dict[str, float]:
+    r"""Signal and noise of the velocity direction, for sizing an audit.
+
+    Prompt ``p`` contributes ``c_p`` (the mean of ``A_i phi_i`` over its samples)
+    to :func:`velocity_direction`. With ``signal = |E c_p|^2`` and
+    ``noise = tr Cov(c_p)``, both estimated without bias across prompts, the
+    split-half cosine on ``m`` prompts per half is close to
+    ``signal / (signal + noise / m)`` in high dimension.
+
+    ``within_share`` is the part of ``noise`` that is sampling noise inside a
+    prompt. It is estimated by recomputing every ``c_p`` on two disjoint halves
+    of that prompt's samples; it scales as one over the samples per prompt,
+    while the between-prompt rest does not. Every prompt needs two samples.
+    """
+    phi = np.asarray(features, dtype=np.float64)
+    if lengths is not None:
+        phi = phi / np.maximum(np.asarray(lengths, dtype=np.float64), 1.0)[:, None]
+    v = np.asarray(reward, dtype=np.float64)
+    groups = group_indices(pid)
+    if len(groups) < 2 or min(len(r) for r in groups) < 2:
+        raise ValueError("reliability_budget needs two prompts with at least two samples each")
+    rng = np.random.default_rng(seed)
+    contrib = np.stack([_prompt_contribution(phi[r], v[r]) for r in groups])
+    halves = []
+    for rows in groups:
+        perm = rng.permutation(rows)
+        a, b = perm[: len(rows) // 2], perm[len(rows) // 2 :]
+        diff = _prompt_contribution(phi[a], v[a]) - _prompt_contribution(phi[b], v[b])
+        halves.append(float(diff @ diff))
+    n_prompts = len(groups)
+    mean = contrib.mean(axis=0)
+    noise = float(((contrib - mean) ** 2).sum() / (n_prompts - 1))
+    signal = float(mean @ mean) - noise / n_prompts
+    # E|c_a - c_b|^2 / 2 is the sampling variance of c_p at half the samples.
+    within = float(np.mean(halves)) / 4.0
+    return {
+        "signal": signal,
+        "noise": noise,
+        "within_share": min(within / noise, 1.0) if noise > 0 else float("nan"),
+        "prompts": float(n_prompts),
+        "samples_per_prompt": float(np.mean([len(r) for r in groups])),
+    }
+
+
+def predicted_reliability(budget: dict[str, float], prompts: float, samples: float) -> float:
+    """Split-half cosine that :func:`reliability_budget` predicts for a pool of this shape."""
+    if budget["signal"] <= 0:
+        return 0.0
+    w = budget["within_share"]
+    noise = budget["noise"] * ((1.0 - w) + w * budget["samples_per_prompt"] / samples)
+    return budget["signal"] / (budget["signal"] + noise / (prompts / 2.0))
+
+
+def prompts_for_reliability(budget: dict[str, float], target: float, samples: float) -> int | None:
+    """Train prompts at which the predicted split-half cosine reaches ``target``."""
+    if budget["signal"] <= 0 or not 0.0 < target < 1.0:
+        return None
+    w = budget["within_share"]
+    noise = budget["noise"] * ((1.0 - w) + w * budget["samples_per_prompt"] / samples)
+    return int(np.ceil(2.0 * noise / budget["signal"] * target / (1.0 - target)))
+
+
 @dataclass
 class TransferForecast:
     """Everything the screen reports for one verifier arm."""

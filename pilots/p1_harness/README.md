@@ -33,7 +33,7 @@ Defaults: `--config pilots/p1_harness/config.yaml`, `--out pilots/p1_harness/res
 
 ## Runtime
 
-About 10 minutes on a Mac Studio with an M4 Max: the test suite (about 2 minutes), the audit (36 prompts with 4 samples each, on MLX), LoRA-B features on MPS, the log-probability rescoring, and three GRPO steps (two, then one more after resuming).
+About 2 minutes on a Mac Studio with an M4 Max once the weights are downloaded (123 s measured): the test suite, the audit (36 prompts with 4 samples each at 256 tokens, on MLX), LoRA-B features on MPS, the log-probability rescoring, and three GRPO steps (two, then one more after resuming).
 
 ## Expected outcome
 
