@@ -81,6 +81,42 @@ def test_problems_contract() -> None:
         task.problems("test", 1, 0)
 
 
+def test_dev_split_uses_its_own_seed_and_leaves_train_heldout() -> None:
+    task = ChainSumTask()
+    assert task.config.dev_seed_offset == 2_000_003
+    assert task.config.dev_seed_offset != task.config.heldout_seed_offset
+    train = task.problems("train", 8, seed=1)
+    held = task.problems("heldout", 8, seed=1)
+    dev = task.problems("dev", 8, seed=1)
+    assert [problem.question for problem in train] == [
+        item["question"] for item in builtin_items(task.config, 1, 8)
+    ]
+    assert [problem.question for problem in held] == [
+        item["question"]
+        for item in builtin_items(task.config, 1 + task.config.heldout_seed_offset, 8)
+    ]
+    assert [problem.question for problem in dev] == [
+        item["question"] for item in builtin_items(task.config, 1 + task.config.dev_seed_offset, 8)
+    ]
+    assert [problem.pid for problem in train] == [
+        f"decimal_chain_sum/train/{index:06d}" for index in range(8)
+    ]
+    assert [problem.pid for problem in dev] == [
+        f"decimal_chain_sum/dev/{index:06d}" for index in range(8)
+    ]
+    assert {problem.question for problem in train}.isdisjoint(problem.question for problem in dev)
+    assert {problem.question for problem in held}.isdisjoint(problem.question for problem in dev)
+    shifted = ChainSumTask(ChainSumConfig(dev_seed_offset=17))
+    assert [problem.to_json() for problem in shifted.problems("train", 8, seed=1)] == [
+        problem.to_json() for problem in train
+    ]
+    assert [problem.to_json() for problem in shifted.problems("heldout", 8, seed=1)] == [
+        problem.to_json() for problem in held
+    ]
+    with pytest.raises(ValueError, match="dev_seed_offset"):
+        ChainSumConfig(dev_seed_offset=task.config.heldout_seed_offset)
+
+
 def test_train_and_heldout_are_disjoint() -> None:
     task = ChainSumTask()
     train = task.problems("train", 500, seed=0)

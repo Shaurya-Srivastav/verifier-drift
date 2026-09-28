@@ -126,7 +126,7 @@ def test_cli_keeps_the_other_subcommands(capsys: pytest.CaptureFixture[str]) -> 
         main(["--help"])
     assert caught.value.code == 0
     text = capsys.readouterr().out
-    for name in ("env", "audit", "train", "score", "study", "pilot"):
+    for name in ("env", "audit", "train", "score", "study", "pilot", "program"):
         assert name in text
 
 
@@ -161,6 +161,68 @@ def test_study_returns_zero_only_when_the_report_is_ok(
     study.run_study = fail  # type: ignore[attr-defined]
     assert main(["study", "--config", str(config), "--out", str(out)]) == 1
     assert "FAIL" in capsys.readouterr().out
+
+
+def test_program_and_study_flags_are_on_the_cli(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as caught:
+        main(["program", "--help"])
+    assert caught.value.code == 0
+    text = capsys.readouterr().out
+    for name in ("render", "plan", "queue", "worker", "status", "analyze", "transfer-eval"):
+        assert name in text
+    with pytest.raises(SystemExit) as caught:
+        main(["study", "--help"])
+    assert caught.value.code == 0
+    study_help = capsys.readouterr().out
+    for flag in ("--only", "--arm", "--seed", "--early", "--variant"):
+        assert flag in study_help
+    with pytest.raises(SystemExit) as caught:
+        main(["program", "plan", "--help"])
+    assert caught.value.code == 0
+    plan_help = capsys.readouterr().out
+    for flag in ("--by-cell", "--budget-usd", "--gpus"):
+        assert flag in plan_help
+
+
+def test_study_forwards_a_single_job_and_preempted_exits_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sys
+    import types
+
+    study = types.ModuleType("vfates.study")
+    seen: dict = {}
+
+    def run_study(config: dict, out: Path, **kwargs: object) -> dict:
+        del config, out
+        seen["kwargs"] = kwargs
+        return {"ok": False, "summary": "PREEMPTED"}
+
+    study.run_study = run_study  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vfates.study", study)
+    config = tmp_path / "study.yaml"
+    config.write_text("name: demo\n", encoding="utf-8")
+    code = main(
+        [
+            "study",
+            "--config",
+            str(config),
+            "--out",
+            str(tmp_path / "out"),
+            "--only",
+            "train",
+            "--arm",
+            "oracle",
+            "--seed",
+            "0",
+            "--early",
+        ]
+    )
+    assert code == 0
+    assert seen["kwargs"] == {"only": "train", "arm": "oracle", "seed": 0, "early": True}
+    assert "PREEMPTED" in capsys.readouterr().out
 
 
 def test_rule_monitors_from_build_arms() -> None:

@@ -68,6 +68,10 @@ def test_trl_kwargs_map_the_objective(tmp_path: Path) -> None:
     assert kwargs["vllm_importance_sampling_correction"] is False
     assert kwargs["logging_nan_inf_filter"] is False
     assert kwargs["bf16"] is False
+    assert kwargs["vllm_tensor_parallel_size"] == 1
+    assert kwargs["vllm_enable_sleep_mode"] is False
+    assert kwargs["chat_template_kwargs"] is None
+    assert kwargs["gradient_accumulation_steps"] == 16 // (4 * 1)
     assert trl_run_metadata(cfg, use_vllm=True)["rollout_seeded"] is False
     assert trl_run_metadata(cfg, use_vllm=False)["rollout_seeded"] is True
     assert kwargs["remove_unused_columns"] is False
@@ -514,3 +518,123 @@ def test_nonfinite_loss_raises_before_a_write(tmp_path: Path) -> None:
     )
     with pytest.raises(NonFiniteLossError, match="gradient norm"):
         guard.on_pre_optimizer_step(None, trainer.state, None, model=trainer.model)
+
+
+@pytest.mark.torch
+def test_full_finetune_skips_peft_and_records_parameterisation(tmp_path: Path) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("peft")
+    pytest.importorskip("trl")
+    from peft import PeftModel
+
+    try:
+        model, tokenizer = _tiny_hf()
+    except OSError:
+        pytest.skip("the Qwen2.5-0.5B-Instruct tokenizer is not in the local Hugging Face cache")
+    trainer = _build(tmp_path, model, tokenizer, full_finetune=True, lora=None)
+    assert not isinstance(trainer.model, PeftModel)
+    assert all(param.requires_grad for param in trainer.model.parameters())
+    assert not any("lora_" in name for name, _param in trainer.model.named_parameters())
+    meta = json.loads((tmp_path / "run_metadata.json").read_text())
+    assert meta["parameterisation"] == "full"
+    assert meta["lora_init"] is None
+    assert trainer.args.optim == "adamw_torch"
+
+
+def test_preemption_callback_saves_and_stops_on_a_fake_step() -> None:
+    """SIGUSR1 sets the flag. The next step end saves and stops. MLX checks the same flag."""
+    import os
+    import signal
+    from types import SimpleNamespace
+
+    from vfates.train.trl_grpo import PreemptionCallback
+
+    callback = PreemptionCallback()
+    state = SimpleNamespace(global_step=4)
+    control = SimpleNamespace(should_save=False, should_training_stop=False)
+    assert callback.on_step_end(None, state, control) is control
+    assert control.should_training_stop is False
+    callback.install()
+    try:
+        os.kill(os.getpid(), signal.SIGUSR1)
+        assert callback.preempted is True
+    finally:
+        callback.restore()
+    stopped = callback.on_step_end(None, state, control)
+    assert stopped.should_save is True
+    assert stopped.should_training_stop is True
+
+
+def test_bind_vllm_chat_template_forwards_kwargs() -> None:
+    from vfates.train.trl_grpo import bind_vllm_chat_template
+
+    class _LLM:
+        def chat(self, messages, sampling_params=None, chat_template_kwargs=None):
+            self.messages = messages
+            self.sampling_params = sampling_params
+            self.chat_template_kwargs = chat_template_kwargs
+            return "ok"
+
+    llm = _LLM()
+    bind_vllm_chat_template(llm, {"enable_thinking": False})
+    assert llm.chat([{"role": "user", "content": "hi"}], sampling_params="params") == "ok"
+    assert llm.chat_template_kwargs == {"enable_thinking": False}
+
+
+class _RecordingTokenizer:
+    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=True, **kwargs):
+        assert add_generation_prompt is True
+        assert tokenize is True
+        self.kwargs = dict(kwargs)
+        self.messages = messages
+        return [3, 1, 4]
+
+
+def test_trl_prompt_ids_match_encode_prompt() -> None:
+    from vfates.gen.base import chat_messages
+    from vfates.gen.chat import encode_prompt
+    from vfates.train.trl_grpo import trl_prompt_ids
+
+    tokenizer = _RecordingTokenizer()
+    user = "What is 2+2?"
+    kwargs = {"enable_thinking": False}
+    left = encode_prompt(tokenizer, user, chat_template_kwargs=kwargs)
+    right = trl_prompt_ids(tokenizer, chat_messages(user), chat_template_kwargs=kwargs)
+    assert left == right == [3, 1, 4]
+    assert tokenizer.kwargs == kwargs
+
+
+@pytest.mark.network
+def test_qwen3_thinking_off_matches_the_trl_prompt_path() -> None:
+    """Tokenizer files only. Qwen3 enable_thinking false is the same ids in both paths."""
+    pytest.importorskip("transformers")
+    from transformers import AutoTokenizer
+
+    from vfates.gen.base import chat_messages
+    from vfates.gen.chat import encode_prompt
+    from vfates.train.trl_grpo import trl_prompt_ids
+
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    user = "What is 2 + 2? Put the answer after the step."
+    kwargs = {"enable_thinking": False}
+    encoded = encode_prompt(tokenizer, user, chat_template_kwargs=kwargs)
+    trl_ids = trl_prompt_ids(tokenizer, chat_messages(user), chat_template_kwargs=kwargs)
+    assert encoded == trl_ids
+    thinking = encode_prompt(tokenizer, user, chat_template_kwargs={"enable_thinking": True})
+    assert encoded != thinking
+    # Qwen3's non-thinking switch prefills an empty think block. Thinking mode
+    # leaves that block out so the completion can open it.
+    off = tokenizer.apply_chat_template(
+        chat_messages(user),
+        add_generation_prompt=True,
+        tokenize=False,
+        enable_thinking=False,
+    )
+    on = tokenizer.apply_chat_template(
+        chat_messages(user),
+        add_generation_prompt=True,
+        tokenize=False,
+        enable_thinking=True,
+    )
+    assert off.endswith("<think>\n\n</think>\n\n")
+    assert not on.endswith("<think>\n\n</think>\n\n")

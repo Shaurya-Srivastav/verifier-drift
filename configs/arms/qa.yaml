@@ -1,0 +1,62 @@
+# Step-0 arms for the QA task.
+# The kit (kit.yaml, same directory) is included first. Targets stay the kit's
+# FPR 0.15 and FNR 0.30. {domain} salts become qa/... when the loader sees
+# domain: qa. Thresholds and phrases are NOT stored here: calibrate_arms fits
+# them. Order matters: resampled and patch arms refer to arms above them.
+include: kit.yaml
+domain: qa
+
+arms:
+  # Natural verifier: TIGER-Lab/general-verifier, temperature 0, max_tokens
+  # 1024, served at VFATES_JUDGE_BASE_URL. The verdict is 1 exactly when the
+  # reply contains "Final Decision: Yes". Ignores the oracle bit. The prompt
+  # is the model card's completion prompt (question, reference answer, student
+  # answer). A missing box still sends the extracted answer or the response,
+  # so the judge can accept a reply the parser did not box.
+  - name: natural
+    type: model_judge
+
+  # Resampled noise matched to natural's achieved pooled rates. Support is
+  # every completion, including replies with no parsed answer: the judge can
+  # accept a master-key opener that never closes a box.
+  - name: noise_natural
+    type: resampled
+    match: natural
+    support: all
+    seed: 0
+
+  # After features, before the lock. Keep the k categories with the highest
+  # locked tau_pool. Ties break by fewer errors fixed, then lexicographic
+  # category name. Selection and step-0 rates go into forecasts and the lock.
+  - name: patch_tau
+    type: patch_select
+    base: natural
+    k: 2
+    by: tau
+
+  # The k categories with the most step-0 train-pool errors of natural.
+  # Ties follow task.error_categories order. If the two selections are equal,
+  # patch_rate is withdrawn with reason same_selection.
+  - name: patch_rate
+    type: patch_select
+    base: natural
+    k: 2
+    by: rate
+
+  # Reported robust judge (Zhao et al., arXiv:2507.08794). sarosavo/Master-RM,
+  # revision 9fd43a7a4194a703d02be3fbdcfc276cb046d8e4, fine-tuned from
+  # Qwen/Qwen2.5-7B-Instruct. Chat prompt from the model card. A stripped
+  # reply of exactly YES scores 1. Full menu only. Served at
+  # VFATES_JUDGE_BASE_URL under this model id. Cache key is model, revision,
+  # and the sha256 of the filled prompt.
+  - name: natural_robust
+    type: master_rm
+
+  # Resampled class-conditional noise matched to natural_robust. Support is
+  # all, the same support as noise_natural: a completion with no box is still
+  # inside the draw, because the judge scores the whole response.
+  - name: noise_natural_robust
+    type: resampled
+    match: natural_robust
+    support: all
+    seed: 0

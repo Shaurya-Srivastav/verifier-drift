@@ -1,74 +1,24 @@
-# P4: exploratory micro-GRPO on the Mac. Trains every arm on P3's frozen pools
-# and scores the P3 lock. MLX, Qwen2.5-0.5B-Instruct, LoRA.
-# About 110 minutes per arm at 512 tokens; runs are resumable.
-
-audit_dir: pilots/p3_estimator/results/audit
-# Train on the first 256 of P3's 1,024 train prompts: 150 steps x 8 prompts
-# stay about 4.7 epochs, the regime P4.1's 0.10 gain was set for. The locked
-# forecasts use the whole audit pool.
-max_train: 256
-backend: mlx
-seeds: [0]
-n_boot: 2000
-
-arms: [oracle, noise_fp, fp_tolerance, fp_tolerance_decoy, fp_hash, fp_trigger,
-       noise_fp_trigger, noise_fn, fn_behavior, fn_prompt_subset]
-
-# fp_trigger is paired with noise_fp_trigger, not with noise_fp.
-# fp_tolerance_decoy is a shared arm under noise_fp. fp_hash stays local.
-families:
-  - {control: noise_fp, kind: fp, shared: [fp_tolerance, fp_tolerance_decoy], local: [fp_hash]}
-  - {control: noise_fp_trigger, kind: fp, shared: [fp_trigger], local: []}
-  - {control: noise_fn, kind: fn, shared: [fn_behavior], local: [fn_prompt_subset]}
-
-train:
-  model_id: Qwen/Qwen2.5-0.5B-Instruct
-  steps: 150
-  prompts_per_step: 8
-  group_size: 8
-  max_tokens: 512
-  temperature: 1.0
-  lr: 5.0e-5
-  warmup_steps: 5
-  beta_kl: 0.0
-  loss_agg: seq_mean
-  adv_mode: std
-  num_iterations: 1
-  grad_clip: 1.0
-  micro_batch_size: 8
-  gradient_checkpointing: true
-  data_regime: multi_epoch
-  eval_every: 25
-  eval_heldout_n: 128
-  eval_train_n: 64
-  eval_samples_per_prompt: 4
-  eval_max_tokens: 512
-  eval_temperature: 1.0
-  save_every: 25
-  lora: {rank: 16, alpha: 32, dropout: 0.0, keys: [q, k, v, o, gate, up, down], num_layers: -1}
-
-gates:
-  oracle_gain: 0.10
-  fate_gap: 0.05
-  local_tol: 0.05
-  alpha: 0.05
-
-# Placeholder E1 cost. Eval tokens are included. P5's wall clock replaces it.
-cost_model:
-  mean_completion_len: 350
-  steps: 300
-  prompts_per_step: 64
-  group_size: 8
-  full_runs: 39
-  early_runs: 13
-  early_steps: 25
-  eval_every: 25
-  eval_prompts: 384
-  eval_train_prompts: 128
-  eval_samples: 4
-  audit_prompts: 1408
-  audit_samples: 16
-  h100_gen_tok_s: 20000
-  h100_train_tok_s: 40000
-  overhead: 1.25
-  usd_per_h100_hour: 2.5
+schema: vfates.p4_decisions/1
+title: P4 micro-GRPO
+steps: 150
+oracle_gain: 0.10
+seed: 0
+smoke: false
+train_fates: true
+domains:
+  - chain_sum
+  - math
+  - code
+  - ifeval
+  - qa
+# Domains whose backup source P2 has already screened. A failing primary is
+# rescreened only when its name is in this list.
+backup_screened: []
+cells:
+  chain_sum: e1-chain_sum-qwen3-1.7b
+  math: e1-math-qwen3-1.7b
+  code: e1-code-qwen3-1.7b
+  ifeval: e1-ifeval-qwen3-1.7b
+  qa: e1-qa-qwen3-1.7b
+# Dotted overrides applied to every cell (pool caps, for example).
+cell_overrides: {}

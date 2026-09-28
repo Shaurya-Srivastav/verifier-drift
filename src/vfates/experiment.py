@@ -8,6 +8,8 @@ the trainer backend, and the GRPO hyperparameters.
 
 from __future__ import annotations
 
+import os
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,7 @@ from typing import Any
 from vfates.audit import LORA_INIT_NAME, artifact_sha256, load_audit, read_lock_record
 from vfates.train.config import GRPOConfig
 from vfates.utils.env import environment_report
+from vfates.utils.env import hardware_class as detect_hardware_class
 from vfates.utils.io import read_json, write_json
 from vfates.verifiers.monitors import rule_monitors
 
@@ -107,6 +110,44 @@ def _check_audited_policy(audit_config: Mapping[str, Any], config: GRPOConfig) -
         raise ValueError("training does not sample the audited policy: " + "; ".join(mismatches))
 
 
+def _preempted_wall_seconds(path: Path) -> float:
+    """Wall time already recorded on a preempted summary, otherwise 0."""
+    if not path.is_file():
+        return 0.0
+    try:
+        summary = read_json(path)
+    except (OSError, ValueError):
+        return 0.0
+    if not isinstance(summary, dict) or summary.get("status") != "preempted":
+        return 0.0
+    timing = summary.get("timing")
+    if not isinstance(timing, dict):
+        return 0.0
+    wall = timing.get("wall_seconds")
+    if isinstance(wall, bool) or not isinstance(wall, (int, float)):
+        return 0.0
+    return float(wall)
+
+
+def _attach_run_timing(
+    out_dir: Path,
+    summary: dict[str, Any],
+    started: float,
+    prior_wall: float,
+    hardware: str,
+) -> dict[str, Any]:
+    """Write ``timing`` onto a run summary. GPU count is observed, never guessed."""
+    from vfates.audit import visible_gpu_count
+
+    summary["timing"] = {
+        "wall_seconds": prior_wall + (time.perf_counter() - started),
+        "gpus": visible_gpu_count(),
+        "hardware_class": hardware,
+    }
+    write_json(out_dir / "summary.json", summary)
+    return summary
+
+
 def train_arm(
     audit_dir: str | Path,
     arm: str,
@@ -118,12 +159,17 @@ def train_arm(
     max_train: int | None = None,
     max_heldout: int | None = None,
     eval_generator: Mapping[str, Any] | None = None,
+    hardware_class: str | None = None,
 ) -> dict[str, Any]:
     """Run GRPO with ``arm`` as the reward on the audit's train pool; evaluate on held-out.
 
     ``max_train`` / ``max_heldout`` take a prefix of the frozen pools (for pilots).
     ``eval_generator`` (``{"backend", "kwargs"}``) is the sampler for the TRL
     backend's checkpoint evals; the MLX trainer evaluates in-loop.
+    ``hardware_class`` is the cell's declared class (``study.hardware_class``).
+    Training is refused when it differs from :func:`detect_hardware_class`
+    unless ``VFATES_ALLOW_HARDWARE_MISMATCH=1``. Both values are stored in
+    ``run.json``.
     """
     audit = load_audit(audit_dir)
     if arm not in audit.arms:
@@ -161,9 +207,27 @@ def train_arm(
         train_config.to_dict() if isinstance(train_config, GRPOConfig) else dict(train_config)
     )
     cfg_dict["out_dir"] = str(out_dir)
+    declared = hardware_class if hardware_class is not None else cfg_dict.get("hardware_class")
+    if declared is not None:
+        cfg_dict["hardware_class"] = str(declared)
     config = GRPOConfig.from_dict(cfg_dict)
+    detected = detect_hardware_class()
+    override = os.environ.get("VFATES_ALLOW_HARDWARE_MISMATCH") == "1"
+    mismatch = declared is not None and str(declared) != detected
+    if mismatch and not override:
+        raise RuntimeError(
+            f"hardware class {detected!r} does not match the cell's declared class "
+            f"{declared!r}. Set VFATES_ALLOW_HARDWARE_MISMATCH=1 to train anyway."
+        )
     _check_audited_policy(read_json(audit_path / "config.json")["config"], config)
-    if lora_sha is not None:
+    if config.full_finetune:
+        # The audit still has a LoRA A file. Full-parameter training does not load it.
+        if backend == "mlx":
+            raise RuntimeError(
+                "MLX training does not support full_finetune. "
+                "Train every parameter with the trl backend."
+            )
+    elif lora_sha is not None:
         config = _with_lora_init(config, str(init_path), lora_sha)
     train = [p for p in audit.problems.values() if p.split == "train"][:max_train]
     held = [p for p in audit.problems.values() if p.split == "heldout"][:max_heldout]
@@ -181,30 +245,39 @@ def train_arm(
             "n_train": len(train),
             "n_heldout": len(held),
             "lock_sha256": lock_sha,
-            "lora_init_sha256": lora_sha,
+            "lora_init_sha256": None if config.full_finetune else lora_sha,
+            "parameterisation": config.parameterisation,
             "git_commit": env.get("git_commit"),
             "git_dirty": env.get("git_dirty"),
             "git_head": env.get("git_head"),
             "environment": env,
+            "hardware_class_declared": None if declared is None else str(declared),
+            "hardware_class_detected": detected,
+            "hardware_mismatch_override": bool(mismatch and override),
         },
     )
+    out_path = Path(out_dir)
+    prior_wall = _preempted_wall_seconds(out_path / "summary.json")
+    started = time.perf_counter()
     if backend == "mlx":
         from vfates.train.mlx_grpo import MLXGRPOTrainer
 
         trainer = MLXGRPOTrainer(config, audit.task, verifier, train, held, monitors=monitors)
-        return trainer.run(resume=resume)
+        summary = trainer.run(resume=resume)
+        return _attach_run_timing(out_path, summary, started, prior_wall, detected)
     if backend == "trl":
-        return _train_trl(
+        summary = _train_trl(
             config,
             audit,
             verifier,
             train,
             held,
             monitors,
-            Path(out_dir),
+            out_path,
             resume=resume,
             eval_generator=eval_generator,
         )
+        return _attach_run_timing(out_path, summary, started, prior_wall, detected)
     raise ValueError(f"unknown backend {backend!r}; expected 'mlx' or 'trl'")
 
 
@@ -220,48 +293,104 @@ def _train_trl(
     resume: bool,
     eval_generator: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """TRL training, then the shared held-out protocol on every saved adapter."""
+    """TRL training, then the shared held-out protocol on every saved adapter.
+
+    The eval generator is built only after the trainer and its colocated vLLM
+    engine are released. A preemption signal saves a checkpoint, writes
+    ``summary.json`` with ``status`` ``preempted``, and returns so the process
+    can exit 0. Resume uses the existing checkpoint path.
+    """
     import gc
 
     import torch
 
-    from vfates.gen.factory import make_generator
-    from vfates.train.checkpoint_eval import evaluate_checkpoints, peft_checkpoints
+    from vfates.train.checkpoint_eval import (
+        evaluate_checkpoints,
+        make_eval_generator,
+        release_colocated_engine,
+        saved_checkpoints,
+    )
     from vfates.train.trl_grpo import RUN_METADATA_NAME, build_trl_trainer
 
     extra = {"eval_strategy": "no", "eval_on_start": False, "save_total_limit": None}
     trainer = build_trl_trainer(
         config, audit.task, verifier, train, held, monitors=monitors, extra_trl_args=extra
     )
-    trainer.train(resume_from_checkpoint=True if resume and peft_checkpoints(out_dir) else None)
-    steps = int(trainer.state.global_step)
-    final = out_dir / f"checkpoint-{steps}"
-    if not final.exists():
-        trainer.save_model(str(final))
-    del trainer
-    gc.collect()
+    flag = getattr(trainer, "_vfates_preemption", None)
+    steps = 0
+    preempted = False
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        for index in range(torch.cuda.device_count()):
+            torch.cuda.reset_peak_memory_stats(index)
+    try:
+        if flag is not None:
+            flag.install()
+        trainer.train(
+            resume_from_checkpoint=True if resume and saved_checkpoints(out_dir) else None
+        )
+        steps = int(trainer.state.global_step)
+        preempted = bool(flag is not None and flag.preempted)
+        checkpoint = out_dir / f"checkpoint-{steps}"
+        if not checkpoint.exists():
+            trainer.save_model(str(checkpoint))
+    finally:
+        if flag is not None:
+            flag.restore()
+        release_colocated_engine(trainer)
+        del trainer
+        gc.collect()
+        peaks = _cuda_peak_gib(torch)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    spec = dict(eval_generator or {})
-    backend = spec.pop("backend", "vllm" if torch.cuda.is_available() else "hf")
-    kwargs = dict(spec.pop("kwargs", {}))
-    if backend == "vllm":
-        kwargs.setdefault("enable_lora", True)
-        kwargs.setdefault("max_lora_rank", int(config.lora.rank))
-    generator = make_generator(backend, config.model_id, **kwargs)
+    metadata = read_json(out_dir / RUN_METADATA_NAME)
+    if preempted:
+        summary = {
+            "out_dir": str(out_dir),
+            "steps_completed": steps,
+            "backend": "trl",
+            "status": "preempted",
+            "lora_seed": metadata["lora_seed"],
+            "lora_init_sha256": metadata["lora_init_sha256"],
+            "rollout_seeded": metadata["rollout_seeded"],
+            "parameterisation": metadata["parameterisation"],
+            **peaks,
+        }
+        write_json(out_dir / "summary.json", summary)
+        return summary
+
+    generator = make_eval_generator(config, eval_generator)
     evaluate_checkpoints(
         out_dir, audit.task, config, generator, train, held, verifier=verifier, monitors=monitors
     )
-    metadata = read_json(out_dir / RUN_METADATA_NAME)
     summary = {
         "out_dir": str(out_dir),
         "steps_completed": steps,
         "backend": "trl",
+        "status": "complete",
         "eval_generator": generator.describe(),
         "lora_seed": metadata["lora_seed"],
         "lora_init_sha256": metadata["lora_init_sha256"],
         "rollout_seeded": metadata["rollout_seeded"],
+        "parameterisation": metadata["parameterisation"],
+        **peaks,
     }
     write_json(out_dir / "summary.json", summary)
     return summary
+
+
+def _cuda_peak_gib(torch: Any) -> dict[str, Any]:
+    """Peak GiB per CUDA device, read before the cache is released.
+
+    ``peak_memory_gb`` is the max across devices, or null when CUDA is absent.
+    """
+    if not torch.cuda.is_available():
+        return {"peak_memory_gb_per_gpu": {}, "peak_memory_gb": None}
+    per_gpu = {
+        str(index): round(torch.cuda.max_memory_allocated(index) / 1024**3, 3)
+        for index in range(torch.cuda.device_count())
+    }
+    return {
+        "peak_memory_gb_per_gpu": per_gpu,
+        "peak_memory_gb": max(per_gpu.values()) if per_gpu else None,
+    }

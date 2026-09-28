@@ -1,40 +1,75 @@
-# P1: harness pilot
+# P1 harness
 
-Checks, with the real pilot model, that every stage the study depends on computes what it claims: sampling, grading, calibration, LoRA-B features, forecasts, the lock, GRPO training, resumption, and the analysis join. Nothing here tests the hypothesis. A failure here means a later result could be an artefact of the code.
+Question: before any study GPU time, does every stage of every domain compute what it claims, and do the training, program, and analysis entry points refuse the cases the study refuses?
 
-The committed run is [`results/report.md`](results/report.md).
+## What this run checks
 
-## What each check is for
+Structural command (no model). These checks are gated unless marked documented.
 
-| Check | Claim |
-| --- | --- |
-| P1.1 | The unit and integration suite passes (`pytest -m "not slow and not network"`). |
-| P1.2 | The built-in chain-sum generator is bit-identical to Reasoning Gym's `decimal_chain_sum` on `identity_items` items (question, answer, metadata). |
-| P1.3 | A tiny audit writes every artefact: problems, completions, calibration, table, confusion, features, feature metadata, forecasts, the fingerprint manifest, the LoRA init file, and the lock. |
-| P1.4 | The lock verifies, and editing one forecast value makes verification fail (tamper detection). |
-| P1.5 | Rerunning the audit on its own directory changes no artifact hash: problems, completions, calibration, verdicts, features, forecasts, `stages.json`, `lora_init.safetensors`, and the lock (resume is idempotent: no resampling, no refitting). |
-| P1.11 | The locked payload is the canonical JSON of `forecasts.json`. |
-| P1.12 | `features.meta.json` records `token_source: token_ids`, so the screen was computed from the sampled token ids. |
-| P1.13 | `stages.json` has a fingerprint for problems, completions, calibration, the verdict table, features, and forecasts. |
-| P1.14 | `lora_init.safetensors` loads and its SHA-256 equals `lock.json` `artifacts.lora_init`. |
-| P1.6 | Per-token log-probabilities from MLX sampling agree with a float32 PyTorch rescoring of the same token ids (median absolute difference per token at most `gates.logprob_per_token`). A tokenisation or alignment bug is off by more than a nat per token; bf16 rounding is a few hundredths. |
-| P1.7 | Decoded completions re-encode to the sampled token ids (`encode_completion`) in at least `gates.roundtrip_rate` of samples, so features and training see the tokens that were sampled. |
-| P1.8 | MLX `LoRALinear` and PEFT `LoraConfig` built from the same `LoRAConfig` wrap the same modules with the same scale (`alpha / rank`). |
-| P1.9 | Two GRPO steps with the `train_arm` arm write metrics, evals, per-prompt evals and checkpoints; resuming to `steps + 1` continues from the checkpoint. |
-| P1.10 | The analysis layer joins the run to the lock (`score_forecasts`) and computes a prompt-paired contrast. |
+| Id | Check | Threshold |
+| --- | --- | --- |
+| P1.0 | Model path was not run | documented |
+| P1.1 | Unit suite, only when `pytest: true` | exit 0 |
+| P1.2 | Built-in chain-sum items equal Reasoning Gym, when that package imports | identical |
+| P1.22 | SIGUSR1 sets `PreemptionCallback.preempted`. This checks the callback flag. It does not signal a running trainer. | flag is true |
+| P1.23 | Study refuses a hardware-class mismatch | `ValueError` before the audit |
+| P1.24 | Study refuses a `chat_template_kwargs` mismatch | `ValueError` before the audit |
+| P1.25 | Render, plan, enqueue, local worker, `program status` | every enqueued job done |
+| P1.26 | `pooled_report` reads base, early, and variant runs | schema `vfates.pooled/1`, oracle gain present, variant `streaming` |
+| P1.27 | The plan contains a transfer-eval job | at least one |
+| P1.28 | Confirmatory report is well formed | schema `vfates.confirmatory/1`; H3 may be `not_tested` |
+| P1.29 | Confirmatory analysis refuses an incomplete cell | error contains `incomplete planned runs` |
 
-## How to run
+`live: true` adds, per domain, on the development pool with `Qwen/Qwen3-0.6B`:
+
+| Id | Check | Threshold |
+| --- | --- | --- |
+| P1.3 | Audit artifacts, including `patches.json` exactly when the menu has a patch arm | none missing |
+| P1.5 | A second `run_audit` changes no artifact digest | 0 changed |
+| P1.11 | Lock payload equals `forecasts.json` | canonical JSON |
+| P1.12 | Features record `token_source: token_ids` | exact |
+| P1.13 | `stages.json` fingerprints, `patches` exactly when patch arms exist | 64 hex chars |
+| P1.15 | Lock `pool_source` is `dev` | exact |
+| P1.16 | Lock `hardware_class` equals this machine | exact |
+| P1.17 | Every arm has `tau_pool_budget` at 32, 64, 128, 192, with draws unless the budget is exact | all four |
+| P1.18 | `patch_selection` is present exactly when patch arms exist | match |
+| P1.14 | LoRA init file loads and its sha256 is the lock's | match |
+| P1.4 | chain_sum lock verifies, and a one-number copy does not | both |
+| P1.6 | MLX and PyTorch log-probs on chain_sum development prompts | median absolute difference at most 0.05 nats/token |
+| P1.7 | Decoded completions re-encode to the sampled token ids | rate at least 0.95 |
+| P1.8 | MLX and PEFT LoRA adapt the same modules at the same scale | same set and scales |
+| P1.21 | chain_sum GRPO, 2 steps, MLX, audit LoRA A, held-out eval at step 0 and step 2 | both steps |
+| P1.9 | That GRPO run logs, checkpoints, and resumes one step further | steps completed equals 3 |
+| P1.10 | Analysis joins the chain_sum lock with the oracle run | 1 arm scored |
+
+P1.4, P1.6, P1.7, P1.8, P1.9, and P1.10 use the chain_sum cell from `cell_config(..., dev=True)` and `Qwen/Qwen3-0.6B`. P1.6 samples the development split. The program, refusal, and confirmatory checks use no model.
+
+Math uses DeepScaleR when `HF_TOKEN` is unset, and Big-Math otherwise. QA uses the heuristic judge on the live path. IFEval uses a heuristic `judge_config` on the live path. Feature extraction on the live path sets `load.device` to `cpu`.
+
+## Hardware and commands
+
+Structural, Apple silicon or CPU, no download:
 
 ```bash
-python pilots/p1_harness/run.py            # or: vfates pilot p1
+python pilots/p1_harness/run.py
 ```
 
-Defaults: `--config pilots/p1_harness/config.yaml`, `--out pilots/p1_harness/results`. `--set key=value` overrides a config entry (for example `--set pytest=false` to skip the suite when iterating). With `fresh: true` the tiny audit and run directories are rebuilt on every invocation.
+Live model path, Apple silicon, `Qwen/Qwen3-0.6B`:
+
+```bash
+python pilots/p1_harness/run.py --set live=true
+```
 
 ## Runtime
 
-About 2 minutes on a Mac Studio with an M4 Max once the weights are downloaded (123 s measured): the test suite, the audit (36 prompts with 4 samples each at 256 tokens, on MLX), LoRA-B features on MPS, the log-probability rescoring, and three GRPO steps (two, then one more after resuming).
+Structural is about 10 seconds. That is the five fake worker jobs plus the confirmatory fixture, measured by the unit test of `program_queue_smoke`.
 
-## Expected outcome
+Live is an estimate of about 40 minutes on Apple silicon, under the 45 minute ceiling. Five domains at 6 prompts, 2 samples, and 32 tokens, plus feature passes, an 8-prompt log-probability rescore at 128 tokens, a LoRA parity load, and a GRPO run that stops at step 2 and resumes through step 3. The feature pass dominates. This is not a measurement of that run.
 
-Exit code 0 and summary `PASS`, with no documented checks.
+## Files
+
+`results/report.json`, `results/report.md`. The live path also writes `results/domains/<domain>/` (an audit directory) and `results/train/`. The structural path writes `results/program/` and `results/confirmatory/`. Nothing here edits a study template.
+
+## How this feeds the study
+
+P1 does not choose a bucket or drop a domain. A failed gated check means that stage is not ready to spend GPU time. P1.0 is documented on the structural command, so a structural PASS is not a claim that the 0.6B audits ran.

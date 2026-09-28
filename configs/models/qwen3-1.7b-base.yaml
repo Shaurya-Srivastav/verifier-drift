@@ -1,0 +1,66 @@
+# Qwen3-1.7B-Base for exploratory cell X6 (chain_sum, Egashira et al.).
+# revision from https://huggingface.co/api/models/Qwen/Qwen3-1.7B-Base on
+# 2026-09-28. params_b is the safetensors header numel (1720574976). The base
+# checkpoint ties the embeddings, so there is no separate lm_head and the
+# count is lower than Qwen3-1.7B Instruct.
+# The tokenizer ships a chat template (tokenizer_config.json). With
+# chat_template_kwargs null, enable_thinking is undefined. The template then
+# ends the generation prompt at <|im_start|>assistant and does not prefill
+# the empty <think></think> block. That block is inserted only when
+# enable_thinking is passed and false, which is the chat-model switch and is
+# not used here. Prompt encoding is the same chat path as the instruct models.
+name: qwen3-1.7b-base
+model_id: Qwen/Qwen3-1.7B-Base
+revision: ea980cb0a6c2ae4b936e82123acc929f1cec04c1
+family: qwen3
+params_b: 1.720574976
+chat_template_kwargs: null
+lora_keys: [q, k, v, o, gate, up, down]
+dtype: bfloat16
+attn_implementation: flash_attention_2
+gated: false
+lr: 2.0e-5
+placement:
+  # Same device split as qwen3-1.7b. About 3.4 GB per copy. Two copies
+  # (train + colocated vLLM) fit a 32 GB card at micro 8.
+  apple-silicon:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 4
+    vllm_gpu_memory_utilization: 0.35
+  h100-80gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 32
+    vllm_gpu_memory_utilization: 0.35
+  a100-80gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 32
+    vllm_gpu_memory_utilization: 0.35
+  a100-40gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 16
+    vllm_gpu_memory_utilization: 0.35
+  rtx-a6000-48gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 16
+    vllm_gpu_memory_utilization: 0.35
+  rtx-5000-ada-32gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 8
+    vllm_gpu_memory_utilization: 0.40
+# Full-parameter placement, same 2-GPU split as qwen3-1.7b. This checkpoint
+# is 1.720574976e9 params, 3.44 GB in bf16. Weights, gradients, and two AdamW
+# moments are 13.76 GB, plus a 3.44 GB vLLM copy, about 17.2 GB on one GPU
+# before activations and KV. Two A6000s with FSDP and tp 2 put about 8.6 GB
+# of that on each GPU. Use configs/accelerate/fsdp_2gpu_full.yaml.
+placement_full:
+  rtx-a6000-48gb:
+    gpus: 2
+    tp: 2
+    micro_batch_size: 8
+    vllm_gpu_memory_utilization: 0.40

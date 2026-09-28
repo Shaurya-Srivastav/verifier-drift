@@ -12,10 +12,12 @@ Evaluated ``(step, split)`` pairs are skipped on rerun.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import contextlib
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from vfates.gen.factory import BackendName
 from vfates.tasks.base import Task
 from vfates.train.config import GRPOConfig
 from vfates.train.evaluate import append_eval_samples, eval_log_rows, evaluate_policy
@@ -26,14 +28,121 @@ from vfates.utils.io import append_jsonl, read_jsonl
 from vfates.verifiers.base import Verifier
 
 
+def release_colocated_engine(trainer: Any) -> None:
+    """Drop a colocated vLLM engine before constructing the eval generator.
+
+    TRL 0.25.1 stores that engine on ``trainer.llm``. The eval
+    :class:`~vfates.gen.vllm_backend.VLLMGenerator` needs the same GPUs, so it
+    is created only after this returns.
+    """
+    engine = getattr(trainer, "llm", None)
+    if engine is None:
+        return
+    shutdown = getattr(engine, "shutdown", None)
+    if callable(shutdown):
+        with contextlib.suppress(Exception):
+            shutdown()
+    with contextlib.suppress(Exception):
+        trainer.llm = None
+
+
+def make_eval_generator(
+    config: GRPOConfig,
+    spec: Mapping[str, Any] | None = None,
+) -> Any:
+    """Sampler for checkpoint eval. Call only after :func:`release_colocated_engine`.
+
+    A vLLM spec receives ``tensor_parallel_size`` from
+    ``config.vllm_tensor_parallel_size`` unless the spec already set it, plus
+    LoRA loading and the run's ``chat_template_kwargs``.
+    """
+    import torch
+
+    from vfates.gen.factory import make_generator
+
+    raw = dict(spec or {})
+    backend = _eval_backend(str(raw.pop("backend", "vllm" if torch.cuda.is_available() else "hf")))
+    kwargs = dict(raw.pop("kwargs", {}))
+    if backend == "vllm":
+        kwargs.setdefault("tensor_parallel_size", int(config.vllm_tensor_parallel_size))
+        if not config.full_finetune:
+            kwargs.setdefault("enable_lora", True)
+            kwargs.setdefault("max_lora_rank", int(config.lora.rank))
+    if config.chat_template_kwargs:
+        kwargs.setdefault("chat_template_kwargs", dict(config.chat_template_kwargs))
+    if config.model_revision and "revision" not in kwargs:
+        kwargs.setdefault("revision", config.model_revision)
+    return make_generator(backend, config.model_id, **kwargs)
+
+
+def _eval_backend(name: str) -> BackendName:
+    if name == "mlx":
+        return "mlx"
+    if name == "hf":
+        return "hf"
+    if name == "vllm":
+        return "vllm"
+    raise ValueError(f"unknown eval backend {name!r}; expected 'mlx', 'hf' or 'vllm'")
+
+
+_FULL_WEIGHT_NAMES = (
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "pytorch_model.bin",
+    "pytorch_model.bin.index.json",
+)
+
+
+def is_adapter_checkpoint(path: str | Path) -> bool:
+    """True when ``path`` is a PEFT adapter directory."""
+    return (Path(path) / "adapter_config.json").is_file()
+
+
+def is_full_model_checkpoint(path: str | Path) -> bool:
+    """True when ``path`` holds a full Hugging Face weight file."""
+    directory = Path(path)
+    return any((directory / name).is_file() for name in _FULL_WEIGHT_NAMES)
+
+
 def peft_checkpoints(run_dir: str | Path) -> list[tuple[int, Path]]:
     """``(step, path)`` of every ``checkpoint-<step>`` holding a PEFT adapter, by step."""
+    return [
+        (step, path) for step, path in saved_checkpoints(run_dir) if is_adapter_checkpoint(path)
+    ]
+
+
+def saved_checkpoints(run_dir: str | Path) -> list[tuple[int, Path]]:
+    """``(step, path)`` of every ``checkpoint-<step>`` that eval can load, by step.
+
+    A directory counts when it holds a PEFT adapter or a full-model weight file.
+    """
     found = []
     for path in Path(run_dir).glob("checkpoint-*"):
         suffix = path.name.split("-", 1)[1]
-        if suffix.isdigit() and (path / "adapter_config.json").exists():
+        if suffix.isdigit() and (is_adapter_checkpoint(path) or is_full_model_checkpoint(path)):
             found.append((int(suffix), path))
     return sorted(found)
+
+
+def apply_eval_checkpoint(generator: Any, path: str | Path | None) -> None:
+    """Point ``generator`` at a checkpoint. ``None`` is the base model.
+
+    Adapter directories use ``set_adapter``. Full-model directories use
+    ``load_full_checkpoint`` (HF and vLLM). Step 0 restores both.
+    """
+    if path is not None and is_full_model_checkpoint(path) and not is_adapter_checkpoint(path):
+        loader = getattr(generator, "load_full_checkpoint", None)
+        if not callable(loader):
+            raise RuntimeError(
+                f"{path} is a full-model checkpoint and {type(generator).__name__} "
+                "has no load_full_checkpoint"
+            )
+        loader(str(path))
+        return
+    restorer = getattr(generator, "load_full_checkpoint", None)
+    if path is None and callable(restorer):
+        restorer(None)
+    generator.set_adapter(None if path is None else str(path))
 
 
 def evaluate_checkpoints(
@@ -50,7 +159,8 @@ def evaluate_checkpoints(
 ) -> list[tuple[int, str]]:
     """Evaluate step 0 and each checkpoint; return the ``(step, split)`` pairs written.
 
-    ``generator`` must implement ``set_adapter(path | None)``
+    ``generator`` must implement ``set_adapter(path | None)``. A full-model
+    checkpoint also needs ``load_full_checkpoint``
     (:class:`~vfates.gen.hf_backend.HFGenerator`,
     :class:`~vfates.gen.vllm_backend.VLLMGenerator`). Draw seeds are
     ``stable_seed(config.seed, "eval", step, split)``, as in the MLX trainer.
@@ -58,7 +168,7 @@ def evaluate_checkpoints(
     run_dir = Path(run_dir)
     log = run_dir / "eval.jsonl"
     done = {(r["step"], r["split"]) for r in read_jsonl(log)} if log.exists() else set()
-    points: list[tuple[int, Path | None]] = [(0, None), *peft_checkpoints(run_dir)]
+    points: list[tuple[int, Path | None]] = [(0, None), *saved_checkpoints(run_dir)]
     splits = {
         "heldout": list(heldout_problems)[: config.eval_heldout_n],
         "train": list(train_problems)[: config.eval_train_n],
@@ -77,7 +187,7 @@ def evaluate_checkpoints(
             todo = [s for s, probs in splits.items() if probs and (step, s) not in done]
             if not todo:
                 continue
-            generator.set_adapter(None if path is None else str(path))
+            apply_eval_checkpoint(generator, path)
             for split in todo:
                 stats = evaluate_policy(
                     generator,

@@ -10,7 +10,8 @@ TRL's eval sampler repeats each held-out prompt ``num_generations`` times, so
 ``eval_samples_per_prompt`` is not an independent knob here, and its pooled
 means go to ``trl_eval.jsonl``. The endpoint (``eval.jsonl``,
 ``eval_prompts.jsonl``) comes from :mod:`vfates.train.checkpoint_eval`, run on
-the saved adapters after training.
+the saved checkpoints after training. A full-parameter run
+(``full_finetune``) saves the whole model, not an adapter.
 
 LoRA A is drawn from ``config.lora_seed`` (or loaded from ``config.lora_init``)
 before ``GRPOTrainer`` is constructed. TRL 0.25.1 calls ``set_seed`` only inside
@@ -32,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import time
 import warnings
 from collections.abc import Mapping, Sequence
@@ -54,6 +56,95 @@ _PEFT_PREFIX = "base_model.model."
 _REWARD_HEADS = ("verifier", "oracle", "false_positive", "false_negative")
 
 
+def global_batch_layout(config: GRPOConfig, world_size: int) -> tuple[int, int]:
+    """``(micro_batch_size, gradient_accumulation_steps)`` for one optimizer step.
+
+    The step always contains ``prompts_per_step * group_size`` completions:
+    ``gradient_accumulation_steps = total // (micro_batch_size * world_size)``.
+    ``world_size`` is the trainer process count (one process per GPU under FSDP).
+    """
+    world = int(world_size)
+    if world < 1:
+        raise ValueError(f"world_size must be >= 1, got {world}")
+    total = int(config.completions_per_step)
+    micro = int(config.micro_batch_size)
+    denom = micro * world
+    if total % denom != 0:
+        raise ValueError(
+            f"prompts_per_step * group_size ({total}) must be divisible by "
+            f"micro_batch_size * world_size ({micro} * {world} = {denom})"
+        )
+    tp = int(config.vllm_tensor_parallel_size)
+    if world % tp != 0:
+        raise ValueError(f"vllm_tensor_parallel_size ({tp}) must divide world_size ({world})")
+    return micro, total // denom
+
+
+def training_world_size() -> int:
+    """Process count: initialized ``torch.distributed``, else ``WORLD_SIZE``, else 1."""
+    try:
+        import torch
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_world_size())
+    except ImportError:
+        pass
+    # torchrun and accelerate set RANK together with WORLD_SIZE. A stray
+    # WORLD_SIZE in a login shell must not change a single-process unit test.
+    if os.environ.get("RANK") is not None or os.environ.get("LOCAL_RANK") is not None:
+        raw = os.environ.get("WORLD_SIZE")
+        if raw:
+            return int(raw)
+    return 1
+
+
+def resolve_attn_implementation(requested: str | None, *, cuda: bool) -> str:
+    """``flash_attention_2`` on CUDA when flash-attn imports, otherwise ``sdpa``.
+
+    An explicit ``sdpa`` or ``eager`` request is kept. ``flash_attention_2``
+    falls back to ``sdpa`` when CUDA is absent or the package does not import.
+    """
+    if requested not in (None, "flash_attention_2"):
+        return str(requested)
+    if cuda and _flash_attn_available():
+        return "flash_attention_2"
+    return "sdpa"
+
+
+def _flash_attn_available() -> bool:
+    try:
+        import flash_attn  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def trl_prompt_ids(
+    tokenizer: Any,
+    messages: Sequence[Mapping[str, str]],
+    *,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
+) -> list[int]:
+    """Prompt ids TRL 0.25.1's generate path builds for one conversational prompt.
+
+    ``GRPOTrainer._generate_single_turn`` calls
+    ``processing_class.apply_chat_template(..., add_generation_prompt=True,
+    tokenize=True, **chat_template_kwargs)`` (``grpo_trainer.py`` around the
+    transformers generate branch). ``GRPOConfig.chat_template_kwargs`` is the
+    field that supplies those kwargs (``grpo_config.py`` in v0.25.1). This is
+    the same call as :func:`vfates.gen.chat.encode_prompt`.
+    """
+    from vfates.gen.chat import _as_id_list
+
+    encoded = tokenizer.apply_chat_template(
+        list(messages),
+        add_generation_prompt=True,
+        tokenize=True,
+        **dict(chat_template_kwargs or {}),
+    )
+    return _as_id_list(encoded)
+
+
 def trl_grpo_kwargs(
     config: GRPOConfig,
     *,
@@ -61,23 +152,27 @@ def trl_grpo_kwargs(
     use_vllm: bool | None = None,
     vllm_mode: str | None = None,
     bf16: bool = False,
+    world_size: int = 1,
 ) -> dict[str, Any]:
     """Keyword arguments for ``trl.GRPOConfig`` (0.25.1).
 
-    One optimizer step sees ``prompts_per_step * group_size`` completions:
-    ``per_device_train_batch_size = micro_batch_size`` and
-    ``gradient_accumulation_steps`` makes up the rest. ``steps_per_generation``
-    is left unset so TRL sets it to the accumulation count.
+    One optimizer step sees ``prompts_per_step * group_size`` completions on
+    any ``world_size``: ``per_device_train_batch_size = micro_batch_size`` and
+    ``gradient_accumulation_steps = total // (micro_batch_size * world_size)``.
+    ``steps_per_generation`` is left unset so TRL sets it to the accumulation
+    count and ``generation_batch_size`` equals the global completion count.
+
+    Forwarded TRL 0.25.1 names, checked against ``trl/trainer/grpo_config.py``
+    at tag v0.25.1: ``chat_template_kwargs``, ``vllm_tensor_parallel_size``,
+    ``vllm_enable_sleep_mode``.
     """
     if not isinstance(config, GRPOConfig):
         config = GRPOConfig.from_dict(config)
-    completions = config.completions_per_step
-    micro = config.micro_batch_size
-    grad_accum = completions // micro
+    micro, grad_accum = global_batch_layout(config, world_size)
     vllm = config.use_vllm if use_vllm is None else bool(use_vllm)
     mode = config.vllm_mode if vllm_mode is None else vllm_mode
     scheduler = "constant_with_warmup" if config.warmup_steps > 0 else "constant"
-    return {
+    out = {
         "output_dir": config.out_dir,
         "learning_rate": float(config.lr),
         "adam_beta1": float(config.adam_betas[0]),
@@ -118,7 +213,12 @@ def trl_grpo_kwargs(
         "use_vllm": vllm,
         "vllm_mode": mode,
         "vllm_gpu_memory_utilization": float(config.vllm_gpu_memory_utilization),
+        "vllm_tensor_parallel_size": int(config.vllm_tensor_parallel_size),
+        "vllm_enable_sleep_mode": bool(config.vllm_enable_sleep_mode),
         "vllm_importance_sampling_correction": bool(config.vllm_importance_sampling_correction),
+        "chat_template_kwargs": (
+            None if config.chat_template_kwargs is None else dict(config.chat_template_kwargs)
+        ),
         "reward_weights": reward_weights_for(n_reward_funcs),
         "shuffle_dataset": config.data_regime == "multi_epoch",
         "dataloader_num_workers": 0,
@@ -128,9 +228,20 @@ def trl_grpo_kwargs(
         # average of earlier losses.
         "logging_nan_inf_filter": False,
     }
+    if config.full_finetune:
+        # torch AdamW, so moments follow the bf16 parameter dtype. A fused
+        # optimizer can upcast the state and change the memory plan.
+        out["optim"] = "adamw_torch"
+    return out
 
 
-def trl_run_metadata(config: GRPOConfig, *, use_vllm: bool) -> dict[str, Any]:
+def trl_run_metadata(
+    config: GRPOConfig,
+    *,
+    use_vllm: bool,
+    world_size: int = 1,
+    attn_implementation: str | None = None,
+) -> dict[str, Any]:
     """Run facts that are not optimizer hyperparameters.
 
     ``rollout_seeded`` is false when training samples with colocated vLLM: TRL
@@ -138,12 +249,30 @@ def trl_run_metadata(config: GRPOConfig, *, use_vllm: bool) -> dict[str, Any]:
     prompt group can collapse it. The Hugging Face generate path follows the
     torch RNG seeded by :func:`transformers.set_seed` and TRL's later
     ``set_seed(args.seed, device_specific=True)``.
+
+    ``tp_size`` is ``vllm_tensor_parallel_size``. ``dp_size`` is
+    ``world_size // tp_size`` (TRL's colocate groups). ``attn_implementation``
+    is the resolved kernel, not the raw config request.
     """
+    tp = int(config.vllm_tensor_parallel_size)
+    world = int(world_size)
+    if tp < 1 or world % tp != 0:
+        raise ValueError(f"vllm_tensor_parallel_size ({tp}) must divide world_size ({world})")
+    kwargs = config.chat_template_kwargs
     return {
         "lora_seed": int(config.lora_seed),
         "lora_init": config.lora_init,
         "lora_init_sha256": config.lora_init_sha256,
         "rollout_seeded": not bool(use_vllm),
+        "vllm_mode": config.vllm_mode,
+        "tp_size": tp,
+        "dp_size": world // tp,
+        "world_size": world,
+        "hardware_class": config.hardware_class,
+        "chat_template_kwargs": None if kwargs is None else dict(kwargs),
+        "attn_implementation": attn_implementation,
+        "model_revision": config.model_revision,
+        "parameterisation": config.parameterisation,
     }
 
 
@@ -338,6 +467,77 @@ class VfatesLogCallback:
             self._eval_t0 = time.perf_counter()
 
 
+class PreemptionCallback:
+    """Stop after the next optimizer step when the job is signaled.
+
+    ``install`` registers ``SIGTERM`` and ``SIGUSR1`` handlers that only set
+    ``preempted``. :meth:`on_step_end` then asks the Trainer to save a
+    checkpoint and stop. The process should exit 0 after writing
+    ``summary.json`` with ``status`` ``preempted``. Resume uses the checkpoint
+    the Trainer saved for that step. This class does not subclass
+    ``TrainerCallback`` at import time; :func:`build_trl_trainer` wraps it.
+    """
+
+    def __init__(self) -> None:
+        self.preempted = False
+        self._previous: list[tuple[int, Any]] = []
+
+    def install(self) -> None:
+        import signal
+
+        def _handler(signum: int, frame: Any) -> None:
+            del signum, frame
+            self.preempted = True
+
+        self._handler = _handler
+        for name in ("SIGTERM", "SIGUSR1"):
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            self._previous.append((int(sig), signal.signal(sig, _handler)))
+
+    def restore(self) -> None:
+        import signal
+
+        while self._previous:
+            sig, previous = self._previous.pop()
+            signal.signal(sig, previous)
+
+    def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+        del args, state, kwargs
+        if self.preempted and control is not None:
+            control.should_save = True
+            control.should_training_stop = True
+        return control
+
+
+def bind_vllm_chat_template(llm: Any, chat_template_kwargs: Mapping[str, Any] | None) -> None:
+    """Pass template kwargs into colocated vLLM ``LLM.chat``.
+
+    TRL 0.25.1 stores ``chat_template_kwargs`` and applies them in the
+    transformers generate path and in server-mode ``vllm_client.chat``. The
+    colocate branch calls ``self.llm.chat(prompts, sampling_params=...)``
+    without them (``grpo_trainer.py`` ``_generate_single_turn``). vLLM 0.10.2
+    ``LLM.chat`` accepts ``chat_template_kwargs`` and forwards them to
+    ``apply_chat_template``. Binding here makes that path use the same kwargs
+    as :func:`vfates.gen.chat.encode_prompt`.
+    """
+    if llm is None or not chat_template_kwargs:
+        return
+    original = llm.chat
+    fixed = dict(chat_template_kwargs)
+
+    def chat(*args: Any, **kwargs: Any) -> Any:
+        merged = dict(fixed)
+        extra = kwargs.get("chat_template_kwargs")
+        if extra:
+            merged.update(dict(extra))
+        kwargs["chat_template_kwargs"] = merged
+        return original(*args, **kwargs)
+
+    llm.chat = chat
+
+
 def _adapter_key(parameter_name: str, marker: str) -> str | None:
     if marker not in parameter_name or not parameter_name.endswith("weight"):
         return None
@@ -435,13 +635,33 @@ def _seed_torch(seed: int) -> None:
         torch.cuda.manual_seed_all(int(seed))
 
 
-def _load_causal_lm(config: GRPOConfig, model: Any) -> Any:
+def _load_causal_lm(config: GRPOConfig, model: Any, *, attn_implementation: str) -> Any:
+    """Load the policy in bf16 on CUDA. An injected module is returned as-is.
+
+    LoRA matrices stay float32 (see :func:`_cast_lora_params_fp32`). Training
+    still sets ``bf16=True`` so the forward runs under bf16 autocast.
+    """
     if model is not None and not isinstance(model, str):
         return model
+    import torch
     from transformers import AutoModelForCausalLM
 
     model_id = config.model_id if model is None else str(model)
-    return AutoModelForCausalLM.from_pretrained(model_id)
+    kwargs: dict[str, Any] = {"attn_implementation": attn_implementation}
+    if torch.cuda.is_available():
+        kwargs["dtype"] = torch.bfloat16
+    if config.model_revision:
+        kwargs["revision"] = config.model_revision
+    return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+
+
+def _cast_lora_params_fp32(model: Any) -> None:
+    """Keep trainable LoRA weights in float32. The frozen base may be bf16."""
+    import torch
+
+    for name, param in model.named_parameters():
+        if "lora_" in name and param.dtype != torch.float32:
+            param.data = param.data.to(dtype=torch.float32)
 
 
 def _wrap_peft(config: GRPOConfig, model: Any) -> Any:
@@ -540,16 +760,30 @@ def build_trl_trainer(
     funcs = make_trl_reward_funcs(ctx)
     out = Path(config.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    base = _load_causal_lm(config, model)
-    wrapped = _wrap_peft(config, base)
-
     cuda = bool(torch.cuda.is_available())
+    attn = resolve_attn_implementation(config.attn_implementation, cuda=cuda)
+    config.attn_implementation = attn
+    base = _load_causal_lm(config, model, attn_implementation=attn)
+    if config.full_finetune:
+        # Every parameter, bf16 on CUDA. No PEFT wrap and no audit LoRA A.
+        # LoRA runs keep float32 adapter weights under bf16 autocast.
+        wrapped = base
+        if cuda:
+            wrapped = wrapped.to(dtype=torch.bfloat16)
+        for param in wrapped.parameters():
+            param.requires_grad_(True)
+    else:
+        wrapped = _wrap_peft(config, base)
+        _cast_lora_params_fp32(wrapped)
+
+    world = training_world_size()
     kwargs = trl_grpo_kwargs(
         config,
         n_reward_funcs=len(funcs),
         use_vllm=use_vllm,
         vllm_mode=vllm_mode,
         bf16=cuda,
+        world_size=world,
     )
     if extra_trl_args:
         kwargs.update(extra_trl_args)
@@ -557,7 +791,12 @@ def build_trl_trainer(
     write_json(out / "environment_report.json", environment_report())
     write_json(
         out / RUN_METADATA_NAME,
-        trl_run_metadata(config, use_vllm=bool(kwargs["use_vllm"])),
+        trl_run_metadata(
+            config,
+            use_vllm=bool(kwargs["use_vllm"]),
+            world_size=world,
+            attn_implementation=attn,
+        ),
     )
     args = TrlGRPOConfig(**kwargs)
 
@@ -595,6 +834,12 @@ def build_trl_trainer(
         ) -> None:
             self._inner.on_log(args, state, control, logs=logs, **kwargs)
 
+    preemption = PreemptionCallback()
+
+    class _Preempt(TrainerCallback):
+        def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+            return preemption.on_step_end(args, state, control, **kwargs)
+
     trainer = GRPOTrainer(
         model=wrapped,
         reward_funcs=funcs,
@@ -603,8 +848,10 @@ def build_trl_trainer(
         eval_dataset=eval_ds,
         processing_class=processing_class,
         peft_config=None,
-        callbacks=[_Callback(config.out_dir, sorted(monitors))],
+        callbacks=[_Callback(config.out_dir, sorted(monitors)), _Preempt()],
     )
+    trainer._vfates_preemption = preemption
+    bind_vllm_chat_template(getattr(trainer, "llm", None), config.chat_template_kwargs)
     _install_nonfinite_guard(trainer, config.out_dir)
     return trainer
 

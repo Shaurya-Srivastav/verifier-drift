@@ -4,7 +4,14 @@ from decimal import Decimal
 
 import pytest
 
-from vfates.tasks.answer import canonical_decimal, decimal_parts, extract_boxed, parse_decimal
+from vfates.tasks.answer import (
+    canonical_decimal,
+    decimal_parts,
+    extract_all_boxed,
+    extract_boxed,
+    normalise_statement,
+    parse_decimal,
+)
 
 _EXTRACT = [
     ("", None),
@@ -29,6 +36,18 @@ _EXTRACT = [
 @pytest.mark.parametrize(("text", "expected"), _EXTRACT)
 def test_extract_boxed(text: str, expected: str | None) -> None:
     assert extract_boxed(text) == expected
+
+
+def test_extract_all_boxed_keeps_earlier_closed_boxes() -> None:
+    assert extract_all_boxed(r"\boxed{1} and \fbox{2}") == ["1", "2"]
+    assert extract_all_boxed(r"\boxed{1} \boxed{2") == ["1"]
+    assert extract_boxed(r"\boxed{1} \boxed{2") is None
+    assert extract_all_boxed("no box") == []
+
+
+def test_normalise_statement_folds_spacing_and_case() -> None:
+    assert normalise_statement("Hello   WORLD") == normalise_statement("hello world")
+    assert normalise_statement(r"$x\,+\,y$") == normalise_statement("x+y")
 
 
 _PARSE = [

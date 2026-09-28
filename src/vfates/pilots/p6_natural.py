@@ -1,35 +1,102 @@
-"""Pilot P6: step-0 audit of the two natural verifiers.
+"""Pilot P6: step-0 natural verifiers on the dev pool.
 
-MBPP+ trains against the original base tests while the oracle is base and
-plus. IFEval trains against the constraint checker while the oracle is the
-checker and a content judge. This pilot samples the base policy on the
-training split and records the step-0 confusion, plus the monitors that
-separate prompt-specific misses from shared exploits.
+Documents FPR, FNR, Youden's J and precision with prompt-cluster bootstrap
+intervals, patch-category error counts, whether patch_tau and patch_rate
+select the same categories, the QA and IFEval judge checks, and a human
+adjudication sample. Nothing in this pilot is a gate.
+
+API stages read OPENAI_API_KEY. Without that key they are skipped and
+recorded as documented checks. Verdicts are never filled in by hand.
 """
 
 from __future__ import annotations
 
-import gc
+import csv
 import math
-from collections.abc import Sequence
+import os
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
-from vfates.tasks.ifeval import IFEvalTask
-from vfates.tasks.judges import HeuristicJudge, LocalJudge
-from vfates.tasks.mbpp import (
-    MBPPPlusTask,
-    base_passes,
-    code_length,
-    grade_code,
-    oracle_passes,
-    special_casing_suspect,
+from vfates.pilots.common import Checks, markdown_table, write_report
+from vfates.utils.hashing import u01
+from vfates.utils.io import read_json, write_json
+
+NATURAL_VERIFIERS: tuple[tuple[str, str], ...] = (
+    ("math", "natural"),
+    ("math", "natural_strict"),
+    ("code", "natural"),
+    ("ifeval", "natural"),
+    ("qa", "natural"),
+    ("qa", "natural_robust"),
 )
-from vfates.types import Problem
-from vfates.utils.env import environment_report
-from vfates.utils.io import write_json
-from vfates.utils.seeding import seed_everything
-from vfates.verifiers.natural import IFEvalCheckerVerifier, MBPPBaseTestsVerifier
+
+CATEGORIES: dict[str, tuple[str, ...]] = {
+    "math": (
+        "no_box",
+        "multiple_distinct_boxes",
+        "large_magnitude_gold",
+        "near_miss_numeric",
+        "fraction_vs_decimal",
+        "whitespace_or_latex_spacing",
+        "symbolic_gold",
+        "units_or_text_in_box",
+    ),
+    "code": (
+        "hardcoded_example_output",
+        "special_case_branches",
+        "ignores_input",
+        "exception_swallow",
+        "single_public_example",
+        "recursion_or_deep_loops",
+        "prints_debug_extra",
+    ),
+    "ifeval": (
+        "keyword_constraints",
+        "length_constraints",
+        "format_constraints",
+        "case_constraints",
+        "start_end_constraints",
+        "many_constraints",
+        "short_response",
+        "repetition_heavy",
+    ),
+    "qa": (
+        "no_final_answer",
+        "master_key_opener",
+        "hedged_multiple_answers",
+        "numeric_answer",
+        "long_response",
+        "refusal",
+    ),
+}
+
+ADJUDICATION_COLUMNS: tuple[str, ...] = (
+    "item_id",
+    "pid",
+    "prompt",
+    "response",
+    "gold",
+    "parsed",
+    "verifier_verdict",
+    "oracle_verdict",
+    "label",
+    "note",
+)
+ORACLE_COLUMNS: tuple[str, ...] = (
+    "item_id",
+    "pid",
+    "prompt",
+    "response",
+    "gold",
+    "rule_oracle",
+    "qwen3_32b",
+    "api_model",
+    "label",
+    "note",
+)
+LABELS = frozenset({"real_error", "oracle_wrong", "unclear"})
+RATE_KEYS = ("fpr", "fnr", "j", "precision")
 
 
 def _div(num: float, den: float) -> float | None:
@@ -55,7 +122,7 @@ def _counts(oracle: Sequence[int], verifier: Sequence[int]) -> tuple[int, int, i
 def confusion_from_counts(tp: int, fp: int, tn: int, fn: int) -> dict[str, Any]:
     """Pooled step-0 rates. Undefined ratios are ``None`` (empty denominator).
 
-    ``j`` is Youden's J, TPR − FPR. ``fp_mass`` is FP / N.
+    ``j`` is Youden's J, TPR - FPR. ``fp_mass`` is FP / N.
     ``fp_share_among_accepted`` is FP / (TP + FP), the fraction of
     verifier-accepted samples the oracle rejects.
     """
@@ -102,7 +169,7 @@ def prompt_averaged_confusion(
         return float(sum(values) / len(values))
 
     keys = ("fpr", "fnr", "j", "precision", "fp_mass", "fp_share_among_accepted")
-    averaged = {key: _mean(key) for key in keys}
+    averaged: dict[str, Any] = {key: _mean(key) for key in keys}
     averaged["n_prompts"] = len(groups)
     return averaged
 
@@ -135,12 +202,6 @@ def fp_concentration(
     return float(sum(counts[pid] for pid in ranked[:width]) / total)
 
 
-def _mean(values: Sequence[float]) -> float | None:
-    if not values:
-        return None
-    return float(sum(values) / len(values))
-
-
 def _make_generator(backend: str, model_id: str, kwargs: dict[str, Any]) -> Any:
     try:
         from vfates.gen.factory import BackendName, make_generator
@@ -156,277 +217,569 @@ def _make_generator(backend: str, model_id: str, kwargs: dict[str, Any]) -> Any:
     return make_generator(cast(BackendName, backend), model_id, **kwargs)
 
 
-def _examples(rows: list[dict[str, Any]], limit: int = 5) -> list[dict[str, Any]]:
-    found: list[dict[str, Any]] = []
+def wilson_interval(successes: int, n: int, *, alpha: float = 0.05) -> dict[str, Any]:
+    """Wilson score interval for ``successes`` out of ``n``."""
+    from statistics import NormalDist
+
+    k = int(successes)
+    total = int(n)
+    if total <= 0:
+        return {"point": None, "lo": None, "hi": None, "n": 0, "k": k}
+    z = NormalDist().inv_cdf(1.0 - alpha / 2.0)
+    p = k / total
+    denom = 1.0 + z * z / total
+    center = (p + z * z / (2.0 * total)) / denom
+    margin = z * math.sqrt(p * (1.0 - p) / total + z * z / (4.0 * total * total)) / denom
+    return {
+        "point": p,
+        "lo": max(0.0, center - margin),
+        "hi": min(1.0, center + margin),
+        "n": total,
+        "k": k,
+    }
+
+
+def deterministic_sample(
+    rows: Sequence[Mapping[str, Any]], n: int, seed: int, label: str
+) -> tuple[list[dict[str, Any]], bool]:
+    """Take ``n`` rows, ordered by ``u01(seed, label, item_id, pid)``."""
+    ranked = sorted(
+        (dict(row) for row in rows),
+        key=lambda row: (
+            u01(seed, label, str(row.get("item_id", "")), str(row.get("pid", ""))),
+            str(row.get("item_id", "")),
+        ),
+    )
+    width = max(int(n), 0)
+    return ranked[:width], len(ranked) > width
+
+
+def _write_csv(path: str | Path, columns: Sequence[str], rows: Sequence[Mapping[str, Any]]) -> None:
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(columns), extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {column: "" if row.get(column) is None else row.get(column) for column in columns}
+            )
+
+
+def export_adjudication(
+    rows: Sequence[Mapping[str, Any]], path: str | Path, *, n: int, seed: int
+) -> dict[str, Any]:
+    """Write a deterministic sample of adjudication rows. ``label`` is left blank."""
+    prepared: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        item_id = row.get("item_id") or f"{row.get('pid', index)}:{row.get('k', index)}"
+        prepared.append(
+            {
+                "item_id": item_id,
+                "pid": row.get("pid", ""),
+                "prompt": row.get("prompt", ""),
+                "response": row.get("response", ""),
+                "gold": row.get("gold", ""),
+                "parsed": row.get("parsed", ""),
+                "verifier_verdict": row.get("verifier_verdict", row.get("verifier", "")),
+                "oracle_verdict": row.get("oracle_verdict", row.get("oracle", "")),
+                "label": "",
+                "note": row.get("note", ""),
+            }
+        )
+    chosen, truncated = deterministic_sample(prepared, n, seed, "adjudication")
+    _write_csv(path, ADJUDICATION_COLUMNS, chosen)
+    return {
+        "path": str(path),
+        "n": len(chosen),
+        "n_available": len(prepared),
+        "truncated": truncated,
+    }
+
+
+def import_adjudication(path: str | Path) -> dict[str, Any]:
+    """Fraction of labelled rows marked ``real_error``, with a Wilson interval.
+
+    Blank labels are unlabelled and stay out of the fraction. Any other label
+    raises ``ValueError``.
+    """
+    dest = Path(path)
+    with dest.open(newline="") as handle:
+        loaded = list(csv.DictReader(handle))
+    counts = {label: 0 for label in ("real_error", "oracle_wrong", "unclear")}
+    for row in loaded:
+        label = str(row.get("label") or "").strip()
+        if not label:
+            continue
+        if label not in LABELS:
+            raise ValueError(
+                f"label {label!r} is not real_error, oracle_wrong, or unclear ({dest})"
+            )
+        counts[label] += 1
+    n_labelled = sum(counts.values())
+    interval = wilson_interval(counts["real_error"], n_labelled)
+    return {
+        "path": str(dest),
+        "n_rows": len(loaded),
+        "n_labelled": n_labelled,
+        "n_real_error": counts["real_error"],
+        "n_oracle_wrong": counts["oracle_wrong"],
+        "n_unclear": counts["unclear"],
+        "fraction_real_error": interval["point"],
+        "wilson_lo": interval["lo"],
+        "wilson_hi": interval["hi"],
+    }
+
+
+def _three_present(row: Mapping[str, Any]) -> bool:
+    return all(row.get(key) not in (None, "") for key in ("rule_oracle", "qwen3_32b", "api_model"))
+
+
+def _disagrees(row: Mapping[str, Any]) -> bool:
+    if not _three_present(row):
+        return False
+    bits = {int(row["rule_oracle"]), int(row["qwen3_32b"]), int(row["api_model"])}
+    return len(bits) > 1
+
+
+def _oracle_missing() -> list[str]:
+    missing = []
+    if not os.environ.get("OPENAI_API_KEY"):
+        missing.append("OPENAI_API_KEY")
+    if not (os.environ.get("VFATES_QWEN32_BASE_URL") or os.environ.get("VFATES_JUDGE_BASE_URL")):
+        missing.append("VFATES_QWEN32_BASE_URL")
+    return missing
+
+
+def _chat(base_url: str, api_key: str, model: str, prompt: str) -> str:
+    import json
+    import urllib.request
+
+    url = base_url.rstrip("/") + "/chat/completions"
+    body = json.dumps(
+        {"model": model, "temperature": 0, "messages": [{"role": "user", "content": prompt}]}
+    ).encode()
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        payload = json.loads(response.read().decode())
+    return str(payload["choices"][0]["message"]["content"])
+
+
+def _fill_oracle_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Ask the configured 32B server and the API model. Raises if either call fails."""
+    from vfates.tasks.qa import general_verifier_bit
+
+    api_key = os.environ["OPENAI_API_KEY"]
+    qwen_base = os.environ.get("VFATES_QWEN32_BASE_URL") or os.environ["VFATES_JUDGE_BASE_URL"]
+    qwen_key = os.environ.get("VFATES_JUDGE_API_KEY", "EMPTY")
+    api_base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    api_model = os.environ.get("VFATES_API_JUDGE_MODEL", "gpt-4.1")
+    filled: list[dict[str, Any]] = []
     for row in rows:
-        if row["v"] == 1 and row["o"] == 0:
-            found.append(
+        item = dict(row)
+        text = (
+            f"Question: {row.get('prompt', '')}\n"
+            f"Answer: {row.get('response', '')}\n"
+            "Reply with Final Decision: Yes or Final Decision: No."
+        )
+        if item.get("qwen3_32b") in (None, ""):
+            item["qwen3_32b"] = general_verifier_bit(
+                _chat(qwen_base, qwen_key, "Qwen/Qwen3-32B", text)
+            )
+        if item.get("api_model") in (None, ""):
+            item["api_model"] = general_verifier_bit(_chat(api_base, api_key, api_model, text))
+        filled.append(item)
+    return filled
+
+
+def _oracle_rows_from_audit(audit_dir: str | Path) -> list[dict[str, Any]]:
+    from vfates.audit import load_audit
+
+    audit = load_audit(audit_dir)
+    table = audit.table
+    n = len(table)
+    splits = [str(item) for item in table.split]
+    held = [i for i in range(n) if splits[i] == "heldout"]
+    indexes = held or list(range(n))
+    rows: list[dict[str, Any]] = []
+    for i in indexes:
+        comp = audit.completions[i]
+        problem = audit.problems[comp.pid]
+        parsed = audit.parsed[i]
+        rows.append(
+            {
+                "item_id": f"{comp.pid}:{int(table.k[i])}",
+                "pid": str(comp.pid),
+                "prompt": problem.question,
+                "response": comp.text,
+                "gold": problem.answer,
+                "parsed": "" if parsed.answer is None else str(parsed.answer),
+                "rule_oracle": int(table.O[i]),
+                "qwen3_32b": None,
+                "api_model": None,
+                "label": "",
+                "note": "",
+            }
+        )
+    return rows
+
+
+def export_oracle_check(
+    audit_dir: str | Path,
+    out_csv: str | Path,
+    *,
+    n: int = 200,
+    rows: Sequence[Mapping[str, Any]] | None = None,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Export held-out rows where the rule oracle, Qwen3-32B and an API model disagree.
+
+    Without OPENAI_API_KEY and a 32B endpoint, and without rows that already
+    carry the three verdicts, the export is skipped. Nothing is invented.
+    """
+    supplied = rows is not None
+    loaded: list[dict[str, Any]]
+    if supplied:
+        loaded = [dict(row) for row in rows or []]
+    elif not str(audit_dir):
+        missing = _oracle_missing()
+        return {
+            "skipped": True,
+            "reason": "missing " + ", ".join(missing) if missing else "audit_dir is not set",
+            "n": 0,
+            "path": str(out_csv),
+        }
+    else:
+        try:
+            loaded = _oracle_rows_from_audit(audit_dir)
+        except (OSError, ValueError, KeyError) as exc:
+            return {
+                "skipped": True,
+                "reason": f"{type(exc).__name__}: {exc}",
+                "n": 0,
+                "path": str(out_csv),
+            }
+    if not any(_three_present(row) for row in loaded):
+        missing = _oracle_missing()
+        if missing:
+            return {
+                "skipped": True,
+                "reason": "missing " + ", ".join(missing),
+                "n": 0,
+                "path": str(out_csv),
+            }
+        try:
+            loaded = _fill_oracle_rows(loaded)
+        except Exception as exc:
+            return {
+                "skipped": True,
+                "reason": f"{type(exc).__name__}: {exc}",
+                "n": 0,
+                "path": str(out_csv),
+            }
+    disagreements = [row for row in loaded if _disagrees(row)]
+    for row in disagreements:
+        row.setdefault("label", "")
+        row.setdefault("note", "")
+    chosen, truncated = deterministic_sample(disagreements, n, seed, "oracle_check")
+    _write_csv(out_csv, ORACLE_COLUMNS, chosen)
+    return {
+        "skipped": False,
+        "n": len(chosen),
+        "n_available": len(disagreements),
+        "truncated": truncated,
+        "path": str(out_csv),
+    }
+
+
+def rates_with_intervals(
+    pids: Sequence[object],
+    oracle: Sequence[int],
+    verifier: Sequence[int],
+    *,
+    n_boot: int = 2000,
+    seed: int = 0,
+    alpha: float = 0.05,
+) -> dict[str, Any]:
+    """Pooled rates plus a prompt-cluster bootstrap interval for each rate."""
+    import numpy as np
+
+    from vfates.utils.stats import cluster_bootstrap
+
+    oracle_bits = [int(bit) for bit in oracle]
+    verifier_bits = [int(bit) for bit in verifier]
+    pooled = pooled_confusion(oracle_bits, verifier_bits)
+    clusters = list(pids)
+    if not clusters:
+        return {**pooled, "intervals": None}
+    oracle_arr = np.asarray(oracle_bits)
+    verifier_arr = np.asarray(verifier_bits)
+
+    def _stat(key: str):
+        def fn(idx: Any) -> float:
+            chosen = np.asarray(idx, dtype=int)
+            if chosen.size == 0:
+                return float("nan")
+            row = confusion_from_counts(
+                *_counts(oracle_arr[chosen].tolist(), verifier_arr[chosen].tolist())
+            )
+            value = row[key]
+            return float("nan") if value is None else float(value)
+
+        return fn
+
+    intervals: dict[str, dict[str, float | None]] = {}
+    for key in RATE_KEYS:
+        point, lo, hi = cluster_bootstrap(
+            _stat(key), clusters, n_boot=n_boot, alpha=alpha, seed=seed
+        )
+        intervals[key] = {
+            "point": None if math.isnan(point) else point,
+            "lo": None if math.isnan(lo) else lo,
+            "hi": None if math.isnan(hi) else hi,
+        }
+    return {**pooled, "intervals": intervals}
+
+
+def category_error_counts(rows: Sequence[Mapping[str, Any]], menu: Sequence[str]) -> dict[str, int]:
+    """Step-0 error counts per patch category, in menu order."""
+    counts = {str(name): 0 for name in menu}
+    for row in rows:
+        if int(row["oracle"]) == int(row["verifier"]):
+            continue
+        for name in row.get("categories") or []:
+            if str(name) in counts:
+                counts[str(name)] += 1
+    return counts
+
+
+def same_selection_of(block: Mapping[str, Any] | None) -> bool | None:
+    """Whether patch_tau and patch_rate chose the same categories.
+
+    When the forecasts block has arm records, this uses
+    :func:`vfates.verifiers.patch._same_selection` (tuple equality in menu
+    order). A block that only stores the boolean is read as that boolean.
+    """
+    if not isinstance(block, Mapping):
+        return None
+    from vfates.verifiers.patch import _same_selection
+
+    records = {
+        str(key): value
+        for key, value in block.items()
+        if key != "same_selection" and isinstance(value, Mapping) and "categories" in value
+    }
+    if records:
+        return bool(_same_selection(records))
+    if "same_selection" in block:
+        return bool(block["same_selection"])
+    return None
+
+
+def read_same_selection(audit_dir: str | Path) -> bool | None:
+    path = Path(audit_dir) / "forecasts.json"
+    if not path.is_file():
+        return None
+    loaded = read_json(path)
+    if not isinstance(loaded, Mapping):
+        return None
+    block = loaded.get("patch_selection")
+    if not isinstance(block, Mapping):
+        return None
+    return same_selection_of(block)
+
+
+def false_positives(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(row) for row in rows if int(row["verifier"]) == 1 and int(row["oracle"]) == 0]
+
+
+def synthetic_rows(domain: str, verifier: str, *, n: int = 30) -> list[dict[str, Any]]:
+    """Fixed step-0 rows for the Mac smoke. No model and no network."""
+    menu = CATEGORIES[domain]
+    rows: list[dict[str, Any]] = []
+    for i in range(n):
+        oracle = 0 if i % 5 == 0 else 1
+        bit = 1 if i % 5 in (0, 1) else oracle
+        rows.append(
+            {
+                "item_id": f"{domain}-{verifier}-{i}",
+                "pid": f"p{i % 6}",
+                "k": i // 6,
+                "prompt": f"prompt {i}",
+                "response": f"response {i}",
+                "gold": "gold",
+                "parsed": "parsed",
+                "oracle": oracle,
+                "verifier": bit,
+                "categories": [menu[i % len(menu)]] if oracle != bit else [],
+            }
+        )
+    return rows
+
+
+def frame_from_audit(audit_dir: str | Path, verifier: str) -> list[dict[str, Any]]:
+    """Dev-pool rows for one natural verifier. Prefers a ``dev`` split when present."""
+    from vfates.audit import load_audit
+
+    audit = load_audit(audit_dir)
+    table = audit.table
+    if verifier not in table.V:
+        raise KeyError(f"{verifier} is not a column of {audit_dir}")
+    n = len(table)
+    if len(audit.completions) != n or len(audit.parsed) != n:
+        raise RuntimeError(f"{audit_dir}: completions do not align with the audit table")
+    splits = [str(item) for item in table.split]
+    use_dev = any(item == "dev" for item in splits)
+    rows: list[dict[str, Any]] = []
+    for i in range(n):
+        if use_dev and splits[i] != "dev":
+            continue
+        comp = audit.completions[i]
+        problem = audit.problems[comp.pid]
+        parsed = audit.parsed[i]
+        try:
+            cats = list(audit.task.categorize(problem, parsed, comp.text))
+        except Exception:
+            cats = []
+        rows.append(
+            {
+                "item_id": f"{comp.pid}:{int(table.k[i])}",
+                "pid": str(comp.pid),
+                "k": int(table.k[i]),
+                "prompt": problem.question,
+                "response": comp.text,
+                "gold": problem.answer,
+                "parsed": "" if parsed.answer is None else str(parsed.answer),
+                "oracle": int(table.O[i]),
+                "verifier": int(table.V[verifier][i]),
+                "categories": cats,
+            }
+        )
+    return rows
+
+
+def qa_judge_check(
+    rows: Sequence[Mapping[str, Any]], *, n_boot: int = 2000, seed: int = 0
+) -> dict[str, Any]:
+    """General-verifier vs an API model on rows where they disagree with the rule oracle."""
+    if not rows or all(row.get("api") is None and not row.get("api_reply") for row in rows):
+        if not os.environ.get("OPENAI_API_KEY"):
+            return {"skipped": True, "reason": "OPENAI_API_KEY is not set"}
+        return {"skipped": True, "reason": "no API verdicts"}
+    from vfates.analysis.judge_agreement import agreement_statistics
+    from vfates.tasks.qa import general_verifier_bit, judge_agreement_row
+
+    paired: list[dict[str, Any]] = []
+    for row in rows:
+        api = row.get("api")
+        if api is None and row.get("api_reply"):
+            api = general_verifier_bit(str(row["api_reply"]))
+        if api is None:
+            continue
+        bits = {int(row["oracle"]), int(row["verifier"]), int(api)}
+        if len(bits) == 1:
+            continue
+        if row.get("verifier_reply") and row.get("api_reply"):
+            paired.append(
+                judge_agreement_row(
+                    str(row["verifier_reply"]), str(row["api_reply"]), str(row["pid"])
+                )
+            )
+        else:
+            paired.append(
                 {
-                    "pid": row["pid"],
-                    "k": row["k"],
-                    "text": row["text"][:400],
-                    **{key: row[key] for key in ("suspect", "judge_reject") if key in row},
+                    "local": int(row["verifier"]),
+                    "remote": int(api),
+                    "pid": str(row["pid"]),
+                    "local_unparsed": False,
                 }
             )
-        if len(found) >= limit:
-            break
-    return found
+    if not paired:
+        return {"skipped": False, "n_disagreements": 0, "statistics": None}
+    return {
+        "skipped": False,
+        "n_disagreements": len(paired),
+        "statistics": agreement_statistics(paired, n_boot=n_boot, seed=seed),
+    }
 
 
-def _summarize(
-    rows: list[dict[str, Any]],
-    *,
-    extra: dict[str, Any],
+def ifeval_judge_check(
+    rows: Sequence[Mapping[str, Any]], *, n_boot: int = 2000, seed: int = 0
 ) -> dict[str, Any]:
-    oracle = [int(row["o"]) for row in rows]
-    verifier = [int(row["v"]) for row in rows]
-    pids = [row["pid"] for row in rows]
-    pooled = pooled_confusion(oracle, verifier)
-    fps = [row for row in rows if row["v"] == 1 and row["o"] == 0]
-    accepted = [row for row in rows if row["v"] == 1]
-    summary = {
-        "completed": True,
-        "n_problems": len({row["pid"] for row in rows}),
-        "n_rows": len(rows),
-        "n_errors": sum(int(row.get("error", False)) for row in rows),
-        "pooled": pooled,
-        "prompt_averaged": prompt_averaged_confusion(pids, oracle, verifier),
-        "fp_share_among_accepted": pooled["fp_share_among_accepted"],
-        "fp_concentration_top10": fp_concentration(pids, oracle, verifier, top_frac=0.1),
-        "checker_pass_rate": _div(sum(verifier), len(verifier)),
-        "oracle_pass_rate": _div(sum(oracle), len(oracle)),
-        "examples": _examples(rows),
-    }
-    summary.update(extra)
-    summary["n_fp"] = len(fps)
-    summary["n_accepted"] = len(accepted)
-    return summary
+    """Content judge vs gpt-4.1. Skipped, never faked, when the API key is absent."""
+    has_remote = any(row.get("remote") is not None or row.get("remote_reply") for row in rows)
+    if not has_remote:
+        if not os.environ.get("OPENAI_API_KEY"):
+            return {"skipped": True, "reason": "OPENAI_API_KEY is not set", "model": "gpt-4.1"}
+        return {"skipped": True, "reason": "no gpt-4.1 verdicts", "model": "gpt-4.1"}
+    from vfates.analysis.judge_agreement import agreement_statistics
+    from vfates.tasks.judges import parse_yes_no
 
-
-def _generate(
-    gen: Any,
-    problems: list[Problem],
-    prompts: list[str],
-    cfg: dict[str, Any],
-    seed: int,
-    system_prompt: str | None,
-) -> list[list[Any]]:
-    n = int(cfg.get("samples", 8))
-    if not prompts:
-        return []
-    outs = gen.generate(
-        prompts,
-        n,
-        max_tokens=int(cfg.get("max_tokens", 512)),
-        temperature=float(cfg.get("temperature", 1.0)),
-        top_p=float(cfg.get("top_p", 1.0)),
-        seed=seed,
-        system_prompt=system_prompt,
-    )
-    if len(outs) != len(problems):
-        raise RuntimeError(
-            f"generator returned {len(outs)} prompt-groups for {len(problems)} prompts"
+    paired = []
+    for row in rows:
+        remote = row.get("remote")
+        if remote is None and row.get("remote_reply"):
+            remote = parse_yes_no(str(row["remote_reply"]))
+        paired.append(
+            {
+                "local": row.get("local"),
+                "remote": remote,
+                "pid": str(row.get("pid", "")),
+                "local_unparsed": bool(row.get("local_unparsed", False)),
+            }
         )
-    for group in outs:
-        if len(group) != n:
-            raise RuntimeError(f"generator returned {len(group)} samples, expected {n}")
-    return outs
-
-
-def _run_mbpp(config: dict[str, Any], backend: str, seed: int) -> dict[str, Any]:
-    cfg = dict(config.get("mbpp") or {})
-    model = str(cfg["model"])
-    gen = _make_generator(backend, model, dict(cfg.get("generator_kwargs") or {}))
-    try:
-        task = MBPPPlusTask(
-            heldout_fraction=float(cfg.get("heldout_fraction", 0.33)),
-            per_test_timeout_s=float(cfg.get("per_test_timeout_s", 4.0)),
-        )
-        n_problems = int(cfg.get("n_problems", 64))
-        problems = task.problems("train", n_problems, seed)
-        verifier = MBPPBaseTestsVerifier(
-            k=cfg.get("verifier_k"),
-            visible_only=bool(cfg.get("visible_only", False)),
-        )
-        outs = _generate(
-            gen, problems, [task.prompt(p) for p in problems], cfg, seed, task.system_prompt()
-        )
-        rows: list[dict[str, Any]] = []
-        for problem, samples in zip(problems, outs):
-            for k, sample in enumerate(samples):
-                text = sample.text
-                parsed = task.parse(problem, text)
-                error = False
-                if not parsed.answer:
-                    o_bit, v_bit = 0, 0
-                else:
-                    try:
-                        graded = grade_code(problem, parsed.answer)
-                        o_bit = int(oracle_passes(graded))
-                        v_bit = int(
-                            base_passes(graded, k=verifier.k, visible_only=verifier.visible_only)
-                        )
-                    except Exception:
-                        o_bit, v_bit, error = 0, 0, True
-                rows.append(
-                    {
-                        "pid": problem.pid,
-                        "k": k,
-                        "o": o_bit,
-                        "v": v_bit,
-                        "error": error,
-                        "suspect": special_casing_suspect(problem, parsed, text),
-                        "code_length": code_length(problem, parsed, text),
-                        "has_code_block": bool(parsed.extras.get("has_code_block")),
-                        "text": text,
-                    }
-                )
-        fps = [row for row in rows if row["v"] == 1 and row["o"] == 0]
-        summary = _summarize(
-            rows,
-            extra={
-                "domain": "mbpp_plus",
-                "model": model,
-                "verifier": verifier.describe(),
-                "special_casing_rate_among_fps": _mean(
-                    [1.0 if row["suspect"] else 0.0 for row in fps]
-                ),
-                "mean_code_length": _mean([float(row["code_length"]) for row in rows]),
-                "code_block_rate": _mean([1.0 if row["has_code_block"] else 0.0 for row in rows]),
-                "parsed_rate": _mean([1.0 if row["code_length"] else 0.0 for row in rows]),
-            },
-        )
-        summary["generator"] = gen.describe() if hasattr(gen, "describe") else {"model_id": model}
-        return summary
-    finally:
-        del gen
-        gc.collect()
-
-
-def _run_ifeval(config: dict[str, Any], backend: str, seed: int) -> dict[str, Any]:
-    cfg = dict(config.get("ifeval") or {})
-    model = str(cfg["model"])
-    gen = _make_generator(backend, model, dict(cfg.get("generator_kwargs") or {}))
-    judge = HeuristicJudge(
-        min_content_words=int(cfg.get("min_content_words", 12)),
-        max_repeat_ratio=float(cfg.get("max_repeat_ratio", 0.4)),
-        max_keyword_density=float(cfg.get("max_keyword_density", 0.5)),
-    )
-    try:
-        task = IFEvalTask(
-            heldout_fraction=float(cfg.get("heldout_fraction", 0.33)),
-            judge=judge,
-        )
-        n_problems = int(cfg.get("n_problems", 64))
-        problems = task.problems("train", n_problems, seed)
-        verifier = IFEvalCheckerVerifier()
-        outs = _generate(
-            gen, problems, [task.prompt(p) for p in problems], cfg, seed, task.system_prompt()
-        )
-        rows: list[dict[str, Any]] = []
-        for problem, samples in zip(problems, outs):
-            for k, sample in enumerate(samples):
-                text = sample.text
-                parsed = task.parse(problem, text)
-                error = False
-                try:
-                    func_name = str(problem.meta["func_name"])
-                    checker_args = dict(problem.meta["args"])
-                    v_bit = verifier.verdict(problem, parsed, text, 0)
-                    # Same kwargs as IFEvalTask.oracle, so O stays checker AND judge.
-                    judge_reject = (
-                        judge.judge(
-                            problem.question,
-                            text,
-                            func_name=func_name,
-                            checker_args=checker_args,
-                        )
-                        == 0
-                    )
-                    o_bit = int(v_bit == 1 and not judge_reject)
-                except Exception:
-                    v_bit, o_bit, judge_reject, error = 0, 0, False, True
-                rows.append(
-                    {
-                        "pid": problem.pid,
-                        "k": k,
-                        "o": o_bit,
-                        "v": v_bit,
-                        "error": error,
-                        "judge_reject": judge_reject,
-                        "text": text,
-                        "prompt": problem.question,
-                    }
-                )
-        accepted = [row for row in rows if row["v"] == 1]
-        local = _local_judge(gen, rows, int(cfg.get("local_judge_samples", 0)))
-        summary = _summarize(
-            rows,
-            extra={
-                "domain": "ifeval",
-                "model": model,
-                "verifier": verifier.describe(),
-                "judge": judge.describe(),
-                "judge_reject_rate_among_checker_passes": _mean(
-                    [1.0 if row["judge_reject"] else 0.0 for row in accepted]
-                ),
-                "local_judge": local,
-            },
-        )
-        summary["generator"] = gen.describe() if hasattr(gen, "describe") else {"model_id": model}
-        return summary
-    finally:
-        del gen
-        gc.collect()
-
-
-def _local_judge(gen: Any, rows: list[dict[str, Any]], n_samples: int) -> dict[str, Any] | None:
-    """Optional temperature-0 :class:`LocalJudge` on the first ``n_samples`` responses."""
-    if n_samples <= 0:
-        return None
-    subset = rows[:n_samples]
-    if not subset:
-        return {"n": 0}
-    try:
-        local = LocalJudge(gen)
-        verdicts = [local.judge(str(row["prompt"]), str(row["text"])) for row in subset]
-    except Exception as exc:
-        return {"n": len(subset), "error": f"{type(exc).__name__}: {exc}"}
-    heuristic_fail = [1 if row["judge_reject"] else 0 for row in subset]
-    agree = sum(
-        1 for bit, rejected in zip(verdicts, heuristic_fail) if bit == (0 if rejected else 1)
-    )
-    checker_pass = [row for row, bit in zip(subset, verdicts) if row["v"] == 1]
-    local_fail_on_pass = [bit for row, bit in zip(subset, verdicts) if row["v"] == 1 and bit == 0]
     return {
-        "n": len(subset),
-        "local_pass_rate": _div(sum(verdicts), len(verdicts)),
-        "agreement_with_heuristic": _div(agree, len(subset)),
-        "local_fail_rate_among_checker_passes": _div(len(local_fail_on_pass), len(checker_pass)),
+        "skipped": False,
+        "model": "gpt-4.1",
+        "statistics": agreement_statistics(paired, n_boot=n_boot, seed=seed),
     }
 
 
-def _gates(mbpp: dict[str, Any], ifeval: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    cfg = dict(config.get("gates") or {})
-    fp_min = float(cfg.get("mbpp_fp_share_among_accepted", 0.05))
-    lo = float(cfg.get("ifeval_checker_pass_min", 0.2))
-    hi = float(cfg.get("ifeval_checker_pass_max", 0.95))
-    complete = bool(mbpp.get("completed") and ifeval.get("completed"))
-    share = mbpp.get("fp_share_among_accepted")
-    rate = ifeval.get("checker_pass_rate")
-    mbpp_ok = bool(complete and share is not None and share >= fp_min)
-    ifeval_ok = bool(complete and rate is not None and lo <= rate <= hi)
-    return {
-        "mbpp": mbpp_ok,
-        "ifeval": ifeval_ok,
-        "complete": complete,
-        "pass": bool(mbpp_ok and ifeval_ok),
-        "thresholds": {
-            "mbpp_fp_share_among_accepted": fp_min,
-            "ifeval_checker_pass_min": lo,
-            "ifeval_checker_pass_max": hi,
-        },
+def _fmt_interval(block: Mapping[str, Any] | None, key: str) -> str:
+    if not block or block.get(key) is None:
+        return "n/a"
+    row = block[key]
+    return f"{row['point']} [{row['lo']}, {row['hi']}]"
+
+
+def _audit_dirs(config: Mapping[str, Any]) -> dict[str, str]:
+    raw = config.get("audit_dirs") or {}
+    return {str(key): str(value) for key, value in dict(raw).items() if value}
+
+
+def _rows_for(
+    config: Mapping[str, Any], domain: str, verifier: str, *, smoke: bool
+) -> tuple[list[dict[str, Any]], str]:
+    if smoke:
+        return synthetic_rows(domain, verifier, n=int(config.get("smoke_n", 30))), "synthetic"
+    audit_dir = _audit_dirs(config).get(domain)
+    if not audit_dir:
+        return [], "no audit_dirs entry"
+    return frame_from_audit(audit_dir, verifier), audit_dir
+
+
+def _stage_set(config: Mapping[str, Any]) -> set[str]:
+    stage = str(config.get("stage") or "all")
+    mapping = {
+        "all": {"rates", "export", "import", "judges", "oracle_check"},
+        "smoke": {"rates", "export", "import", "judges", "oracle_check"},
+        "rates": {"rates"},
+        "export": {"export"},
+        "adjudication_export": {"export"},
+        "import": {"import"},
+        "adjudication_import": {"import"},
+        "judges": {"judges"},
+        "oracle_check": {"oracle_check"},
     }
+    if stage not in mapping:
+        raise ValueError(
+            f"unknown P6 stage {stage!r}. Use all, rates, export, import, judges, or oracle_check."
+        )
+    return mapping[stage]
 
 
 def _markdown(report: dict[str, Any]) -> str:
@@ -435,10 +788,10 @@ def _markdown(report: dict[str, Any]) -> str:
         "# P6 natural-verifier step-0 audit",
         "",
         f"Gates pass: **{gates['pass']}** "
-        f"(MBPP {gates['mbpp']}, IFEval {gates['ifeval']}, complete {gates['complete']}).",
+        f"(IFEval {gates['ifeval']}, complete {gates['complete']}).",
         "",
     ]
-    for key, title in (("mbpp", "MBPP+"), ("ifeval", "IFEval")):
+    for key, title in (("ifeval", "IFEval"),):
         block = report[key]
         pooled = block.get("pooled") or {}
         lines.extend(
@@ -487,30 +840,226 @@ def _fmt(value: object) -> str:
     return str(value)
 
 
-def run(config: dict[str, Any], out_dir: str | Path) -> dict[str, Any]:
-    """Sample both domains, grade O and V, and write ``report.json`` / ``report.md``.
+def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
+    """Document step-0 natural-verifier rates. Gates nothing."""
+    import time
 
-    Generation is imported inside this function. If ``vfates.gen.factory`` is
-    missing, a clear ``ImportError`` is raised and no report is written.
-    """
+    from vfates.utils.env import hardware_class
+
+    started = time.perf_counter()
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    smoke = bool(config.get("smoke", False))
+    wanted = _stage_set(config)
     seed = int(config.get("seed", 0))
-    seed_everything(seed)
-    backend = str(config["backend"])
-    mbpp = _run_mbpp(config, backend, seed)
-    ifeval = _run_ifeval(config, backend, seed)
-    gates = _gates(mbpp, ifeval, config)
-    report = {
-        "pilot": "p6_natural",
-        "summary": "PASS" if gates["pass"] else "FAIL",
-        "ok": bool(gates["pass"]),
-        "config": config,
-        "environment": environment_report(),
-        "mbpp": mbpp,
-        "ifeval": ifeval,
-        "gates": gates,
-    }
-    write_json(out / "report.json", report)
-    (out / "report.md").write_text(_markdown(report), encoding="utf-8")
-    return report
+    n_boot = int(config.get("smoke_boot", 200) if smoke else config.get("n_boot", 2000))
+    n_export = int(config.get("n_adjudication", 100))
+    checks = Checks()
+    hardware = hardware_class()
+    adj_dir = (
+        Path(str(config["adjudication_dir"]))
+        if config.get("adjudication_dir")
+        else out / "adjudication"
+    )
+    tables: dict[str, Any] = {"hardware_class": hardware, "smoke": smoke}
+    rate_rows: list[list[Any]] = []
+    seen_domains: set[str] = set()
+
+    if "rates" in wanted or "export" in wanted:
+        for domain, verifier in NATURAL_VERIFIERS:
+            try:
+                rows, source = _rows_for(config, domain, verifier, smoke=smoke)
+            except Exception as exc:
+                rows, source = [], f"{type(exc).__name__}: {exc}"
+            if "rates" in wanted:
+                if not rows:
+                    checks.add(
+                        f"P6.1.{domain}.{verifier}",
+                        f"{domain} {verifier} step-0 rates",
+                        None,
+                        False,
+                        threshold="documented",
+                        metric=source,
+                        documented=True,
+                    )
+                else:
+                    scored = rates_with_intervals(
+                        [row["pid"] for row in rows],
+                        [row["oracle"] for row in rows],
+                        [row["verifier"] for row in rows],
+                        n_boot=n_boot,
+                        seed=seed,
+                    )
+                    counts = category_error_counts(rows, CATEGORIES[domain])
+                    tables[f"{domain}.{verifier}"] = {
+                        "rates": scored,
+                        "categories": counts,
+                        "source": source,
+                    }
+                    rate_rows.append(
+                        [
+                            domain,
+                            verifier,
+                            scored.get("fpr"),
+                            scored.get("fnr"),
+                            scored.get("j"),
+                            scored.get("precision"),
+                        ]
+                    )
+                    checks.add(
+                        f"P6.1.{domain}.{verifier}",
+                        f"{domain} {verifier} step-0 FPR, FNR, J, precision",
+                        scored.get("fpr"),
+                        True,
+                        threshold="documented",
+                        metric=(
+                            f"FNR={scored.get('fnr')}, J={scored.get('j')}, "
+                            f"precision={scored.get('precision')}; "
+                            f"FPR {_fmt_interval(scored.get('intervals'), 'fpr')}"
+                        ),
+                        documented=True,
+                    )
+                    checks.add(
+                        f"P6.2.{domain}.{verifier}",
+                        f"{domain} {verifier} patch category error counts",
+                        float(sum(counts.values())),
+                        True,
+                        threshold="documented",
+                        metric=", ".join(f"{name}={count}" for name, count in counts.items()),
+                        documented=True,
+                    )
+            if "export" in wanted and rows:
+                exported = export_adjudication(
+                    false_positives(rows),
+                    adj_dir / f"{domain}__{verifier}.csv",
+                    n=n_export,
+                    seed=seed,
+                )
+                checks.add(
+                    f"P6.6.{domain}.{verifier}",
+                    f"export false positives for {domain} {verifier}",
+                    float(exported["n"]),
+                    True,
+                    threshold=n_export,
+                    metric=exported["path"],
+                    documented=True,
+                )
+            if domain not in seen_domains and "rates" in wanted:
+                seen_domains.add(domain)
+                audit_dir = _audit_dirs(config).get(domain)
+                selection = read_same_selection(audit_dir) if audit_dir and not smoke else None
+                checks.add(
+                    f"P6.3.{domain}",
+                    f"{domain} patch_tau and patch_rate same_selection",
+                    None if selection is None else float(selection),
+                    selection is True,
+                    threshold="same categories",
+                    metric="smoke does not select on features"
+                    if smoke
+                    else f"same_selection={selection}",
+                    documented=True,
+                )
+
+    if "judges" in wanted:
+        qa_rows = list(config.get("qa_rows") or [])
+        ifeval_rows = list(config.get("ifeval_rows") or [])
+        qa = qa_judge_check(qa_rows, n_boot=n_boot, seed=seed)
+        ifeval = ifeval_judge_check(ifeval_rows, n_boot=n_boot, seed=seed)
+        tables["qa_judge"] = qa
+        tables["ifeval_judge"] = ifeval
+        checks.add(
+            "P6.4",
+            "QA general-verifier vs rule oracle vs API model",
+            None if qa.get("statistics") is None else qa["statistics"].get("agreement"),
+            not qa.get("skipped", False),
+            threshold="documented",
+            metric=qa.get("reason") or f"disagreements={qa.get('n_disagreements')}",
+            documented=True,
+        )
+        checks.add(
+            "P6.5",
+            "IFEval content judge vs gpt-4.1",
+            None if ifeval.get("statistics") is None else ifeval["statistics"].get("agreement"),
+            not ifeval.get("skipped", False),
+            threshold="documented",
+            metric=ifeval.get("reason") or "gpt-4.1",
+            documented=True,
+        )
+
+    if "import" in wanted:
+        paths = sorted(adj_dir.glob("*.csv")) if adj_dir.is_dir() else []
+        if not paths:
+            checks.add(
+                "P6.7",
+                "import labelled adjudication",
+                None,
+                False,
+                threshold="documented",
+                metric="no adjudication csv",
+                documented=True,
+            )
+        imports = []
+        for path in paths:
+            loaded = import_adjudication(path)
+            imports.append(loaded)
+            checks.add(
+                f"P6.7.{path.stem}",
+                f"real-error fraction in {path.name}",
+                loaded["fraction_real_error"],
+                loaded["n_labelled"] > 0,
+                threshold="Wilson interval",
+                metric=(
+                    f"{loaded['n_real_error']}/{loaded['n_labelled']} labelled; "
+                    f"Wilson [{loaded['wilson_lo']}, {loaded['wilson_hi']}]"
+                ),
+                documented=True,
+            )
+        tables["adjudication"] = imports
+
+    if "oracle_check" in wanted:
+        oracle_csv = (
+            Path(str(config["oracle_csv"]))
+            if config.get("oracle_csv")
+            else adj_dir / "qa__oracle_check.csv"
+        )
+        audit_dir = str(config.get("audit_dir") or _audit_dirs(config).get("qa") or "")
+        result = export_oracle_check(
+            audit_dir,
+            oracle_csv,
+            n=int(config.get("n_oracle_check", 200)),
+            rows=config.get("oracle_rows"),
+            seed=seed,
+        )
+        tables["oracle_check"] = result
+        checks.add(
+            "P6.8",
+            "QA oracle disagreement export",
+            None if result.get("skipped") else float(result.get("n") or 0),
+            not result.get("skipped", False),
+            threshold=int(config.get("n_oracle_check", 200)),
+            metric=result.get("reason") or result.get("path", ""),
+            documented=True,
+        )
+
+    write_json(out / "tables.json", tables)
+    sections = []
+    if rate_rows:
+        sections.append(
+            (
+                "Step-0 rates",
+                markdown_table(["domain", "verifier", "fpr", "fnr", "j", "precision"], rate_rows),
+            )
+        )
+    return write_report(
+        out,
+        str(config.get("title", "P6 natural verifiers")),
+        checks,
+        config=dict(config),
+        started=started,
+        tables={"hardware_class": hardware},
+        sections=sections,
+        intro=(
+            f"Hardware class {hardware}. P6 gates nothing. "
+            "API checks are skipped when OPENAI_API_KEY is unset."
+        ),
+    )

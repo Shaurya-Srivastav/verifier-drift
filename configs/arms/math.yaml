@@ -1,0 +1,88 @@
+# Step-0 arms for the math task.
+# The kit (kit.yaml, same directory) is included first: oracle, fp_hash,
+# fp_trigger, noise_fp, noise_fp_trigger, fn_behavior, fn_prompt_subset,
+# noise_fn. Targets stay the kit's FPR 0.15 and FNR 0.30. {domain} salts
+# become math/... when the loader sees domain: math.
+# Thresholds, tolerances and phrases are NOT stored here: calibrate_arms fits
+# them. Order matters: resampled and patch arms refer to arms above them.
+include: kit.yaml
+domain: math
+
+arms:
+  # Shared false positives from a numeric margin. Accept a wrong answer when
+  # task.abs_error(problem, parsed) <= tol. None (a non-numeric gold or
+  # answer) does not fire and is not a calibration candidate. The fit fills
+  # from zero outward, so the accepted set is the nearest wrong answers.
+  - name: fp_tolerance
+    type: tolerance_fp
+
+  # Rate-matched control for fp_tolerance. The kit's noise_fp is matched to
+  # fp_hash, so noise_fp minus fp_tolerance is not a rate-matched contrast.
+  # This arm draws on answered wrong outputs at fp_tolerance's achieved
+  # (FPR, FNR). Support is answered, the same support as the kit noise arms.
+  - name: noise_fp_tolerance
+    type: resampled
+    match: fp_tolerance
+    support: answered
+    seed: 0
+
+  # Natural verifier: last boxed answer, otherwise the last number, then the
+  # arXiv:2609.01354 cascade. strip_string equality, then math.isclose with
+  # relative tolerance 1e-4 when both sides are numbers (returned even when
+  # false), else SymPy. The relative tolerance accepts an off-by-one once
+  # |gold| is about 1e4 (10000 versus 10001) and rejects it at smaller scale
+  # (100 versus 101). Ignores the oracle bit.
+  - name: natural
+    type: math_lenient
+
+  # Resampled class-conditional noise matched to natural's achieved pooled
+  # (FPR, FNR). Support is answered: a completion with no parsed box is
+  # outside the draw. Lenient can still accept an unboxed last number; this
+  # control does not, so the contrast is on stated answers.
+  - name: noise_natural
+    type: resampled
+    match: natural
+    support: answered
+    seed: 0
+
+  # Strict natural verifier: DeepSeek-Math strip_string on the last box, then
+  # exact string equality. No box is incorrect. No numeric tolerance and no
+  # symbolic step, so a fraction versus a decimal and a LaTeX spacing macro
+  # (x\,+\,y versus x+y) are misses when the oracle accepts them.
+  - name: natural_strict
+    type: math_strip_string
+
+  # Resampled noise matched to natural_strict. Support is answered. A missing
+  # box is 0 for both the oracle and strip_string, so the disagreements this
+  # arm is matched to sit on boxed text.
+  - name: noise_natural_strict
+    type: resampled
+    match: natural_strict
+    support: answered
+    seed: 0
+
+  # After features, before the lock. Keep the k categories with the highest
+  # locked tau_pool. Ties break by fewer errors fixed, then lexicographic
+  # category name. Base is the lenient natural verifier. Selection and step-0
+  # rates go into forecasts and the lock.
+  - name: patch_tau
+    type: patch_select
+    base: natural
+    k: 2
+    by: tau
+
+  # The k categories with the most step-0 train-pool errors of natural.
+  # Ties follow task.error_categories order. If the two selections are equal,
+  # patch_rate is withdrawn with reason same_selection.
+  - name: patch_rate
+    type: patch_select
+    base: natural
+    k: 2
+    by: rate
+
+  # Reported arm, outside every confirmatory family. Declared class-conditional
+  # rates, not a match to another arm. Full menu only.
+  - name: random
+    type: resampled
+    rates: {fpr: 0.5, fnr: 0.5}
+    support: all

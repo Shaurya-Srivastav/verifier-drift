@@ -172,6 +172,20 @@ def test_config_validation_and_yaml(tmp_path: Path) -> None:
     assert loaded.lora_init == "a.safetensors"
     assert loaded.lora_init_sha256 == "ab" * 32
     assert loaded.to_dict()["lora_seed"] == 3
+    assert loaded.parameterisation == "lora"
+    assert loaded.full_finetune is False
+    full = GRPOConfig.from_dict({**good, "full_finetune": True, "lora": None})
+    assert full.parameterisation == "full"
+    assert full.to_dict()["lora"] is None
+    assert GRPOConfig.from_dict(full.to_dict()).to_dict() == full.to_dict()
+    with pytest.raises(ValueError, match="full_finetune: true"):
+        GRPOConfig.from_dict({**good, "lora": None})
+    with pytest.raises(ValueError, match="lora: null"):
+        GRPOConfig.from_dict({**good, "full_finetune": True})
+    with pytest.raises(ValueError, match="lora_init"):
+        GRPOConfig.from_dict(
+            {**good, "full_finetune": True, "lora": None, "lora_init": "a.safetensors"}
+        )
 
 
 class _YesTask(Task):

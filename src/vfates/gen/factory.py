@@ -19,7 +19,8 @@ def make_generator(backend: BackendName, model_id: str, **kwargs: Any) -> Genera
 
     ``kwargs`` are passed to that backend's constructor (``device`` and
     ``dtype`` for Hugging Face, engine options for vLLM, ``adapter_path`` and
-    batch sizes for MLX).
+    batch sizes for MLX). ``chat_template_kwargs`` is accepted by every
+    backend, applied in its chat template, and reported by ``describe()``.
     """
     if backend == "mlx":
         from vfates.gen.mlx_backend import MLXGenerator

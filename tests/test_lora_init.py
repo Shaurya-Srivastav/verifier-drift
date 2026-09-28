@@ -53,6 +53,59 @@ def test_lora_init_save_load_sha_and_schema(tmp_path) -> None:
         assert_lora_a_equal(changed, loaded)
 
 
+def test_apply_lora_a_copies_saved_matrices() -> None:
+    torch = pytest.importorskip("torch")
+
+    from vfates.features.lora_init import apply_lora_a
+
+    class _Weight(torch.nn.Module):
+        def __init__(self, tensor: torch.Tensor) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(tensor)
+
+    class _Proj(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lora_A = torch.nn.ModuleDict({"default": _Weight(torch.zeros(2, 3))})
+
+    class _Block(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.q_proj = _Proj()
+
+    class _Inner(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layers = torch.nn.ModuleList([_Block()])
+
+    class _LM(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = _Inner()
+
+    class _Mid(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = _LM()
+
+    class _Root(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.base_model = _Mid()
+
+    model = _Root()
+    saved = {"model.layers.0.q_proj": np.arange(6, dtype=np.float32).reshape(2, 3)}
+    apply_lora_a(model, saved)
+    weight = model.base_model.model.model.layers[0].q_proj.lora_A.default.weight
+    assert weight.dtype == torch.float32
+    assert np.array_equal(weight.detach().numpy(), saved["model.layers.0.q_proj"])
+    with pytest.raises(ValueError, match="no matrix"):
+        apply_lora_a(model, {})
+    bad = {"model.layers.0.q_proj": np.zeros((2, 4), dtype=np.float32)}
+    with pytest.raises(ValueError, match="shape"):
+        apply_lora_a(model, bad)
+
+
 def test_lora_init_rejects_a_bad_schema(tmp_path) -> None:
     path = tmp_path / LORA_INIT_FILENAME
     weight = np.zeros((2, 2), dtype=np.float32)

@@ -32,6 +32,36 @@ from vfates.verifiers.base import Verifier
 MonitorFn = Callable[[Problem, Parsed, str], bool]
 
 
+def _score_record(
+    ctx: RewardContext,
+    parsed: Parsed,
+    oracle_bit: int,
+    verdict_bit: int,
+    problem: Problem,
+    text: str,
+) -> dict[str, Any]:
+    """The dict :meth:`RewardContext.score` stores. Shared with the batch path."""
+    o = int(oracle_bit)
+    v = int(verdict_bit)
+    monitor_bits = {name: bool(fn(problem, parsed, text)) for name, fn in ctx.monitors.items()}
+    record: dict[str, Any] = {
+        "V": v,
+        "O": o,
+        "FP": (1 - o) * v,
+        "FN": o * (1 - v),
+        "answer": parsed.answer,
+        "has_answer": parsed.answer is not None,
+        "monitors": monitor_bits,
+    }
+    lookup = getattr(ctx.task, "grade_meta", None)
+    if callable(lookup):
+        meta = lookup(problem, parsed, text)
+        if isinstance(meta, Mapping) and "n_denied" in meta:
+            record["n_denied"] = int(meta["n_denied"])
+            record["denied"] = list(meta.get("denied") or ())
+    return record
+
+
 class RewardContext:
     """Grades completions with one task oracle and one verifier."""
 
@@ -71,16 +101,7 @@ class RewardContext:
         parsed = self.task.parse(problem, text)
         o = int(self.task.oracle(problem, parsed, text))
         v = int(self.verifier.verdict(problem, parsed, text, o, key))
-        monitor_bits = {name: bool(fn(problem, parsed, text)) for name, fn in self.monitors.items()}
-        record = {
-            "V": v,
-            "O": o,
-            "FP": (1 - o) * v,
-            "FN": o * (1 - v),
-            "answer": parsed.answer,
-            "has_answer": parsed.answer is not None,
-            "monitors": monitor_bits,
-        }
+        record = _score_record(self, parsed, o, v, problem, text)
         if len(self._cache) > 200_000:
             self._cache.clear()
         self._cache[cache_id] = record
@@ -92,13 +113,98 @@ class RewardContext:
         texts: Sequence[str],
         keys: Sequence[DrawKey | None],
     ) -> list[dict[str, Any]]:
-        """Score aligned ``(pid, text, key)`` triples."""
+        """Score aligned ``(pid, text, key)`` triples.
+
+        When the task defines ``grade_batch(items) -> list[int]``, oracle bits
+        for cache misses are graded together (one GRPO step, in parallel).
+        A verifier with ``verdict_batch`` is graded the same way. Otherwise
+        each verifier call is the serial ``verdict``. Records match
+        :meth:`score`: same ``V``, ``O``, ``FP``, ``FN`` and monitor bits.
+        An oracle-kind verifier is ``V = O`` and is not asked to grade again.
+        """
         if not (len(pids) == len(texts) == len(keys)):
             raise ValueError(
                 f"pids, texts and keys must have the same length, got "
                 f"{len(pids)}, {len(texts)}, {len(keys)}"
             )
-        return [self.score(pid, text, key) for pid, text, key in zip(pids, texts, keys)]
+        grade_batch = getattr(self.task, "grade_batch", None)
+        if not callable(grade_batch):
+            return [self.score(pid, text, key) for pid, text, key in zip(pids, texts, keys)]
+        return self._score_graded(list(pids), list(texts), list(keys), grade_batch)
+
+    def _score_graded(
+        self,
+        pids: list[str],
+        texts: list[str],
+        keys: list[DrawKey | None],
+        grade_batch: Any,
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any] | None] = [None] * len(pids)
+        miss: list[int] = []
+        for index, (key, text) in enumerate(zip(keys, texts)):
+            cached = self._cache.get((key, text))
+            if cached is not None:
+                records[index] = cached
+            else:
+                miss.append(index)
+        if not miss:
+            return [record for record in records if record is not None]
+
+        items: list[tuple[Problem, Parsed, str]] = []
+        for index in miss:
+            pid = pids[index]
+            try:
+                problem = self.problems_by_pid[pid]
+            except KeyError as exc:
+                raise KeyError(f"No problem registered for pid {pid!r}") from exc
+            parsed = self.task.parse(problem, texts[index])
+            items.append((problem, parsed, texts[index]))
+        oracle_bits = [int(bit) for bit in grade_batch(items)]
+        if len(oracle_bits) != len(items):
+            raise RuntimeError(
+                f"grade_batch returned {len(oracle_bits)} bits for {len(items)} completions"
+            )
+        verdict_batch = getattr(self.verifier, "verdict_batch", None)
+        verifier_bits: list[int] | None = None
+        oracle_kind = self.verifier.kind == "oracle" and not self.verifier.stochastic
+        if not oracle_kind and callable(verdict_batch):
+            verifier_bits = [
+                int(bit)
+                for bit in verdict_batch(
+                    [item[0] for item in items],
+                    [item[1] for item in items],
+                    [item[2] for item in items],
+                    oracle_bits,
+                    [keys[index] for index in miss],
+                )
+            ]
+            if len(verifier_bits) != len(items):
+                raise RuntimeError(
+                    f"verdict_batch returned {len(verifier_bits)} bits for {len(items)} completions"
+                )
+        for offset, index in enumerate(miss):
+            problem, parsed, text = items[offset]
+            key = keys[index]
+            oracle_bit = oracle_bits[offset]
+            if oracle_kind:
+                verdict_bit = oracle_bit
+            elif verifier_bits is not None:
+                verdict_bit = verifier_bits[offset]
+            else:
+                verdict_bit = int(self.verifier.verdict(problem, parsed, text, oracle_bit, key))
+            record = _score_record(
+                self,
+                parsed,
+                oracle_bit,
+                verdict_bit,
+                problem,
+                text,
+            )
+            if len(self._cache) > 200_000:
+                self._cache.clear()
+            self._cache[(key, text)] = record
+            records[index] = record
+        return [record for record in records if record is not None]
 
 
 def monitor_conditionals(

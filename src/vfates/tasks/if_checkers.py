@@ -49,10 +49,16 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Mapping
 from typing import Any
 
 Checker = Callable[..., bool]
+
+# Multi-constraint rows store every instruction under this func_name so the
+# existing ifeval_checker verifier, which calls apply_checker(func_name, args),
+# grades the whole bundle.
+IFEVAL_ALL = "ifeval_all"
 
 
 def verify_keywords(text: str, keyword_list: list[str]) -> bool:
@@ -329,7 +335,25 @@ def apply_checker(text: str, func_name: str, args: dict[str, Any]) -> bool:
     Exceptions are swallowed so a single malformed response cannot abort a
     grading sweep. Direct calls of the functions still raise (for example
     :func:`verify_letter_frequency` on a multi-character letter).
+
+    ``func_name == ifeval_all`` grades every constraint in
+    ``args["constraints"]``. Unknown instruction ids and a missing
+    ``langdetect`` import propagate. Other checker exceptions still yield False,
+    so an unknown id cannot pass.
     """
+    if func_name == IFEVAL_ALL:
+        constraints = args.get("constraints")
+        if not isinstance(constraints, list):
+            return False
+        try:
+            return all(
+                apply_instruction(text, str(item["instruction_id"]), item.get("kwargs"))
+                for item in constraints
+            )
+        except (ImportError, KeyError):
+            raise
+        except Exception:
+            return False
     func = IF_FUNCTIONS_MAP.get(func_name)
     if func is None:
         return False
@@ -337,3 +361,371 @@ def apply_checker(text: str, func_name: str, args: dict[str, Any]) -> bool:
         return bool(func(text, **args))
     except Exception:
         return False
+
+
+# Instruction-id checkers for allenai/IF_multi_constraints_upto5. These follow
+# IFEvalG check_following and that dataset's kwargs. They do not replace
+# IF_FUNCTIONS_MAP: RLVR-IFeval still uses the func_name checkers above, including
+# the deviations listed at the top of this module.
+#
+# length_constraints:number_sentences counts sentences with
+# ifbench_checkers.split_into_sentences. IFEvalG uses NLTK Punkt. The regex
+# splitter is the one IFEvalG already uses for its other sentence checkers, and
+# it matches Punkt on ordinary prose. change_case:capital_word_frequency uses
+# the pure-Python word_tokenize in that module.
+#
+# language:response_language, change_case:english_capital and
+# change_case:english_lowercase import langdetect lazily. A detection failure
+# (LangDetectException) counts as followed, matching IFEvalG. ImportError
+# propagates. detectable_format:constrained_response accepts only the three
+# strings in _CONSTRAINED_RESPONSE_OPTIONS. Some dataset prompts list extra
+# "I think ..." options that this checker rejects.
+
+
+_CONSTRAINED_RESPONSE_OPTIONS = (
+    "My answer is yes.",
+    "My answer is no.",
+    "My answer is maybe.",
+)
+
+
+def _relation(actual: int, threshold: int, relation: str) -> bool:
+    from vfates.tasks.ifbench_checkers import relation_holds
+
+    return relation_holds(actual, int(threshold), relation)
+
+
+def check_keywords_existence(text: str, keywords: list[str]) -> bool:
+    """Every keyword matches as a case-insensitive regular expression."""
+    return all(re.search(keyword, text, flags=re.IGNORECASE) for keyword in keywords)
+
+
+def check_keywords_frequency(text: str, keyword: str, frequency: int, relation: str) -> bool:
+    """Substring count of ``keyword`` (a regular expression) under ``relation``."""
+    actual = len(re.findall(keyword.strip(), text, flags=re.IGNORECASE))
+    return _relation(actual, frequency, relation)
+
+
+def check_forbidden_words_id(text: str, forbidden_words: list[str]) -> bool:
+    """No forbidden word matches ``\\bword\\b``. The word is not escaped."""
+    return all(
+        re.search(r"\b" + word + r"\b", text, flags=re.IGNORECASE) is None
+        for word in forbidden_words
+    )
+
+
+def check_letter_frequency_id(
+    text: str, letter: str, let_frequency: int, let_relation: str
+) -> bool:
+    """Case-insensitive letter count. IFEvalG treats any other relation as at least."""
+    counted = Counter(text.lower())
+    actual = counted[letter.strip().lower()]
+    if let_relation == "less than":
+        return actual < int(let_frequency)
+    return actual >= int(let_frequency)
+
+
+def check_response_language(text: str, language: str) -> bool:
+    """True when langdetect reports ``language``. Detection failure counts as followed."""
+    import langdetect
+
+    try:
+        return langdetect.detect(text) == language
+    except langdetect.LangDetectException:
+        return True
+
+
+def check_number_sentences(text: str, num_sentences: int, relation: str) -> bool:
+    """Sentence count under ``relation``, using the regex splitter rather than Punkt."""
+    from vfates.tasks.ifbench_checkers import split_into_sentences
+
+    return _relation(len(split_into_sentences(text)), num_sentences, relation)
+
+
+def check_number_paragraphs(text: str, num_paragraphs: int) -> bool:
+    """Exactly ``num_paragraphs`` blocks separated by ``***``."""
+    paragraphs = re.split(r"\s?\*\*\*\s?", text)
+    count = len(paragraphs)
+    for index, paragraph in enumerate(paragraphs):
+        if not paragraph.strip():
+            if index == 0 or index == len(paragraphs) - 1:
+                count -= 1
+            else:
+                return False
+    return count == int(num_paragraphs)
+
+
+def check_number_words(text: str, num_words: int, relation: str) -> bool:
+    """``\\w+`` word count under ``relation``."""
+    from vfates.tasks.ifbench_checkers import count_words
+
+    return _relation(count_words(text), num_words, relation)
+
+
+def check_nth_paragraph_first_word(
+    text: str, num_paragraphs: int, nth_paragraph: int, first_word: str
+) -> bool:
+    """``num_paragraphs`` blank-line paragraphs, and paragraph ``nth`` starts with ``first_word``."""
+    paragraphs = re.split(r"\n\n", text)
+    count = len(paragraphs)
+    for paragraph in paragraphs:
+        if not paragraph.strip():
+            count -= 1
+    index = int(nth_paragraph)
+    if index > count:
+        return False
+    paragraph = paragraphs[index - 1].strip()
+    if not paragraph:
+        return False
+    word = paragraph.split()[0].strip().lstrip("'").lstrip('"')
+    got = ""
+    for character in word:
+        if character in {".", ",", "?", "!", "'", '"'}:
+            break
+        got += character.lower()
+    return count == int(num_paragraphs) and got == first_word.strip().lower()
+
+
+def check_placeholders_id(text: str, num_placeholders: int) -> bool:
+    """At least ``num_placeholders`` ``[placeholder]`` spans."""
+    return len(re.findall(r"\[.*?\]", text)) >= int(num_placeholders)
+
+
+def check_postscript_id(text: str, postscript_marker: str) -> bool:
+    """A postscript line matches the marker. ``P.S.`` and ``P.P.S`` use IFEvalG's patterns."""
+    value = text.lower()
+    marker = postscript_marker.strip()
+    if marker == "P.P.S":
+        pattern = r"\s*p\.\s?p\.\s?s.*$"
+    elif marker == "P.S.":
+        pattern = r"\s*p\.\s?s\..*$"
+    else:
+        pattern = r"\s*" + marker.lower() + r".*$"
+    return bool(re.findall(pattern, value, flags=re.MULTILINE))
+
+
+def check_bullet_lists(text: str, num_bullets: int) -> bool:
+    """Exactly ``num_bullets`` markdown bullets (``*`` or ``-``)."""
+    stars = re.findall(r"^\s*\*[^\*].*$", text, flags=re.MULTILINE)
+    dashes = re.findall(r"^\s*-.*$", text, flags=re.MULTILINE)
+    return len(stars) + len(dashes) == int(num_bullets)
+
+
+def check_constrained_response(text: str) -> bool:
+    """The stripped response contains one of the three canonical option strings."""
+    value = text.strip()
+    return any(option in value for option in _CONSTRAINED_RESPONSE_OPTIONS)
+
+
+def check_highlighted_sections(text: str, num_highlights: int) -> bool:
+    """At least ``num_highlights`` non-empty ``*highlight*`` or ``**highlight**`` spans."""
+    count = 0
+    for highlight in re.findall(r"\*[^\n\*]*\*", text):
+        if highlight.strip("*").strip():
+            count += 1
+    for highlight in re.findall(r"\*\*[^\n\*]*\*\*", text):
+        if highlight.removeprefix("**").removesuffix("**").strip():
+            count += 1
+    return count >= int(num_highlights)
+
+
+def check_multiple_sections(text: str, section_spliter: str, num_sections: int) -> bool:
+    """At least ``num_sections`` blocks opened by ``splitter`` plus a number.
+
+    The kwarg is spelled ``section_spliter``, matching the dataset. The splitter
+    is a regular expression and is not escaped.
+    """
+    pattern = r"\s?" + section_spliter.strip() + r"\s?\d+\s?"
+    return len(re.split(pattern, text)) - 1 >= int(num_sections)
+
+
+def check_json_format_id(text: str) -> bool:
+    """One JSON document, after a single leading and trailing markdown fence is removed."""
+    value = (
+        text.strip()
+        .removeprefix("```json")
+        .removeprefix("```Json")
+        .removeprefix("```JSON")
+        .removeprefix("```")
+        .removesuffix("```")
+        .strip()
+    )
+    try:
+        json.loads(value)
+    except ValueError:
+        return False
+    return True
+
+
+def check_title_id(text: str) -> bool:
+    """A non-empty ``<<title>>`` span."""
+    titles = re.findall(r"<<[^\n]+>>", text)
+    return any(title.lstrip("<").rstrip(">").strip() for title in titles)
+
+
+def check_two_responses_id(text: str) -> bool:
+    """Exactly two non-empty ``******`` sides, and they differ after strip.
+
+    Empty pieces at either end are ignored. A leading separator therefore does
+    not by itself make two responses. The RLVR ``validate_two_responses`` checker
+    is different.
+    """
+    valid: list[str] = []
+    responses = text.split("******")
+    for index, response in enumerate(responses):
+        if not response.strip():
+            if index != 0 and index != len(responses) - 1:
+                return False
+        else:
+            valid.append(response)
+    return len(valid) == 2 and valid[0].strip() != valid[1].strip()
+
+
+def check_repeat_prompt_id(text: str, prompt_to_repeat: str) -> bool:
+    """The stripped response starts with the prompt, case-insensitive."""
+    return bool(text.strip().lower().startswith(prompt_to_repeat.strip().lower()))
+
+
+def check_end_id(text: str, end_phrase: str) -> bool:
+    """After strip, quote strip, and case-fold, the response ends with ``end_phrase``."""
+    value = text.strip().strip('"').lower()
+    return value.endswith(end_phrase.strip().lower())
+
+
+def check_capital_word_frequency(text: str, capital_frequency: int, capital_relation: str) -> bool:
+    """Count of all-caps Treebank tokens under ``capital_relation``."""
+    from vfates.tasks.ifbench_checkers import word_tokenize
+
+    capital = [word for word in word_tokenize(text) if word.isupper()]
+    if capital_relation == "less than":
+        return len(capital) < int(capital_frequency)
+    return len(capital) >= int(capital_frequency)
+
+
+def check_english_capital(text: str) -> bool:
+    """All cased characters are uppercase and langdetect reports English.
+
+    If the text is uppercase and language detection fails, IFEvalG counts it as followed.
+    """
+    import langdetect
+
+    try:
+        return text.isupper() and langdetect.detect(text) == "en"
+    except langdetect.LangDetectException:
+        return True
+
+
+def check_english_lowercase(text: str) -> bool:
+    """All cased characters are lowercase and langdetect reports English.
+
+    If the text is lowercase and language detection fails, IFEvalG counts it as followed.
+    """
+    import langdetect
+
+    try:
+        return text.islower() and langdetect.detect(text) == "en"
+    except langdetect.LangDetectException:
+        return True
+
+
+def check_no_comma_id(text: str) -> bool:
+    """No comma."""
+    return re.search(r"\,", text) is None
+
+
+def check_quotation_id(text: str) -> bool:
+    """Stripped text has length greater than 1 and both ends are double quotes."""
+    value = text.strip()
+    return len(value) > 1 and value[0] == '"' and value[-1] == '"'
+
+
+def _entry(fn: Checker, *required: str) -> tuple[Checker, tuple[str, ...]]:
+    return fn, required
+
+
+IFEVAL_SPECS: dict[str, tuple[Checker, tuple[str, ...]]] = {
+    "keywords:existence": _entry(check_keywords_existence, "keywords"),
+    "keywords:frequency": _entry(check_keywords_frequency, "keyword", "frequency", "relation"),
+    "keywords:forbidden_words": _entry(check_forbidden_words_id, "forbidden_words"),
+    "keywords:letter_frequency": _entry(
+        check_letter_frequency_id, "letter", "let_frequency", "let_relation"
+    ),
+    "language:response_language": _entry(check_response_language, "language"),
+    "length_constraints:number_sentences": _entry(
+        check_number_sentences, "num_sentences", "relation"
+    ),
+    "length_constraints:number_paragraphs": _entry(check_number_paragraphs, "num_paragraphs"),
+    "length_constraints:number_words": _entry(check_number_words, "num_words", "relation"),
+    "length_constraints:nth_paragraph_first_word": _entry(
+        check_nth_paragraph_first_word, "num_paragraphs", "nth_paragraph", "first_word"
+    ),
+    "detectable_content:number_placeholders": _entry(check_placeholders_id, "num_placeholders"),
+    "detectable_content:postscript": _entry(check_postscript_id, "postscript_marker"),
+    "detectable_format:number_bullet_lists": _entry(check_bullet_lists, "num_bullets"),
+    "detectable_format:constrained_response": _entry(check_constrained_response),
+    "detectable_format:number_highlighted_sections": _entry(
+        check_highlighted_sections, "num_highlights"
+    ),
+    "detectable_format:multiple_sections": _entry(
+        check_multiple_sections, "section_spliter", "num_sections"
+    ),
+    "detectable_format:json_format": _entry(check_json_format_id),
+    "detectable_format:title": _entry(check_title_id),
+    "combination:two_responses": _entry(check_two_responses_id),
+    "combination:repeat_prompt": _entry(check_repeat_prompt_id, "prompt_to_repeat"),
+    "startend:end_checker": _entry(check_end_id, "end_phrase"),
+    "change_case:capital_word_frequency": _entry(
+        check_capital_word_frequency, "capital_frequency", "capital_relation"
+    ),
+    "change_case:english_capital": _entry(check_english_capital),
+    "change_case:english_lowercase": _entry(check_english_lowercase),
+    "punctuation:no_comma": _entry(check_no_comma_id),
+    "startend:quotation": _entry(check_quotation_id),
+}
+
+IFEVAL_INSTRUCTION_IDS: tuple[str, ...] = tuple(IFEVAL_SPECS)
+IFEVAL_INSTRUCTION_CHECKERS: dict[str, Checker] = {
+    name: spec[0] for name, spec in IFEVAL_SPECS.items()
+}
+IFEVAL_REQUIRED: dict[str, tuple[str, ...]] = {name: spec[1] for name, spec in IFEVAL_SPECS.items()}
+
+
+def _spec_for(instruction_id: str) -> tuple[Checker, tuple[str, ...]]:
+    spec = IFEVAL_SPECS.get(instruction_id)
+    if spec is not None:
+        return spec
+    from vfates.tasks.ifbench_checkers import IFBENCH_SPECS
+
+    found = IFBENCH_SPECS.get(instruction_id)
+    if found is None:
+        raise KeyError(f"unknown constraint id {instruction_id!r}")
+    return found
+
+
+def prepare_constraint(instruction_id: str, kwargs: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return kwargs for ``instruction_id``. Unknown ids and missing keys raise.
+
+    ``None`` means no arguments. A required key whose value is ``None`` is missing.
+    """
+    _fn, required = _spec_for(instruction_id)
+    args = {} if kwargs is None else dict(kwargs)
+    missing = [key for key in required if args.get(key) is None]
+    if missing:
+        raise ValueError(f"{instruction_id} missing kwargs {missing}")
+    return {key: value for key, value in args.items() if value is not None}
+
+
+def apply_instruction(text: str, instruction_id: str, kwargs: Mapping[str, Any] | None) -> bool:
+    """Run the IFEval or IFBench checker for ``instruction_id``. Unknown ids raise."""
+    fn, _required = _spec_for(instruction_id)
+    args = (
+        {} if kwargs is None else {key: value for key, value in kwargs.items() if value is not None}
+    )
+    return bool(fn(text, **args))
+
+
+def known_instruction_ids() -> frozenset[str]:
+    """The 25 IFEval instruction ids plus the 29 IFBench training ids."""
+    from vfates.tasks.ifbench_checkers import IFBENCH_TRAIN_IDS
+
+    return frozenset(IFEVAL_INSTRUCTION_IDS) | frozenset(IFBENCH_TRAIN_IDS)

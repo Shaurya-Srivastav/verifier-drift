@@ -1,0 +1,16 @@
+\begin{tabular}{lrrp{0.28\textwidth}}
+\toprule
+Baseline & $\rho$ & $\rho(\tau)-\rho(b)$ & Cost \\
+\midrule
+step-0 Youden J & \pending & \pending & shared audit \\
+mean precision & \pending & \pending & shared audit \\
+modal precision & \pending & \pending & shared audit \\
+$\cos(g_V, g_O)$ & \pending & \pending & shared audit \\
+held-out probe AUC & \pending & \pending & shared audit \\
+step-25 accuracy & \pending & \pending & one 25-step run per verifier \\
+Egashira et al.\ $f \times C$ & \pending & \pending & shared audit \\
+shared-behaviour label & \pending & \pending & rule label, no training \\
+\bottomrule
+\end{tabular}
+
+The audit, with its features, is paid once per cell and serves every verifier; a step-25 run is one short training job per verifier. From recorded wall time, one audit costs as much as \BreakEvenMeasured{} step-25 runs. No projected ratio is quoted: the plan does not price the audit's gradient pass.

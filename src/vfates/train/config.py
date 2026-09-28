@@ -8,6 +8,7 @@ knobs (``use_vllm``, micro-batch, checkpointing).
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -119,9 +120,20 @@ class LoRAConfig:
         return cls(**kwargs)
 
 
+class _UnsetLoRA:
+    """YAML ``lora: null``. Only valid together with ``full_finetune: true``."""
+
+
 @dataclass(kw_only=True)
 class GRPOConfig:
-    """Experiment config. Construct with keywords; ``from_yaml`` / ``from_dict`` validate."""
+    """Experiment config. Construct with keywords; ``from_yaml`` / ``from_dict`` validate.
+
+    ``full_finetune: true`` trains every parameter in bf16 with AdamW and does
+    not wrap a LoRA adapter. The ``lora`` block must be null (it is not
+    applied, and the audit's LoRA A is not loaded). ``parameterisation`` is
+    ``full`` in that case and ``lora`` otherwise. The MLX trainer refuses
+    ``full_finetune``.
+    """
 
     model_id: str
     steps: int
@@ -168,16 +180,36 @@ class GRPOConfig:
     # log-probs; set True only as a robustness check, not for the primary run.
     vllm_importance_sampling_correction: bool = False
     notes: str = ""
+    # Colocated vLLM shards the rollout engine across this many GPUs. TRL
+    # 0.25.1 field name: ``vllm_tensor_parallel_size`` (colocate only).
+    vllm_tensor_parallel_size: int = 1
+    # TRL 0.25.1 field name: ``vllm_enable_sleep_mode``.
+    vllm_enable_sleep_mode: bool = False
+    # ``flash_attention_2`` on CUDA when the package imports, else ``sdpa``.
+    # ``None`` lets the trainer resolve and record the choice.
+    attn_implementation: str | None = None
+    model_revision: str | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
+    hardware_class: str | None = None
+    # Train every parameter. Requires ``lora: null``. See the class docstring.
+    full_finetune: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.lora, LoRAConfig):
-            self.lora = LoRAConfig.from_dict(self.lora)
+        lora_value: Any = self.lora
+        if isinstance(lora_value, _UnsetLoRA):
+            self.lora = LoRAConfig()
+            lora_omitted = True
+        elif not isinstance(lora_value, LoRAConfig):
+            self.lora = LoRAConfig.from_dict(lora_value)
+            lora_omitted = False
+        else:
+            lora_omitted = False
         self.adam_betas = (float(self.adam_betas[0]), float(self.adam_betas[1]))
         if self.eval_max_tokens is None:
             self.eval_max_tokens = int(self.max_tokens)
-        self._validate()
+        self._validate(lora_omitted=lora_omitted)
 
-    def _validate(self) -> None:
+    def _validate(self, *, lora_omitted: bool = False) -> None:
         if not isinstance(self.model_id, str) or not self.model_id.strip():
             raise ValueError("model_id must be a non-empty string")
         if not isinstance(self.out_dir, str) or not self.out_dir.strip():
@@ -241,19 +273,34 @@ class GRPOConfig:
                 f"micro_batch_size ({self.micro_batch_size}) must divide "
                 f"prompts_per_step * group_size ({completions})"
             )
-        lora = self.lora
-        if lora.rank < 1:
-            raise ValueError(f"lora.rank must be >= 1, got {lora.rank}")
-        if lora.alpha <= 0:
-            raise ValueError(f"lora.alpha must be positive, got {lora.alpha}")
-        if not (0.0 <= lora.dropout < 1.0):
-            raise ValueError(f"lora.dropout must be in [0, 1), got {lora.dropout}")
-        if lora.num_layers == 0 or lora.num_layers < -1:
-            raise ValueError(
-                f"lora.num_layers must be -1 (all layers) or >= 1, got {lora.num_layers}"
-            )
-        if not lora.keys:
-            raise ValueError("lora.keys must list at least one projection")
+        if not isinstance(self.full_finetune, bool):
+            raise ValueError(f"full_finetune must be a bool, got {self.full_finetune!r}")
+        if self.full_finetune:
+            if not lora_omitted:
+                raise ValueError(
+                    "full_finetune trains every parameter; set lora: null "
+                    "(the lora block is not applied)"
+                )
+            if self.lora_init is not None or self.lora_init_sha256 is not None:
+                raise ValueError(
+                    "full_finetune does not load an audit LoRA A; leave lora_init null"
+                )
+        elif lora_omitted:
+            raise ValueError("lora: null requires full_finetune: true")
+        else:
+            lora = self.lora
+            if lora.rank < 1:
+                raise ValueError(f"lora.rank must be >= 1, got {lora.rank}")
+            if lora.alpha <= 0:
+                raise ValueError(f"lora.alpha must be positive, got {lora.alpha}")
+            if not (0.0 <= lora.dropout < 1.0):
+                raise ValueError(f"lora.dropout must be in [0, 1), got {lora.dropout}")
+            if lora.num_layers == 0 or lora.num_layers < -1:
+                raise ValueError(
+                    f"lora.num_layers must be -1 (all layers) or >= 1, got {lora.num_layers}"
+                )
+            if not lora.keys:
+                raise ValueError("lora.keys must list at least one projection")
         if not isinstance(self.notes, str):
             raise ValueError("notes must be a string")
         _nonneg_int("lora_seed", self.lora_seed)
@@ -273,15 +320,60 @@ class GRPOConfig:
                     f"got {self.lora_init_sha256!r}"
                 )
             self.lora_init_sha256 = digest
+        _pos_int("vllm_tensor_parallel_size", self.vllm_tensor_parallel_size)
+        if not isinstance(self.vllm_enable_sleep_mode, bool):
+            raise ValueError(
+                f"vllm_enable_sleep_mode must be a bool, got {self.vllm_enable_sleep_mode!r}"
+            )
+        if self.chat_template_kwargs is not None:
+            if isinstance(self.chat_template_kwargs, Mapping):
+                copied = dict(self.chat_template_kwargs)
+            else:
+                raise ValueError(
+                    "chat_template_kwargs must be a mapping or null, "
+                    f"got {type(self.chat_template_kwargs).__name__}"
+                )
+            if any(not isinstance(key, str) for key in copied):
+                raise ValueError("chat_template_kwargs keys must be strings")
+            self.chat_template_kwargs = copied
+        if self.attn_implementation is not None:
+            if (
+                not isinstance(self.attn_implementation, str)
+                or not self.attn_implementation.strip()
+            ):
+                raise ValueError(
+                    "attn_implementation must be a non-empty string or null, "
+                    f"got {self.attn_implementation!r}"
+                )
+            self.attn_implementation = self.attn_implementation.strip()
+        if self.model_revision is not None:
+            if not isinstance(self.model_revision, str) or not self.model_revision.strip():
+                raise ValueError(
+                    f"model_revision must be a non-empty string or null, got {self.model_revision!r}"
+                )
+            self.model_revision = self.model_revision.strip()
+        if self.hardware_class is not None:
+            if not isinstance(self.hardware_class, str) or not self.hardware_class.strip():
+                raise ValueError(
+                    f"hardware_class must be a non-empty string or null, got {self.hardware_class!r}"
+                )
+            self.hardware_class = self.hardware_class.strip()
 
     @property
     def completions_per_step(self) -> int:
         return self.prompts_per_step * self.group_size
 
+    @property
+    def parameterisation(self) -> str:
+        """``full`` when ``full_finetune`` is set, otherwise ``lora``."""
+        return "full" if self.full_finetune else "lora"
+
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["adam_betas"] = [float(self.adam_betas[0]), float(self.adam_betas[1])]
-        data["lora"] = self.lora.to_dict()
+        # The in-memory ``lora`` object is an unused placeholder when every
+        # parameter is trained. Serialise that as null.
+        data["lora"] = None if self.full_finetune else self.lora.to_dict()
         return data
 
     @classmethod
@@ -291,8 +383,11 @@ class GRPOConfig:
         unknown = set(data) - set(cls.__dataclass_fields__)
         if unknown:
             raise ValueError(f"Unknown GRPOConfig fields: {sorted(unknown)}")
+        lora_null = "lora" in data and data["lora"] is None
         raw = {k: v for k, v in data.items() if v is not None}
-        if "lora" in raw and not isinstance(raw["lora"], LoRAConfig):
+        if lora_null:
+            raw["lora"] = _UnsetLoRA()
+        elif "lora" in raw and not isinstance(raw["lora"], LoRAConfig):
             raw["lora"] = LoRAConfig.from_dict(raw["lora"])
         if "adam_betas" in raw:
             betas = raw["adam_betas"]

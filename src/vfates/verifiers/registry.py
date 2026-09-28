@@ -27,7 +27,8 @@ from vfates.verifiers.arms import (
     TriggerFP,
 )
 from vfates.verifiers.base import Verifier
-from vfates.verifiers.natural import IFEvalCheckerVerifier, MBPPBaseTestsVerifier
+from vfates.verifiers.natural import IFEvalCheckerVerifier
+from vfates.verifiers.patch import PatchedVerifier
 
 
 def build_verifier(spec: Mapping[str, Any], task: Any = None) -> Verifier:
@@ -48,9 +49,9 @@ def build_verifier(spec: Mapping[str, Any], task: Any = None) -> Verifier:
             salt=_need(spec, "salt"), threshold=float(_need(spec, "threshold")), name=name
         )
     if typ == "tolerance_fp":
-        return NumericToleranceFP(abs_tol=_need(spec, "abs_tol"), name=name)
+        return NumericToleranceFP(abs_tol=_need(spec, "abs_tol"), name=name, task=task)
     if typ == "tolerance_band_fp":
-        return ToleranceBandFP(lo=_need(spec, "lo"), hi=_need(spec, "hi"), name=name)
+        return ToleranceBandFP(lo=_need(spec, "lo"), hi=_need(spec, "hi"), name=name, task=task)
     if typ == "trigger_fp":
         return TriggerFP(
             pattern=_need(spec, "pattern"),
@@ -80,6 +81,7 @@ def build_verifier(spec: Mapping[str, Any], task: Any = None) -> Verifier:
             seed=int(_need(spec, "seed")),
             name=name,
             support=str(spec.get("support", "all")),
+            task=task,
         )
     if typ == "composite":
         if "fn" not in spec or "fp" not in spec:
@@ -95,15 +97,28 @@ def build_verifier(spec: Mapping[str, Any], task: Any = None) -> Verifier:
         )
     if typ == "string_match":
         return StringMatchVerifier(name=name)
-    if typ == "mbpp_base_tests":
-        k = spec.get("k", None)
-        return MBPPBaseTestsVerifier(
-            k=None if k is None else int(k),
-            visible_only=bool(spec.get("visible_only", False)),
-            name=name,
-        )
     if typ == "ifeval_checker":
         return IFEvalCheckerVerifier(name=name)
+    if typ == "patched":
+        base = spec.get("base")
+        if not isinstance(base, Mapping):
+            raise ValueError("patched spec requires a nested 'base' spec")
+        categories = spec.get("categories")
+        if not isinstance(categories, (list, tuple)):
+            raise ValueError("patched spec requires a 'categories' list")
+        return PatchedVerifier(
+            build_verifier(base, task),
+            categories,
+            task,
+            name=name,
+        )
+    if task is not None and typ in getattr(task, "verifier_types", ()):
+        built = task.build_verifier(spec)
+        if not isinstance(built, Verifier):
+            raise TypeError(
+                f"task.build_verifier({typ!r}) returned {type(built).__name__}, expected Verifier"
+            )
+        return built
     raise ValueError(f"unknown verifier type {typ!r}")
 
 

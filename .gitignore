@@ -32,20 +32,31 @@ wandb/
 *.pt
 *.safetensors
 
-# Pilot outputs stay local except the public record: every pilot's report,
-# the P5 gate report, and each audit's calibration, forecasts and lock (the
-# preregistered forecasts that training is scored against).
+# Pilot outputs stay local except the public record: every pilot's report and
+# decisions, the labelled adjudication CSVs, and each per-domain audit's
+# calibration, forecasts and lock.
 pilots/*/results/**
 !pilots/*/results/
 !pilots/*/results/report.md
 !pilots/*/results/report.json
-!pilots/*/results/gate/
-!pilots/*/results/gate/report.md
-!pilots/*/results/gate/report.json
-!pilots/*/results/audit/
-!pilots/*/results/audit/calibration.json
-!pilots/*/results/audit/forecasts.json
-!pilots/*/results/audit/lock.json
+!pilots/*/results/decisions.json
+!pilots/*/results/adjudication/
+!pilots/*/results/adjudication/*.csv
+!pilots/*/results/*/
+!pilots/*/results/*/audit/
+!pilots/*/results/*/audit/calibration.json
+!pilots/*/results/*/audit/forecasts.json
+!pilots/*/results/*/audit/lock.json
 
 # Private chat exports. Do not match a home-directory cache; this is in-repo only.
 cursor_*.md
+
+# LaTeX build products. paper/main.pdf stays tracked.
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.bbl
+paper/*.blg
+paper/*.synctex.gz

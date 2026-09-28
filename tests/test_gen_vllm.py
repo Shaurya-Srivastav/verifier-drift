@@ -140,3 +140,15 @@ def test_token_prompts_keep_the_suffix():
     assert len(ids) == 4
     full = token_prompts(_FakeTokenizer(), ["hello"])[0]["prompt_token_ids"]
     assert ids == full[-4:]
+
+
+class _KwTokenizer:
+    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=True, **kwargs):
+        assert add_generation_prompt and tokenize
+        assert kwargs == {"enable_thinking": False}
+        return [8, 9]
+
+
+def test_token_prompts_apply_chat_template_kwargs_before_sampling():
+    prompts = token_prompts(_KwTokenizer(), ["hi"], chat_template_kwargs={"enable_thinking": False})
+    assert prompts == [{"prompt_token_ids": [8, 9]}]

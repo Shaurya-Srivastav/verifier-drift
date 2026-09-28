@@ -1,0 +1,50 @@
+# Qwen3-4B. One GPU on every CUDA class, including 32 GB and 40 GB.
+# revision from https://huggingface.co/api/models/Qwen/Qwen3-4B on 2026-09-28.
+# params_b is bf16 weight bytes / 2 (4022468096).
+name: qwen3-4b
+model_id: Qwen/Qwen3-4B
+revision: 1cfa9a7208912126459214e8b04321603b3df60c
+family: qwen3
+params_b: 4.022468096
+chat_template_kwargs:
+  enable_thinking: false
+lora_keys: [q, k, v, o, gate, up, down]
+dtype: bfloat16
+attn_implementation: flash_attention_2
+gated: false
+lr: 2.0e-5
+placement:
+  # About 8 GB per copy, so train + vLLM is about 16 GB before the KV cache.
+  # On 32 GB, util 0.40 gives vLLM 12.8 GB (weights plus a short cache) and
+  # leaves about 19 GB for the training copy and a micro-batch of 8.
+  # 40 GB and up keep a larger micro-batch. No tensor parallel.
+  apple-silicon:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 4
+    vllm_gpu_memory_utilization: 0.35
+  h100-80gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 32
+    vllm_gpu_memory_utilization: 0.35
+  a100-80gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 32
+    vllm_gpu_memory_utilization: 0.35
+  a100-40gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 8
+    vllm_gpu_memory_utilization: 0.40
+  rtx-a6000-48gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 16
+    vllm_gpu_memory_utilization: 0.35
+  rtx-5000-ada-32gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 8
+    vllm_gpu_memory_utilization: 0.40

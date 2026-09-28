@@ -1,68 +1,147 @@
-# P5: GPU gate
+# P5 GPU gate
 
-The go/no-go decision for renting the E1 compute. It has three modes:
+Question: does every model and hardware class in `configs/program.yaml` train, resume, and move oracle accuracy, and which E1 arms need seeds 3 and 4?
 
-- **Dry run** (`mode: dry_run`, the default without CUDA) on the Mac: the PyTorch path at toy size.
-- **Full gate** (`mode: full`, the default with CUDA) on one H100: the development pool. Its only scientific go/no-go is the oracle held-out gain. Fate contrasts are logged and do not decide whether E1 runs.
-- **Replication screen** (`pilots/p5_gpu_gate/replication_screen.yaml`): base accuracy and truncation of Llama-3.2-3B-Instruct and Qwen2.5-3B-Instruct at 1,024 tokens on 128 development prompts. Documented. It is not part of the full-gate decision, because scoring two 3B models is a separate job.
+Each stage is a separate launch. Copy `<out>/stages/<stage>.json` back and run `collect` to merge them. Filter a launch with `--set model=qwen3-8b` and `--set hardware_class=h100-80gb`.
 
-## Dry run (Mac, `mode: dry_run`)
+One GPU is `python -m vfates.cli study`. Two GPUs use `accelerate launch --config_file configs/accelerate/fsdp_2gpu.yaml --num_processes 2`. Four GPUs use `configs/accelerate/fsdp_4gpu.yaml`. The pilot builds that argv (`vfates.schedule.build_worker_command`). Do not wrap the pilot itself in `accelerate launch`. `configs/accelerate/single_gpu.yaml` is the one-GPU file and is not launched. 14B is tensor-parallel 2. 32B is tensor-parallel 4.
 
-| Check | Claim |
-| --- | --- |
-| P5.1 | Documented: accelerator, mode, vLLM version. |
-| P5.2 | A torch audit (Hugging Face sampling, LoRA-B features, calibration, forecasts, lock) completes. It calibrates P1's five toy arms; the full arm file needs a real-size audit and is calibrated by the full gate. |
-| P5.3 | TRL `GRPOTrainer` with PEFT trains `train.steps` steps, logs one metrics row per step, and saves an adapter at every step. |
-| P5.4 | The checkpoint evaluator writes `eval.jsonl` and `eval_prompts.jsonl` at step 0 and every adapter. |
-| P5.5 | Re-evaluation writes nothing new. |
-| P5.6 | Documented: token-rate cost of the full gate. Eval tokens are included. `audit_prompts` is 896 (512 train + 384 held-out). |
+Run a cell on the machine whose `hardware_class()` matches it. The study refuses a mismatch unless `VFATES_ALLOW_HARDWARE_MISMATCH=1`.
 
-The audit has P1's shape (24 train and 12 held-out prompts, 4 samples, 256 tokens); at 96 tokens nearly every completion is truncated and no FN arm can be calibrated. Training and evaluation use the audit's 256-token budget and temperature: `train_arm` refuses a run whose model, `max_tokens`, `eval_max_tokens`, `temperature` or `eval_temperature` differs from the audit that made the lock.
+## Stages
 
-TRL's own evaluation reports pooled reward means only, so `train_arm` turns it off. The endpoint (per-prompt held-out oracle accuracy) comes from evaluating the saved adapters afterwards.
+| id | stage | gated | rule |
+| --- | --- | --- | --- |
+| P5.1 | `path` | gated | Every (model, hardware class) that has a cell. 10-step oracle train plus checkpoint eval through TRL with colocated vLLM, adapter save and reload, held-out oracle accuracy at step 0 and the last step (recorded, not a gain gate), peak memory per GPU. MLX writes `peak_memory_gb`. TRL writes `peak_memory_gb` and `peak_memory_gb_per_gpu` (GiB, three decimals). A CUDA path with neither field fails closed. |
+| P5.2 | `preempt` | gated | One run per hardware class. SIGUSR1 at a mid step (`status: preempted`), then resume to the same planned step with `steps_completed == steps` and `status: complete`. |
+| P5.3 | `gain` | gated | Every model. Oracle on the math dev pool, the model spec's learning rate, 150 steps, held-out oracle gain at least **0.05** over step 0. `qwen3-1.7b-base` has no math cell; it retargets `e1-math-qwen3-1.7b` with that spec's overrides. |
+| P5.4 | `seeds` | documented | Each E1 domain, oracle seeds 0 and 1, full E1 protocol, 300 steps, dev pool. If the sample SD (ddof=1) of the two final dev accuracies exceeds **0.03**, that cell's H1 and H2 arms (`study.seed_rule.arms`) also run seeds 3 and 4. The seed list still includes the E1 base seed 2. |
+| P5.5 | `throughput` | documented | From stage logs: gen and train tokens per second per GPU, and wall hours per arm-seed scaled to 300 steps (`wall_s / measured_steps * 300 / 3600`). Writes `configs/throughput.yaml` only when a non-smoke pair is complete. |
+| | `collect` | | Merges stage files into the report and `results/decisions.json`. |
 
-```bash
-python pilots/p5_gpu_gate/run.py           # or: vfates pilot p5
-```
+Mac dry run (`--set smoke=true`) runs `path` and `preempt` on Qwen3-0.6B through the chain_sum cell (MLX or HF, no dataset download), then `collect`. Gain and seeds are not failed; they are documented as not part of the smoke.
 
-The dry run takes about 4 minutes on a Mac Studio with an M4 Max once the weights are downloaded (254 s measured).
+The dev pool is never the confirmatory held-out split. If dev is shorter than 1024+384, cap `audit.pools` to the largest it allows. A smaller pool can only lower reliability.
 
-## Full gate (H100, `mode: full`)
+## Commands
 
-Development pool, disjoint from E1 at the question level: 512 train prompts at dataset seed 50,000,000 and 384 held-out prompts at 60,000,000. vLLM audit of Qwen2.5-1.5B-Instruct (16 samples, 1,024 tokens), then TRL GRPO on ten arms with two seeds (300 steps). The report is `pilots/p5_gpu_gate/results/gate/report.md`.
-
-| Check | Claim |
-| --- | --- |
-| P5.0 | Every planned arm-seed finished. Execution, not a scientific claim. |
-| P5.7 | Oracle held-out gain (final minus step 0, mean over seeds) is at least 0.10. This is the only scientific go/no-go. |
-| P5.8 | Fate contrasts, prompt bootstrap at the final step. Logged, not a gate. |
-| P5.9 | Sample SD (ddof 1) of the two oracle seeds' final held-out accuracies, and the E1 seed rule: SD > 0.03 means 5 seeds for the H1/H2 arms, otherwise 3. Documented. |
-| P5.10 | Measured H100 hours per arm-seed and the projected E1 cost, with eval and audit included. Documented. |
-
-The P5.10 clocks:
-
-- **Training:** the per-step `wall_s`, which TRL and MLX both log and which excludes evaluation. The fallback is `gen_seconds` + `train_seconds`, then the whole `train_arm` clock.
-- **Evaluation:** the gate writes the whole `train_arm` clock of every fresh run to `timing.json`. `train_arm` turns TRL's in-loop eval off and evaluates the saved adapters afterwards, so eval seconds are that clock minus the summed `wall_s` (checkpoint evaluation and model loading), scaled by the number of evals. TRL's `eval_seconds` on `trl_eval.jsonl` is used instead when it exists. Eval tokens are priced at the generation rate only when no eval clock exists. `eval_sources` in the timing table names the clocks used.
-- **Audit:** the gate times its own audit when it starts fresh and writes `audit_timing.json`. E1's audit is that clock scaled by completions (1,408 x 16 against 896 x 16). Without it, the audit is priced at the measured generation rate, else at the placeholder `h100_gen_tok_s` and `mean_completion_len` in `e1_cost`. `audit_source` in the projection names the one used.
-
-P5.9 also reports the E1 minimum detectable difference at margin 0.05 for 3 seeds and for 5 seeds, from `vfates.analysis.power` with the measured oracle seed SD. That function is a normal approximation to the crossed design (R4). A seed SD of 0 reproduces R4's eval-only standard error (about 0.0076 at 384 prompts and 3 seeds).
-
-The projected E1 cost scales the measured arm-seed by steps. Three-seed E1 is 39 full runs (13 arms x 3) plus 13 early baselines of 25 steps. If the seed rule fires, full runs become 57 (9 arms x 5 + 4 arms x 3). The token-rate model in the dry run is only a comparison.
+Mac:
 
 ```bash
-git clone https://github.com/Shaurya-Srivastav/verifier-drift && cd verifier-drift
-bash pilots/p5_gpu_gate/launch_h100.sh
-tail -f pilots/p5_gpu_gate/results/run.log
+.venv/bin/python -m vfates.cli pilot p5 --set smoke=true --out pilots/p5_gpu_gate/results
 ```
 
-The launcher installs `.[torch,gpu,tasks,analysis]` into `.venv`, prints the environment, and starts the full gate in the background. Every stage resumes. Copy `pilots/p5_gpu_gate/results/` back before releasing the machine.
-
-## Replication screen
+Lab RTX A6000 48GB (`rtx-a6000-48gb`): `qwen3-1.7b` and `qwen3-1.7b-base`.
 
 ```bash
-python pilots/p5_gpu_gate/run.py \
-  --config pilots/p5_gpu_gate/replication_screen.yaml \
-  --out pilots/p5_gpu_gate/results/replication_screen
+.venv/bin/python -m vfates.cli pilot p5 --set stage=path --set hardware_class=rtx-a6000-48gb
+.venv/bin/python -m vfates.cli pilot p5 --set stage=preempt --set hardware_class=rtx-a6000-48gb
+.venv/bin/python -m vfates.cli pilot p5 --set stage=gain --set model=qwen3-1.7b
+.venv/bin/python -m vfates.cli pilot p5 --set stage=gain --set model=qwen3-1.7b-base
+.venv/bin/python -m vfates.cli pilot p5 --set stage=seeds --set cell=e1-chain_sum-qwen3-1.7b
+.venv/bin/python -m vfates.cli pilot p5 --set stage=seeds --set cell=e1-math-qwen3-1.7b
 ```
 
-Use Llama-3.2-3B-Instruct when its base held-out accuracy is in [0.10, 0.60] and truncation (`finish_reason == length`) is at most 0.05. Otherwise use Qwen2.5-3B-Instruct. Write that choice into `configs/experiments/e1_replication_3b.yaml` before its audit is locked.
+Lab RTX 5000 Ada 32GB (`rtx-5000-ada-32gb`): `qwen3-1.7b` code, ifeval, qa. Seeds for those three E1 cells.
+
+```bash
+.venv/bin/python -m vfates.cli pilot p5 --set stage=path --set hardware_class=rtx-5000-ada-32gb
+.venv/bin/python -m vfates.cli pilot p5 --set stage=preempt --set hardware_class=rtx-5000-ada-32gb
+.venv/bin/python -m vfates.cli pilot p5 --set stage=seeds --set cell=e1-code-qwen3-1.7b
+.venv/bin/python -m vfates.cli pilot p5 --set stage=seeds --set cell=e1-ifeval-qwen3-1.7b
+.venv/bin/python -m vfates.cli pilot p5 --set stage=seeds --set cell=e1-qa-qwen3-1.7b
+```
+
+Lab A100 80GB (`a100-80gb`): `qwen3-4b`. Preempt uses the chain_sum cell on this class.
+
+```bash
+.venv/bin/python -m vfates.cli pilot p5 --set stage=path --set hardware_class=a100-80gb
+.venv/bin/python -m vfates.cli pilot p5 --set stage=preempt --set hardware_class=a100-80gb
+.venv/bin/python -m vfates.cli pilot p5 --set stage=gain --set model=qwen3-4b
+```
+
+Rented H100 80GB (`h100-80gb`): `qwen3-8b`, `qwen3-14b` (2 GPU), `qwen3-32b` (4 GPU), `olmo3-7b`, `llama3.1-8b`. Preempt on this class is `e2-math-qwen3-14b`.
+
+```bash
+.venv/bin/python -m vfates.cli pilot p5 --set stage=path --set model=qwen3-8b --set hardware_class=h100-80gb
+.venv/bin/python -m vfates.cli pilot p5 --set stage=path --set model=qwen3-14b --set hardware_class=h100-80gb
+.venv/bin/python -m vfates.cli pilot p5 --set stage=path --set model=qwen3-32b --set hardware_class=h100-80gb
+.venv/bin/python -m vfates.cli pilot p5 --set stage=path --set model=olmo3-7b --set hardware_class=h100-80gb
+.venv/bin/python -m vfates.cli pilot p5 --set stage=path --set model=llama3.1-8b --set hardware_class=h100-80gb
+.venv/bin/python -m vfates.cli pilot p5 --set stage=preempt --set hardware_class=h100-80gb
+.venv/bin/python -m vfates.cli pilot p5 --set stage=gain --set model=qwen3-8b
+.venv/bin/python -m vfates.cli pilot p5 --set stage=gain --set model=qwen3-14b
+.venv/bin/python -m vfates.cli pilot p5 --set stage=gain --set model=qwen3-32b
+.venv/bin/python -m vfates.cli pilot p5 --set stage=gain --set model=olmo3-7b
+.venv/bin/python -m vfates.cli pilot p5 --set stage=gain --set model=llama3.1-8b
+```
+
+The 14B train command the pilot launches:
+
+```bash
+accelerate launch --config_file configs/accelerate/fsdp_2gpu.yaml --num_processes 2 \
+  -m vfates.cli study --config <cell.yaml> --out <out> --only train --arm oracle --seed 0
+```
+
+32B uses `configs/accelerate/fsdp_4gpu.yaml` and `--num_processes 4`.
+
+Collect, after the stage files are in one `--out` directory:
+
+```bash
+.venv/bin/python -m vfates.cli pilot p5 --set stage=collect --out pilots/p5_gpu_gate/results
+.venv/bin/python -m vfates.cli program plan --by-cell --budget-usd 9000
+```
+
+`collect` also prints that plan in the report (skipped when `smoke` or `--set plan=false`).
+
+Slurm, so a preemption reaches the study (`--requeue`, `--signal=B:USR1@180`). The batch script execs the worker; USR1 is forwarded to the study child. The preempt stage does not need this: it sends SIGUSR1 itself and then resumes.
+
+```bash
+#SBATCH --requeue
+#SBATCH --signal=B:USR1@180
+#SBATCH --gres=gpu:4
+export VFATES_QUEUE="$PWD/queue.json"
+export VFATES_HARDWARE_CLASS=h100-80gb
+export VFATES_GPUS=4
+sbatch scripts/slurm/job.sbatch
+```
+
+For an interactive pilot stage on the same node, run the `pilot p5` command under `srun` with the same two `#SBATCH` lines. One-GPU stages run the study in process, so USR1 hits the trainer. Multi-GPU stages spawn `accelerate launch` in the same process group.
+
+## Runtime and cost
+
+Same placeholder as `vfates program plan`: 10,000 gen tok/s and 30,000 train tok/s on one H100, overhead 1.25, 64 prompts times group size 8, domain lengths, times `params_b / 1.7`. Class GPU-hours divide by `speed_vs_h100`. A multi-GPU placement is not multiplied again, because the planner assumes tensor-parallel throughput scales with the GPU count. Hours below include one dev audit plus the short train. They are not measurements. Lab USD is 0. H100 USD is the H100-equivalent hours times $2.50.
+
+Path, 10 steps: A6000 math 1.7B about 1.7 GPU-h; A6000 base about 1.2; RTX 5000 Ada code about 1.6; A100 4B about 2.5; H100 8B and Llama about 2.7 GPU-h ($6.80) each; OLMo about 2.4 GPU-h ($6.00); 14B about 4.8 GPU-h ($12); 32B about 10.9 GPU-h ($27).
+
+Preempt, one short run per class: A6000 chain_sum about 1.2 GPU-h; RTX 5000 Ada code about 1.6; A100 4B chain_sum about 1.7; H100 14B about 4.8 GPU-h ($12).
+
+Gain, 150 steps on math: 1.7B and 1.7B-base on the A6000 about 6.9 GPU-h each; 4B on the A100 about 10 GPU-h; H100 8B and Llama about 11 GPU-h ($28) each; OLMo about 10 GPU-h ($25); 14B about 20 GPU-h ($50); 32B about 46 GPU-h ($114).
+
+Seeds, two oracle runs of 300 steps: chain_sum about 17 GPU-h, math about 24, code about 23, ifeval about 14, qa about 14, all lab, $0. If the SD exceeds 0.03, H1 and H2 add seeds 3 and 4 (another four arm-seeds per such arm). That is the expensive branch; the base list is seeds 0, 1 and 2, and seed 2 of oracle is not trained by this stage.
+
+Mac smoke is minutes, not these hours.
+
+## Files
+
+`results/decisions.json` schema `vfates.p5_decisions/1`: `seeds` per E1 cell, `gain` pass per model, `path` pass per `model/hardware_class`, `preempt` pass per class.
+
+`configs/throughput.yaml` schema `vfates.throughput/1`:
+
+```yaml
+schema: vfates.throughput/1
+rates:
+  <model>:
+    <hardware_class>:
+      gen_tok_s_per_gpu: ...
+      train_tok_s_per_gpu: ...
+      hours_per_arm_seed: ...
+      measured_at: ...
+      commit: ...
+```
+
+Smoke rows are not written. The program planner reads this file. Do not commit a hand-filled copy.
+
+## What the study does with it
+
+A failed path or preempt blocks that placement. A failed gain blocks that model. P5.4 writes the seed list; the report says which cells should set `study.seed_rule.apply` so the rule arms take seeds 3 and 4. P5.5's hours replace the placeholder in `vfates program plan`.

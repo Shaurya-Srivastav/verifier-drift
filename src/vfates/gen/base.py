@@ -32,7 +32,12 @@ class Generator(ABC):
         """``n`` completions for each prompt, in prompt order."""
 
     def describe(self) -> dict[str, Any]:
-        return {"backend": type(self).__name__, "model_id": getattr(self, "model_id", None)}
+        kwargs = getattr(self, "chat_template_kwargs", None)
+        return {
+            "backend": type(self).__name__,
+            "model_id": getattr(self, "model_id", None),
+            "chat_template_kwargs": None if kwargs is None else dict(kwargs),
+        }
 
 
 def chat_messages(user: str, system_prompt: str | None = None) -> list[dict[str, str]]:

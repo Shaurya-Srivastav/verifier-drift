@@ -139,3 +139,91 @@ def test_trl_reward_funcs_names_weights_and_keys() -> None:
     assert oracle == [1.0, 0.0]
     with pytest.raises(ValueError, match="pid"):
         funcs[0](completions)
+
+
+class _CountingTask(_YesTask):
+    def __init__(self) -> None:
+        self.oracle_calls = 0
+        self.batch_sizes: list[int] = []
+
+    def oracle(self, problem: Problem, parsed: Parsed, text: str) -> int:
+        self.oracle_calls += 1
+        return super().oracle(problem, parsed, text)
+
+    def grade_batch(self, items: list[tuple[Problem, Parsed, str]]) -> list[int]:
+        self.batch_sizes.append(len(items))
+        return [int("yes" in text.lower()) for _problem, _parsed, text in items]
+
+
+class _BatchFlip(_Flip):
+    def verdict_batch(self, problems, parsed, texts, oracle_bits, keys) -> list[int]:  # type: ignore[no-untyped-def]
+        del problems, parsed, texts, oracle_bits
+        self.keys.extend(keys)
+        return [int(int(key[-1]) % 2 == 0) for key in keys]
+
+
+class _BoomOracle(Verifier):
+    kind = "oracle"
+    stochastic = False
+    name = "oracle"
+
+    def verdict(self, problem: Problem, parsed: Parsed, text: str, o: int, key=None) -> int:
+        del problem, parsed, text, o, key
+        raise AssertionError("oracle verifier must not be graded again")
+
+
+def _fields(record: dict[str, object]) -> dict[str, object]:
+    return {name: record[name] for name in ("V", "O", "FP", "FN", "has_answer")}
+
+
+def test_score_batch_matches_serial_and_skips_cache_hits() -> None:
+    task = _CountingTask()
+    verifier = _BatchFlip()
+    ctx = RewardContext(task, verifier, {"p0": _problem()}, seed=3)
+    keys = [ctx.draw_key(1, "p0", index) for index in range(3)]
+    texts = ["yes please", "no", "yes"]
+    pids = ["p0", "p0", "p0"]
+    batched = ctx.score_batch(pids, texts, keys)
+    serial_task = _YesTask()
+    serial = RewardContext(serial_task, _Flip(), {"p0": _problem()}, seed=3)
+    one_by_one = [serial.score(pid, text, key) for pid, text, key in zip(pids, texts, keys)]
+    assert [_fields(row) for row in batched] == [_fields(row) for row in one_by_one]
+    assert task.oracle_calls == 0
+    assert task.batch_sizes == [3]
+    ctx.score_batch(pids[:2], texts[:2], keys[:2])
+    assert task.batch_sizes == [3]
+    ctx.score_batch(["p0", "p0"], ["yes please", "maybe"], [keys[0], ctx.draw_key(1, "p0", 4)])
+    assert task.batch_sizes == [3, 1]
+
+
+def test_score_batch_oracle_verifier_copies_the_oracle_bit() -> None:
+    task = _CountingTask()
+    ctx = RewardContext(task, _BoomOracle(), {"p0": _problem()}, seed=0)
+    record = ctx.score_batch(["p0"], ["yes please"], [None])[0]
+    assert record["O"] == 1 and record["V"] == 1
+    assert record["FP"] == 0 and record["FN"] == 0
+    assert task.oracle_calls == 0
+    assert task.batch_sizes == [1]
+
+
+def test_score_batch_rejects_a_short_grade_batch() -> None:
+    class _Short(_CountingTask):
+        def grade_batch(self, items: list[tuple[Problem, Parsed, str]]) -> list[int]:
+            del items
+            return []
+
+    ctx = RewardContext(_Short(), _BoomOracle(), {"p0": _problem()}, seed=0)
+    with pytest.raises(RuntimeError, match="grade_batch"):
+        ctx.score_batch(["p0"], ["yes"], [None])
+
+
+def test_score_batch_without_grade_batch_is_serial() -> None:
+    verifier = _Flip()
+    ctx = RewardContext(_YesTask(), verifier, {"p0": _problem()}, seed=1)
+    batched = ctx.score_batch(
+        ["p0", "p0"],
+        ["yes", "no"],
+        [ctx.draw_key(2, "p0", 0), ctx.draw_key(2, "p0", 1)],
+    )
+    assert batched[0]["O"] == 1 and batched[1]["O"] == 0
+    assert verifier.keys == [(1, 2, "p0", 0), (1, 2, "p0", 1)]

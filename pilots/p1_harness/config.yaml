@@ -1,53 +1,11 @@
-# P1: harness correctness with a real model (Mac Studio, about 2 min).
-model_id: Qwen/Qwen2.5-0.5B-Instruct
-fresh: true
-pytest: true
+# P1 harness. The default command is structural and loads no model.
+# live: true audits Qwen/Qwen3-0.6B on each domain (development pool) and
+# runs a 2-step GRPO job on chain_sum. Math uses DeepScaleR when HF_TOKEN
+# is unset. QA and IFEval use the heuristic judge on this path.
+live: false
+pytest: false
 pytest_marker: "not slow and not network"
-identity_items: 200
-logprob_prompts: 8
-logprob_max_tokens: 128
-
-# A tiny audit that still exercises every stage (sampling, grading,
-# calibration, LoRA-gradient features, forecasts, lock).
-audit:
-  task: {type: chain_sum, min_terms: 2, max_terms: 3, min_digits: 1, max_digits: 3,
-         min_decimal_places: 1, max_decimal_places: 2}
-  pools: {train: 24, heldout: 12, seed: 0}
-  generator: {backend: mlx, model_id: null, kwargs: {completion_batch_size: 64}}
-  sampling: {n: 4, max_tokens: 256, temperature: 1.0, seed: 0, chunk_prompts: 16}
-  arms:
-    targets: {fpr: 0.15, fnr: 0.30}
-    n_boot: 50
-    arms:
-      - {name: oracle, type: oracle}
-      - {name: fp_hash, type: hash_fp, salt: chain_sum/fp_hash}
-      - {name: fp_tolerance, type: tolerance_fp}
-      - {name: noise_fp, type: resampled, match: fp_tolerance, seed: 0}
-      - {name: fn_prompt_subset, type: prompt_subset_fn, salt: chain_sum/fn_prompt_subset}
-  features: {kind: lora_grad, model_id: null, sketch_dim: 1024, load: {dtype: float32}}
-  forecast: {n_boot: 20, reliability_splits: 5}
-  lock: true
-
-train_arm: noise_fp
-train:
-  steps: 2
-  prompts_per_step: 4
-  group_size: 4
-  # Training and evaluation sample the audited policy: the audit's 256 tokens.
-  max_tokens: 256
-  lr: 2.0e-5
-  eval_every: 2
-  eval_heldout_n: 8
-  eval_train_n: 8
-  eval_samples_per_prompt: 1
-  eval_max_tokens: 256
-  save_every: 1
-  micro_batch_size: 4
-  seed: 0
-  lora: {rank: 16, alpha: 32, dropout: 0.0, keys: [q, k, v, o, gate, up, down], num_layers: -1}
-
-gates:
-  # bf16 MLX weights vs fp32 PyTorch: a few hundredths of a nat per token is
-  # numerical, not a tokenisation or alignment bug (those are > 1 nat/token).
-  logprob_per_token: 0.05
-  roundtrip_rate: 0.95
+identity_items: 20
+domains: [chain_sum, math, code, ifeval, qa]
+model_id: Qwen/Qwen3-0.6B
+fresh: true

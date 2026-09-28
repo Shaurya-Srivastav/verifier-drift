@@ -69,13 +69,15 @@ def test_train_arm_writes_the_lock_and_lora_init_into_the_run(
     box = _trainer(monkeypatch)
     run_dir = tmp_path / "run"
     result = train_arm(audit, "oracle", _TRAIN, run_dir, backend="mlx", max_train=2)
-    assert result == {"ok": True}
+    assert result["ok"] is True
+    assert set(result["timing"]) == {"wall_seconds", "gpus", "hardware_class"}
     record = read_lock_record(audit / "lock.json")
     run = read_json(run_dir / "run.json")
     init = audit / "lora_init.safetensors"
     assert run["lock_sha256"] == record["sha256"]
     assert run["lora_init_sha256"] == sha256_file(init)
     assert run["lora_init_sha256"] == record["artifacts"]["lora_init"]
+    assert run["parameterisation"] == "lora"
     assert box["config"].lora_init == str(init)
     assert box["config"].lora_init_sha256 == run["lora_init_sha256"]
     assert isinstance(run["git_commit"], str) or run["git_commit"] is None
@@ -178,3 +180,51 @@ def test_unknown_lock_artifact_is_refused(tmp_path: Path, monkeypatch: pytest.Mo
     _trainer(monkeypatch)
     with pytest.raises(ValueError, match="unknown artifact"):
         train_arm(audit, "oracle", _TRAIN, tmp_path / "run")
+
+
+def test_train_arm_refuses_a_hardware_class_mismatch(
+    tmp_path: Path, audit_config: dict, patch_audit_fakes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    audit = _audit(tmp_path, audit_config, patch_audit_fakes)
+    box = _trainer(monkeypatch)
+    monkeypatch.setattr("vfates.experiment.detect_hardware_class", lambda: "cpu")
+    with pytest.raises(RuntimeError, match="h100-80gb"):
+        train_arm(audit, "oracle", _TRAIN, tmp_path / "refused", hardware_class="h100-80gb")
+    assert box["called"] == 0
+    monkeypatch.setenv("VFATES_ALLOW_HARDWARE_MISMATCH", "1")
+    train_arm(audit, "oracle", _TRAIN, tmp_path / "override", hardware_class="h100-80gb")
+    override = read_json(tmp_path / "override" / "run.json")
+    assert override["hardware_class_declared"] == "h100-80gb"
+    assert override["hardware_class_detected"] == "cpu"
+    assert override["hardware_mismatch_override"] is True
+    monkeypatch.setattr("vfates.experiment.detect_hardware_class", lambda: "apple-silicon")
+    train_arm(audit, "oracle", _TRAIN, tmp_path / "match", hardware_class="apple-silicon")
+    matched = read_json(tmp_path / "match" / "run.json")
+    assert matched["hardware_class_declared"] == "apple-silicon"
+    assert matched["hardware_class_detected"] == "apple-silicon"
+    assert matched["hardware_mismatch_override"] is False
+
+
+def test_train_arm_full_finetune_skips_lora_and_refuses_mlx(
+    tmp_path: Path, audit_config: dict, patch_audit_fakes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    audit = _audit(tmp_path, audit_config, patch_audit_fakes)
+    box = _trainer(monkeypatch)
+    full = {**_TRAIN, "full_finetune": True, "lora": None}
+    with pytest.raises(RuntimeError, match="full_finetune"):
+        train_arm(audit, "oracle", full, tmp_path / "mlx-full", backend="mlx")
+    assert box["called"] == 0
+    assert not (tmp_path / "mlx-full" / "run.json").exists()
+
+    def fake_trl(config, *args, **kwargs):
+        del args, kwargs
+        box["trl_config"] = config
+        return {"ok": True}
+
+    monkeypatch.setattr("vfates.experiment._train_trl", fake_trl)
+    train_arm(audit, "oracle", full, tmp_path / "trl-full", backend="trl")
+    run = read_json(tmp_path / "trl-full" / "run.json")
+    assert run["parameterisation"] == "full"
+    assert run["lora_init_sha256"] is None
+    assert box["trl_config"].full_finetune is True
+    assert box["trl_config"].lora_init is None

@@ -26,6 +26,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import numpy as np
+
 from vfates.analysis.outcomes import normal_cdf, normal_ppf
 
 
@@ -193,108 +195,86 @@ def token_projection(spec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def project_measured_cost(
+def pooled_h3_power(
+    n_pairs: int,
+    true_rho: float,
     *,
-    train_seconds_per_arm_seed: float,
-    reference_steps: int,
-    spec: dict[str, Any],
-    eval_seconds_per_arm_seed: float | None = None,
-    gen_tok_s: float | None = None,
-    mean_completion_len: float | None = None,
-    audit_seconds: float | None = None,
-    audit_completions: int | None = None,
+    n_cells: int = 1,
+    n_sim: int = 200,
+    n_perm: int = 199,
+    alpha: float = 0.05,
+    seed: int = 0,
 ) -> dict[str, Any]:
-    """Project E1 hours from one measured arm-seed, with eval and audit included.
+    """Simulation power of the within-cell Spearman permutation test.
 
-    Training seconds scale with optimiser steps, including early baselines as
-    ``early_steps / reference`` of an arm-seed. Measured eval seconds, when
-    present, scale with the number of evals. Otherwise eval tokens (held-out
-    and train prompts at every eval) are priced at ``gen_tok_s``.
-
-    The audit is not inside the arm-seed wall clock. It is priced, in order, from
-    a measured audit wall clock scaled by completions, from the measured
-    generation rate, or from the spec's placeholder ``h100_gen_tok_s`` and
-    ``mean_completion_len``. ``audit_source`` names the one used. With none of
-    them the projection raises rather than leave the audit out.
+    Pairs are split across ``n_cells`` as evenly as possible. Each cell is a
+    Gaussian copula with Spearman correlation ``true_rho`` (Pearson
+    ``2 sin(pi rho / 6)``). A simulation rejects when the within-cell
+    permutation p-value is below ``alpha``. The bootstrap leg and the
+    minimum-pair gate are not part of this power.
     """
-    if reference_steps < 1:
-        raise ValueError("reference_steps must be >= 1")
-    if train_seconds_per_arm_seed < 0:
-        raise ValueError("train_seconds_per_arm_seed must be >= 0")
-    e1_steps = int(spec["steps"])
-    full_runs = int(spec["full_runs"])
-    early_runs = int(spec.get("early_runs", 0))
-    early_steps = int(spec.get("early_steps", 0))
-    train_seconds = (
-        train_seconds_per_arm_seed
-        / reference_steps
-        * (full_runs * e1_steps + early_runs * early_steps)
-    )
-    eval_every = int(spec["eval_every"])
+    from vfates.analysis.pooled import within_cell_spearman_p
 
-    def n_evals(steps: int, runs: int) -> int:
-        if runs <= 0 or steps <= 0:
-            return 0
-        return (steps // eval_every + 1) * runs
-
-    e1_evals = n_evals(e1_steps, full_runs) + n_evals(early_steps, early_runs)
-    ref_evals = n_evals(reference_steps, 1)
-    if eval_seconds_per_arm_seed is not None:
-        if ref_evals < 1:
-            raise ValueError("reference run has no evals to scale")
-        eval_seconds = eval_seconds_per_arm_seed / ref_evals * e1_evals
-        eval_source = "measured_eval_seconds"
+    if isinstance(n_pairs, bool) or not isinstance(n_pairs, int) or n_pairs < 2:
+        raise ValueError("n_pairs must be an integer >= 2")
+    if isinstance(n_cells, bool) or not isinstance(n_cells, int) or not 1 <= n_cells <= n_pairs:
+        raise ValueError("n_cells must be an integer from 1 to n_pairs")
+    if isinstance(n_sim, bool) or not isinstance(n_sim, int) or n_sim < 1:
+        raise ValueError("n_sim must be an integer >= 1")
+    if isinstance(n_perm, bool) or not isinstance(n_perm, int) or n_perm < 1:
+        raise ValueError("n_perm must be an integer >= 1")
+    if not -1.0 <= float(true_rho) <= 1.0:
+        raise ValueError("true_rho must lie in [-1, 1]")
+    if not 0.0 < float(alpha) < 1.0:
+        raise ValueError("alpha must lie in (0, 1)")
+    sizes = [n_pairs // n_cells] * n_cells
+    for i in range(n_pairs % n_cells):
+        sizes[i] += 1
+    rho = float(true_rho)
+    if rho >= 1.0:
+        pearson = 1.0
+    elif rho <= -1.0:
+        pearson = -1.0
     else:
-        eval_seconds = _token_seconds(
-            e1_evals
-            * (int(spec["eval_prompts"]) + int(spec.get("eval_train_prompts", 0)))
-            * int(spec["eval_samples"]),
-            gen_tok_s,
-            mean_completion_len,
+        pearson = 2.0 * math.sin(rho * math.pi / 6.0)
+    residual = math.sqrt(max(0.0, 1.0 - pearson * pearson))
+    rng = np.random.default_rng(seed)
+    rejects = 0
+    for _ in range(n_sim):
+        dtaus: list[np.ndarray] = []
+        daccs: list[np.ndarray] = []
+        labels: list[np.ndarray] = []
+        for c, n in enumerate(sizes):
+            z = rng.standard_normal((n, 2))
+            z[:, 1] = pearson * z[:, 0] + residual * z[:, 1]
+            dtaus.append(z[:, 0])
+            daccs.append(z[:, 1])
+            labels.append(np.full(n, c, dtype=int))
+        result = within_cell_spearman_p(
+            np.concatenate(dtaus),
+            np.concatenate(daccs),
+            np.concatenate(labels),
+            n_perm=n_perm,
+            seed=int(rng.integers(0, 2**31 - 1)),
         )
-        eval_source = "eval_tokens"
-    e1_completions = int(spec["audit_prompts"]) * int(spec["audit_samples"])
-    if audit_seconds is not None:
-        if audit_completions is None or audit_completions < 1 or audit_seconds < 0:
-            raise ValueError("a measured audit clock needs audit_completions >= 1")
-        audit_total = audit_seconds / audit_completions * e1_completions
-        audit_source = "measured_audit_wall_clock"
-    elif gen_tok_s is not None and mean_completion_len is not None:
-        audit_total = _token_seconds(e1_completions, gen_tok_s, mean_completion_len)
-        audit_source = "measured_gen_rate"
-    elif "h100_gen_tok_s" in spec and "mean_completion_len" in spec:
-        audit_total = _token_seconds(
-            e1_completions, float(spec["h100_gen_tok_s"]), float(spec["mean_completion_len"])
-        )
-        audit_source = "placeholder_gen_rate"
-    else:
-        raise ValueError(
-            "the audit cannot be priced: no audit clock, generation rate or placeholder rate"
-        )
-    total_seconds = train_seconds + eval_seconds + audit_total
-    hours = total_seconds / 3600.0
+        p_value = result.get("p")
+        if isinstance(p_value, float) and math.isfinite(p_value) and p_value < alpha:
+            rejects += 1
     return {
-        "train_hours": train_seconds / 3600.0,
-        "eval_hours": eval_seconds / 3600.0,
-        "audit_hours": audit_total / 3600.0,
-        "h100_hours": hours,
-        "usd": hours * float(spec["usd_per_h100_hour"]),
-        "eval_tokens_included": True,
-        "eval_source": eval_source,
-        "audit_source": audit_source,
-        "source": "measured_wall_clock",
+        "power": rejects / n_sim,
+        "n_rejects": rejects,
+        "n_sim": n_sim,
+        "n_perm": n_perm,
+        "n_pairs": n_pairs,
+        "n_cells": n_cells,
+        "cell_sizes": sizes,
+        "true_rho": rho,
+        "alpha": alpha,
+        "seed": seed,
         "rule": (
-            "Training wall clock scaled by steps. Eval tokens are included, "
-            "from measured eval seconds or from the generation rate. The audit "
-            "is included, from its measured clock scaled by completions, the "
-            "measured generation rate, or the placeholder rate (audit_source)."
+            "Power of the within-cell permutation test of Spearman rho, "
+            "simulated from a Gaussian copula. Reject when p < alpha. "
+            "The crossed-bootstrap percentile and the minimum pair count "
+            "are not part of this power."
         ),
     }
-
-
-def _token_seconds(n_completions: int, gen_tok_s: float | None, length: float | None) -> float:
-    if gen_tok_s is None or length is None:
-        raise ValueError("token pricing needs gen_tok_s and mean_completion_len")
-    if gen_tok_s <= 0 or length < 0:
-        raise ValueError("gen_tok_s must be positive and length must be >= 0")
-    return n_completions * length / gen_tok_s

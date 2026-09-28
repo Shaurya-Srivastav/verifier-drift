@@ -26,7 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Task generation and graders.
-tasks = ["reasoning-gym>=0.1.19", "sympy>=1.12", "datasets>=2.20"]
+tasks = ["reasoning-gym>=0.1.19", "sympy>=1.12", "datasets>=2.20", "math-verify>=0.7", "langdetect>=1.0.9"]
 # PyTorch path: hidden-state / LoRA-gradient features and the TRL trainer (MPS or CUDA).
 torch = ["torch>=2.3", "transformers>=4.46", "peft>=0.13", "accelerate>=0.34", "safetensors>=0.4"]
 # Apple-silicon path: MLX generation and the MLX GRPO trainer. Pinned to the
@@ -98,6 +98,10 @@ module = [
   "transformers", "transformers.*",
   "trl", "trl.*",
   "vllm", "vllm.*",
+  "math_verify", "math_verify.*",
+  "openai", "openai.*",
+  "flash_attn", "flash_attn.*",
+  "langdetect", "langdetect.*",
 ]
 follow_imports = "skip"
 no_implicit_optional = true

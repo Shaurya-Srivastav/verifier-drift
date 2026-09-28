@@ -165,6 +165,13 @@ def _problems(task: Task, split: str, n: int) -> list[Problem]:
 
 
 @pytest.mark.mlx
+def test_mlx_refuses_full_finetune(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, full_finetune=True, lora=None)
+    with pytest.raises(RuntimeError, match="full_finetune"):
+        MLXGRPOTrainer(cfg, _AddTask(), _Even(), _problems(_AddTask(), "train", 2), [])
+
+
+@pytest.mark.mlx
 def test_advantages_and_loss_match_numpy() -> None:
     import mlx.core as mx
 

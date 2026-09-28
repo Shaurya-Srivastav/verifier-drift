@@ -49,6 +49,20 @@ def test_monte_carlo_unbiased_and_variance_bound():
     assert variance <= bound * 1.8 + 1.0
 
 
+def test_sketch_tensor_matches_one_tensor_and_sums_close():
+    torch = pytest.importorskip("torch")
+    rng = np.random.default_rng(7)
+    arrays = [rng.normal(size=(6, 5)), rng.normal(size=(4, 3)), rng.normal(size=9)]
+    sketch = CountSketch(32, seed=3)
+    tensors = [torch.tensor(array, dtype=torch.float64) for array in arrays]
+    one = sketch.sketch_tensor(tensors[0], 0).cpu().numpy()
+    assert np.array_equal(one, sketch.sketch_torch([tensors[0]]).cpu().numpy())
+    parts = [sketch.sketch_tensor(tensor, index) for index, tensor in enumerate(tensors)]
+    total = torch.stack(parts).sum(dim=0).cpu().numpy()
+    whole = sketch.sketch_torch(tensors).cpu().numpy()
+    np.testing.assert_allclose(total, whole, rtol=1e-8, atol=1e-8)
+
+
 def test_numpy_matches_torch_cpu():
     torch = pytest.importorskip("torch")
     rng = np.random.default_rng(2)

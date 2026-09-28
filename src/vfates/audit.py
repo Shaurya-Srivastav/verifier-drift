@@ -15,7 +15,8 @@ Artifacts (all under one ``out_dir``, every stage resumable):
 ``confusion.json``       step-0 confusion per arm and split.
 ``features.npz``         one feature row per audit row (same order).
 ``features.meta.json``   extractor options and whether rows used sampled token ids.
-``forecasts.json``       per-arm screen: transfer precision and the baselines.
+``forecasts.json``       per-arm screen, including ``tau_pool_budget``.
+``patches.json``         patch selection, only when an arm has type ``patch_select``.
 ``lora_init.safetensors`` LoRA A matrices the features were computed with.
 ``lock.json``            hash-locked forecasts, written before any training run.
 
@@ -25,9 +26,11 @@ Held-out verdicts are recorded for description only; nothing is fitted on them.
 from __future__ import annotations
 
 import gc
+import importlib
+import inspect
 import shutil
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -49,7 +52,7 @@ from vfates.tasks.base import Task
 from vfates.tasks.registry import build_task
 from vfates.types import SPLITS, AuditTable, Completion, GenOut, Parsed, Problem
 from vfates.utils.env import environment_report
-from vfates.utils.hashing import stable_seed
+from vfates.utils.hashing import stable_seed, u01
 from vfates.utils.io import (
     append_jsonl,
     atomic_npz,
@@ -63,14 +66,54 @@ from vfates.utils.io import (
 from vfates.utils.stats import group_indices
 from vfates.verifiers.arms import FNRule, FPRule, ResampledNoise
 from vfates.verifiers.base import Verifier
-from vfates.verifiers.calibrate import CalibrationData, calibrate_arms
+from vfates.verifiers.calibrate import CalibrationData, calibrate_arms, pooled_rates
 from vfates.verifiers.registry import build_verifier
 
 FEATURE_KINDS = ("lora_grad", "hidden")
+# Keys the audit forwards only when the spec sets them and the callee accepts them.
+_FEATURE_PASSTHROUGH = (
+    "chat_template_kwargs",
+    "gradient_checkpointing",
+    "target_modules",
+    "logprob_chunk",
+)
+_LOAD_PASSTHROUGH = (("dtype", "dtype"), ("device", "device"), ("device_map", "device_map"))
+# Prepared once per feature stage. Scoring kwargs stay on featurize_prepared.
+_PREPARE_KEYS = (
+    "sketch_dim",
+    "lora_r",
+    "lora_alpha",
+    "target_modules",
+    "lora_seed",
+    "sketch_seed",
+    "device",
+    "dtype",
+    "device_map",
+    "gradient_checkpointing",
+    "load_init",
+)
+_FEATURIZE_KEYS = (
+    "normalize",
+    "max_len",
+    "return_exact",
+    "progress",
+    "chat_template_kwargs",
+    "logprob_chunk",
+)
+_NON_ARM_FORECAST_KEYS = frozenset({"patch_selection"})
+_DOMAIN_TOKEN = "{domain}"
 STAGE_SCHEMA = "vfates.stages/1"
-FORECAST_SCHEMA = "vfates.forecasts/2"
+FORECAST_SCHEMA = "vfates.forecasts/4"
 MANIFEST_NAME = "stages.json"
-STAGE_ORDER = ("problems", "completions", "calibration", "table", "features", "forecasts")
+STAGE_ORDER = (
+    "problems",
+    "completions",
+    "calibration",
+    "table",
+    "features",
+    "patches",
+    "forecasts",
+)
 
 
 LORA_INIT_NAME = LORA_INIT_FILENAME
@@ -81,6 +124,7 @@ _STAGE_FILES: dict[str, tuple[str, ...]] = {
     "calibration": ("calibration.json",),
     "table": ("audit.npz", "audit.meta.json", "confusion.json"),
     "features": ("features.npz", "features.meta.json", LORA_INIT_NAME),
+    "patches": ("patches.json",),
     "forecasts": ("forecasts.json",),
 }
 _PRIMARY = {
@@ -89,15 +133,17 @@ _PRIMARY = {
     "calibration": "calibration.json",
     "table": "audit.npz",
     "features": "features.npz",
+    "patches": "patches.json",
     "forecasts": "forecasts.json",
 }
 # Self included. ``lock.json`` is intentionally absent: a locked directory is never cleaned.
 _DOWNSTREAM: dict[str, tuple[str, ...]] = {
     "problems": STAGE_ORDER,
-    "completions": ("completions", "calibration", "table", "features", "forecasts"),
-    "calibration": ("calibration", "table", "forecasts"),
-    "table": ("table", "forecasts"),
-    "features": ("features", "forecasts"),
+    "completions": ("completions", "calibration", "table", "features", "patches", "forecasts"),
+    "calibration": ("calibration", "table", "patches", "forecasts"),
+    "table": ("table", "patches", "forecasts"),
+    "features": ("features", "patches", "forecasts"),
+    "patches": ("patches", "forecasts"),
     "forecasts": ("forecasts",),
 }
 
@@ -165,15 +211,57 @@ def _arms_file_sha(arm_cfg: Mapping[str, Any]) -> str | None:
     path = arm_cfg.get("file")
     if not path:
         return None
-    return artifact_sha256(path)
+    return _arms_tree_sha(Path(path))
 
 
-def stage_fingerprints(config: Mapping[str, Any]) -> dict[str, str]:
+def _patch_specs(resolved: Mapping[str, Any]) -> list[dict[str, Any]]:
+    arms = resolved.get("arms") or []
+    return [
+        dict(spec)
+        for spec in arms
+        if isinstance(spec, Mapping) and str(spec.get("type")) == "patch_select"
+    ]
+
+
+def _arms_domain(config: Mapping[str, Any]) -> str | None:
+    """Domain used to expand ``{domain}`` in arm salts.
+
+    An arms ``domain`` key wins, then the task ``domain``, then the task
+    ``name``, then the task ``type``.
+    """
+    arms = config.get("arms") or {}
+    if isinstance(arms, Mapping) and arms.get("domain"):
+        return str(arms["domain"])
+    task = config.get("task") or {}
+    if isinstance(task, Mapping):
+        if task.get("domain"):
+            return str(task["domain"])
+        if task.get("name"):
+            return str(task["name"])
+        if task.get("type"):
+            return str(task["type"])
+    return None
+
+
+def stage_fingerprints(
+    config: Mapping[str, Any], *, row_categories: str | None = None
+) -> dict[str, str]:
     """Content hash of each audit stage. Downstream stages include upstream hashes.
 
     ``features`` and ``forecasts`` are omitted when the config has no feature spec.
-    An explicit ``forecast.divide_by_length`` that disagrees with
-    :func:`_length_division` raises before any fingerprint is returned.
+    ``patches`` is included only when an arm has type ``patch_select``, and that
+    requires a features spec. An explicit ``forecast.divide_by_length`` that
+    disagrees with :func:`_length_division` raises before any fingerprint is
+    returned.
+
+    ``pools`` is hashed as given, including ``pools.from``. A dev audit
+    (``from: dev``) therefore cannot resume as a confirmatory audit.
+    ``generator.chat_template_kwargs`` is inside the hashed generator mapping.
+    ``features.chat_template_kwargs``, ``features.load`` (``dtype``, ``device``,
+    ``device_map``), ``gradient_checkpointing``, ``target_modules`` and
+    ``logprob_chunk`` are inside the hashed features mapping. When a patch
+    menu is configured, ``row_categories`` is the sha256 of the per-row
+    ``task.categorize`` assignments and is part of the patch fingerprint.
     """
     problems = _fp({"task": config["task"], "pools": config["pools"]})
     completions = _fp(
@@ -184,7 +272,8 @@ def stage_fingerprints(config: Mapping[str, Any]) -> dict[str, str]:
         }
     )
     arm_cfg = config["arms"]
-    resolved = resolve_arms(arm_cfg)
+    domain = _arms_domain(config)
+    resolved = resolve_arms(arm_cfg, domain=domain)
     calibration = _fp(
         {
             "completions": completions,
@@ -202,21 +291,39 @@ def stage_fingerprints(config: Mapping[str, Any]) -> dict[str, str]:
         "table": _fp({"calibration": calibration}),
     }
     feat = config.get("features")
+    patch_specs = _patch_specs(resolved)
+    if patch_specs and not feat:
+        raise ValueError("patch_select arms require a features spec")
     if not feat:
         return out
     features = _fp({"completions": completions, "features": feat})
     forecast = dict(config.get("forecast") or {})
     divided = _forecast_length_division(feat, forecast)
     out["features"] = features
-    out["forecasts"] = _fp(
-        {
-            "schema": FORECAST_SCHEMA,
-            "features": features,
-            "calibration": calibration,
-            "forecast": forecast,
-            "divide_by_length": divided,
-        }
-    )
+    forecast_body: dict[str, Any] = {
+        "schema": FORECAST_SCHEMA,
+        "features": features,
+        "calibration": calibration,
+        "forecast": forecast,
+        "divide_by_length": divided,
+    }
+    if patch_specs:
+        task = build_task(config["task"])
+        q = float(forecast.get("q", transfer_mod.PRIMARY_Q))
+        patches = _fp(
+            {
+                "features": features,
+                "calibration": calibration,
+                "patch_select": patch_specs,
+                "q": q,
+                "divide_by_length": divided,
+                "error_categories": list(task.error_categories),
+                "row_categories": row_categories,
+            }
+        )
+        out["patches"] = patches
+        forecast_body["patches"] = patches
+    out["forecasts"] = _fp(forecast_body)
     return out
 
 
@@ -310,6 +417,70 @@ def _prepare_stage_manifest(
     return manifest
 
 
+def _reusable_category_digest(
+    out: Path, config: Mapping[str, Any], desired: Mapping[str, str]
+) -> str | None:
+    """Category digest of on-disk rows when this run will reuse them.
+
+    ``None`` when there is no patch menu, or the problems and completions
+    stages are absent or no longer match ``desired`` (they will be resampled).
+    """
+    if "patches" not in desired or not (out / MANIFEST_NAME).is_file():
+        return None
+    manifest = read_json(out / MANIFEST_NAME)
+    stages = manifest.get("stages") if isinstance(manifest, dict) else None
+    if not isinstance(stages, dict):
+        return None
+    if stages.get("problems") != desired.get("problems"):
+        return None
+    if stages.get("completions") != desired.get("completions"):
+        return None
+    problems_path = out / "problems.jsonl"
+    completions_path = out / "completions.jsonl"
+    if not problems_path.is_file() or not completions_path.is_file():
+        return None
+    task = build_task(config["task"])
+    problems_list = [Problem.from_json(row) for row in read_jsonl(problems_path)]
+    problems = {problem.pid: problem for problem in problems_list}
+    completions = load_completions(completions_path, problems_list, int(config["sampling"]["n"]))
+    parsed, _oracle = grade_completions(task, problems, completions)
+    return _row_category_sha(task, problems, completions, parsed)
+
+
+def _reconcile_stages(
+    out: Path,
+    manifest: dict[str, Any],
+    desired: Mapping[str, str],
+    names: Sequence[str],
+) -> None:
+    """Compare ``names`` after their fingerprints can be computed.
+
+    A lock refuses a mismatch. Otherwise a mismatch deletes that stage and
+    everything downstream, the same rule as :func:`_prepare_stage_manifest`.
+    """
+    stages = manifest["stages"]
+    if (out / "lock.json").exists():
+        changed = sorted(name for name in names if stages.get(name) != desired.get(name))
+        if changed:
+            raise ValueError(
+                "lock.json exists but the audit config no longer matches the locked stages "
+                f"({', '.join(changed)}). Refusing to delete or overwrite a locked audit. "
+                "Use a new directory."
+            )
+        return
+    dirty = False
+    for name in names:
+        stored = stages.get(name)
+        wanted = desired.get(name)
+        mismatch = stored is not None and stored != wanted
+        untracked = stored is None and _primary(out, name).is_file()
+        if mismatch or untracked:
+            _invalidate_from(out, name, stages)
+            dirty = True
+    if dirty:
+        write_json(out / MANIFEST_NAME, manifest)
+
+
 def _stage_ready(out: Path, manifest: Mapping[str, Any], stage: str, fp: str) -> bool:
     stages = manifest["stages"]
     return stages.get(stage) == fp and _primary(out, stage).is_file()
@@ -349,6 +520,7 @@ def _write_lock(
         config=dict(config),
         note="Step-0 forecasts locked before any training run.",
         artifacts=artifacts,
+        pool_source="dev" if _pools_from(config.get("pools") or {}) == "dev" else None,
     )
 
 
@@ -364,17 +536,131 @@ def _require_unique_questions(train: Sequence[Problem], held: Sequence[Problem])
         seen[problem.question] = problem.pid
 
 
+def _pools_from(pools: Mapping[str, Any]) -> str | None:
+    """``pools.from``: ``None`` (confirmatory splits) or ``'dev'``."""
+    source = pools.get("from", None)
+    if source is None:
+        return None
+    if source == "dev":
+        return "dev"
+    raise ValueError(f"pools.from must be 'dev' or null, got {source!r}")
+
+
+def _relabel_dev_problem(problem: Problem, split: str) -> Problem:
+    """Copy ``problem`` onto pseudo-``split`` and record that it came from dev."""
+    meta = dict(problem.meta or {})
+    meta["source_split"] = problem.split
+    meta["pool_from"] = "dev"
+    return Problem(
+        pid=problem.pid,
+        split=split,
+        task=problem.task,
+        question=problem.question,
+        answer=problem.answer,
+        meta=meta,
+    )
+
+
+def _partition_dev_pool(
+    drawn: Sequence[Problem], train_n: int, held_n: int, seed: int
+) -> tuple[list[Problem], list[Problem]]:
+    """Rank by ``u01('dev-pool', seed, pid)``, then pid, and relabel.
+
+    The rank depends only on the pid and the pool seed, not on the order
+    ``task.problems`` returned. The first ``train_n`` become pseudo-train and
+    the next ``held_n`` become pseudo-heldout. ``Problem.split`` is rewritten
+    to ``train`` or ``heldout``. ``meta.source_split`` keeps the original
+    split and ``meta.pool_from`` is ``dev``.
+    """
+    ranked = sorted(drawn, key=lambda problem: (u01("dev-pool", seed, problem.pid), problem.pid))
+    train = [_relabel_dev_problem(problem, "train") for problem in ranked[:train_n]]
+    held = [
+        _relabel_dev_problem(problem, "heldout") for problem in ranked[train_n : train_n + held_n]
+    ]
+    return train, held
+
+
 def load_pools(task: Task, pools: Mapping[str, Any]) -> tuple[list[Problem], list[Problem]]:
     """Frozen ``(train, heldout)`` pools from ``{'train': n, 'heldout': m, 'seed': s}``.
+
+    ``pools.from`` defaults to null: draw ``train`` and ``heldout`` from those
+    task splits. ``pools.from: dev`` draws ``train + heldout`` problems from
+    ``task.problems('dev', n, seed)`` and partitions them with
+    :func:`_partition_dev_pool`. A dev split shorter than that sum raises and
+    reports how many problems were available.
 
     Problem ids are whatever the task emits. Repeated question text, inside one
     pool or across the two, is an error.
     """
     seed = int(pools.get("seed", 0))
-    train = task.problems("train", int(pools["train"]), seed)
-    held = task.problems("heldout", int(pools["heldout"]), seed)
+    train_n = int(pools["train"])
+    held_n = int(pools["heldout"])
+    if _pools_from(pools) == "dev":
+        need = train_n + held_n
+        drawn = list(task.problems("dev", need, seed))
+        if len(drawn) < need:
+            raise ValueError(
+                f"dev split is smaller than train + heldout: available {len(drawn)}, "
+                f"need {need} (train {train_n} + heldout {held_n})"
+            )
+        train, held = _partition_dev_pool(drawn[:need], train_n, held_n, seed)
+    else:
+        train = task.problems("train", train_n, seed)
+        held = task.problems("heldout", held_n, seed)
     _require_unique_questions(train, held)
     return train, held
+
+
+def is_dev_audit(audit_dir: str | Path) -> bool:
+    """True when ``audit_dir`` records a development pool.
+
+    A lock ``pool_source`` of ``dev``, ``config.pools.from: dev``, or a
+    problem whose ``meta.source_split`` or ``meta.pool_from`` is ``dev`` all
+    count. A directory with none of those markers is not a dev audit.
+    """
+    path = Path(audit_dir)
+    lock_path = path / "lock.json"
+    if lock_path.is_file():
+        try:
+            record = read_json(lock_path)
+        except ValueError:
+            record = None
+        if isinstance(record, dict) and record.get("pool_source") == "dev":
+            return True
+    config_path = path / "config.json"
+    if config_path.is_file():
+        try:
+            document = read_json(config_path)
+        except ValueError:
+            document = None
+        config = document.get("config") if isinstance(document, dict) else None
+        if not isinstance(config, dict):
+            config = document if isinstance(document, dict) else None
+        pools = config.get("pools") if isinstance(config, dict) else None
+        if isinstance(pools, dict) and pools.get("from") == "dev":
+            return True
+    problems_path = path / "problems.jsonl"
+    if problems_path.is_file():
+        for row in read_jsonl(problems_path):
+            meta = row.get("meta") if isinstance(row, dict) else None
+            if isinstance(meta, dict) and (
+                meta.get("source_split") == "dev" or meta.get("pool_from") == "dev"
+            ):
+                return True
+    return False
+
+
+def require_confirmatory_pools(audit_dir: str | Path) -> None:
+    """Raise when ``audit_dir`` is a development-pool audit.
+
+    Confirmatory cells must train and evaluate on the task's train and
+    held-out splits. The study calls this before using a frozen audit.
+    """
+    if is_dev_audit(audit_dir):
+        raise ValueError(
+            f"{audit_dir} is a development-pool audit (pool_source dev). "
+            "Confirmatory cells must use the train and held-out splits."
+        )
 
 
 def _make_completion(problem: Problem, k: int, out: GenOut) -> Completion:
@@ -596,6 +882,36 @@ def _part_matches(path: Path, lo: int, hi: int, fingerprint: str) -> bool:
         return False
 
 
+def iter_forecast_arms(
+    forecasts: Mapping[str, Any],
+) -> Iterator[tuple[str, Mapping[str, Any]]]:
+    """Arm records in a forecasts document.
+
+    Skips ``patch_selection`` and any other key whose value is not an arm
+    record (a mapping that carries ``transfer``).
+    """
+    for name, entry in forecasts.items():
+        if name in _NON_ARM_FORECAST_KEYS or not isinstance(entry, Mapping):
+            continue
+        if "transfer" not in entry:
+            continue
+        yield str(name), entry
+
+
+def _row_category_sha(
+    task: Task,
+    problems: Mapping[str, Problem],
+    completions: Sequence[Completion],
+    parsed: Sequence[Any],
+) -> str:
+    """sha256 of ``task.categorize`` on each train and held-out row, in order."""
+    rows = []
+    for comp, parsed_row in zip(completions, parsed, strict=True):
+        categories = sorted(task.categorize(problems[comp.pid], parsed_row, comp.text))
+        rows.append({"pid": comp.pid, "k": int(comp.k), "categories": categories})
+    return sha256_text(canonical_json(rows))
+
+
 def extract_features(
     spec: Mapping[str, Any],
     task: Task,
@@ -611,97 +927,148 @@ def extract_features(
 
     ``spec``: ``kind`` (``lora_grad`` | ``hidden``), ``model_id``, and the
     keyword options of the chosen extractor. Each part stores ``fingerprint``
-    and ``n_rows`` and is recomputed when either disagrees. ``save_init`` is
-    forwarded to ``lora_grad_features`` (contract C-2).
+    and ``n_rows`` and is recomputed when either disagrees.
+
+    The base model and tokenizer are loaded once, on the first part that is
+    not already cached. A fully cached stage loads nothing. LoRA rows are
+    scored with one ``prepare_lora_grad`` and ``featurize_prepared`` per
+    missing part. ``save_init`` is passed only to that prepare, so the LoRA A
+    file is written once. The model is freed after the last part.
     """
     if not fingerprint:
         raise ValueError("extract_features requires a stage fingerprint")
     kind = str(spec["kind"])
     if kind not in FEATURE_KINDS:
         raise ValueError(f"unknown feature kind {kind!r}; expected one of {FEATURE_KINDS}")
-    options = {k: v for k, v in spec.items() if k not in ("kind", "model_id", "load")}
+    recorded = {k: v for k, v in spec.items() if k not in ("kind", "model_id", "load")}
+    call_options = {k: v for k, v in recorded.items() if k not in _FEATURE_PASSTHROUGH}
+    forwarded = _extractor_forwarded(spec)
     parts_dir = Path(out_dir) / "feature_parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
     prompts = [task.prompt(problems[c.pid]) for c in completions]
     texts = [c.text for c in completions]
     token_ids = completion_token_ids(completions)
     system = task.system_prompt()
-    model = tokenizer = None
+    raw_options = {**call_options, **forwarded}
+    prepare_values = {key: raw_options[key] for key in _PREPARE_KEYS if key in raw_options}
+    featurize_values = {key: raw_options[key] for key in _FEATURIZE_KEYS if key in raw_options}
+    model = tokenizer = prepared = None
     meta: dict[str, Any] = {
         "kind": kind,
         "model_id": spec["model_id"],
-        "options": options,
+        "options": recorded,
         "token_source": "token_ids" if token_ids is not None else "text",
     }
+    if forwarded:
+        meta["forwarded"] = forwarded
     feats: list[np.ndarray] = []
     lengths: list[np.ndarray] = []
-    for part, lo in enumerate(range(0, len(completions), chunk)):
-        path = parts_dir / f"part_{part:05d}.npz"
-        hi = min(lo + chunk, len(completions))
-        if path.exists():
-            if _part_matches(path, lo, hi, fingerprint):
-                with np.load(path, allow_pickle=False) as z:
-                    feats.append(np.array(z["features"]))
-                    lengths.append(np.array(z["lengths"]))
-                continue
-            path.unlink()
-        if model is None:
-            from vfates.features.hidden import load_model
+    wrote_init = False
+    try:
+        for part, lo in enumerate(range(0, len(completions), chunk)):
+            path = parts_dir / f"part_{part:05d}.npz"
+            hi = min(lo + chunk, len(completions))
+            if path.exists():
+                if _part_matches(path, lo, hi, fingerprint):
+                    with np.load(path, allow_pickle=False) as z:
+                        feats.append(np.array(z["features"]))
+                        lengths.append(np.array(z["lengths"]))
+                    continue
+                path.unlink()
+            if model is None:
+                from vfates.features.hidden import load_model
 
-            load = dict(spec.get("load", {}))
-            model, tokenizer = load_model(str(spec["model_id"]), **load)
-        started = time.perf_counter()
-        part_ids = None if token_ids is None else token_ids[lo:hi]
-        if kind == "lora_grad":
-            from vfates.features.lora_grad import lora_grad_features
+                load = dict(spec.get("load") or {})
+                model, tokenizer = load_model(
+                    str(spec["model_id"]), **_accepted_kwargs(load_model, load)
+                )
+                if kind == "lora_grad":
+                    # importlib, not ``import``: a test double installed in
+                    # sys.modules is invisible to the import statement once the
+                    # real submodule is bound on the package.
+                    lora_mod = importlib.import_module("vfates.features.lora_grad")
 
-            res = lora_grad_features(
-                model,
-                tokenizer,
-                prompts[lo:hi],
-                texts[lo:hi],
-                system_prompt=system,
-                completion_ids=part_ids,
-                save_init=save_init,
-                **options,
+                    prepare = getattr(lora_mod, "prepare_lora_grad", None)
+                    featurize = getattr(lora_mod, "featurize_prepared", None)
+                    if prepare is not None and featurize is not None:
+                        prepared = prepare(
+                            model,
+                            save_init=save_init,
+                            **_accepted_kwargs(prepare, prepare_values),
+                        )
+                        wrote_init = True
+            started = time.perf_counter()
+            part_ids = None if token_ids is None else token_ids[lo:hi]
+            if kind == "lora_grad":
+                lora_mod = importlib.import_module("vfates.features.lora_grad")
+
+                featurize = getattr(lora_mod, "featurize_prepared", None)
+                if prepared is not None and featurize is not None:
+                    res = featurize(
+                        prepared,
+                        tokenizer,
+                        prompts[lo:hi],
+                        texts[lo:hi],
+                        system_prompt=system,
+                        completion_ids=part_ids,
+                        **_accepted_kwargs(featurize, featurize_values),
+                    )
+                else:
+                    # Test doubles that only expose lora_grad_features. A second
+                    # call on one model double-wraps PEFT, so each call gets a
+                    # fresh load. The real extractor uses prepare_lora_grad.
+                    res = lora_mod.lora_grad_features(
+                        model,
+                        tokenizer,
+                        prompts[lo:hi],
+                        texts[lo:hi],
+                        system_prompt=system,
+                        completion_ids=part_ids,
+                        save_init=None if wrote_init else save_init,
+                        **_accepted_kwargs(
+                            lora_mod.lora_grad_features,
+                            {**prepare_values, **featurize_values},
+                        ),
+                    )
+                    wrote_init = True
+                    model = tokenizer = None
+                    _release_accelerators()
+                f, ln = res.features, res.lengths
+                meta["extractor"] = {k: v for k, v in res.meta.items() if k != "sample_seconds"}
+                del res
+            else:
+                from vfates.features.hidden import hidden_features
+
+                extra = {**call_options, **_accepted_kwargs(hidden_features, forwarded)}
+                f = hidden_features(
+                    model,
+                    tokenizer,
+                    prompts[lo:hi],
+                    texts[lo:hi],
+                    system_prompt=system,
+                    completion_ids=part_ids,
+                    **extra,
+                )
+                ln = np.array([c.n_tokens for c in completions[lo:hi]], dtype=np.int64)
+            atomic_npz(
+                path,
+                features=np.asarray(f, dtype=np.float32),
+                lengths=np.asarray(ln),
+                lo=np.int64(lo),
+                hi=np.int64(hi),
+                n_rows=np.int64(hi - lo),
+                fingerprint=np.asarray(fingerprint),
             )
-            f, ln = res.features, res.lengths
-            meta["extractor"] = {k: v for k, v in res.meta.items() if k != "sample_seconds"}
-            # The extractor wraps the base model with PEFT in place and refuses a
-            # wrapped model, so each part starts from a fresh load (same lora_seed).
-            del res
-            model = tokenizer = None
-            _release_accelerators()
-        else:
-            from vfates.features.hidden import hidden_features
-
-            f = hidden_features(
-                model,
-                tokenizer,
-                prompts[lo:hi],
-                texts[lo:hi],
-                system_prompt=system,
-                completion_ids=part_ids,
-                **options,
+            feats.append(np.asarray(f, dtype=np.float32))
+            lengths.append(np.asarray(ln))
+            print(
+                f"[features] {kind} rows {lo}-{hi} of {len(completions)} in "
+                f"{time.perf_counter() - started:.1f}s",
+                flush=True,
             )
-            ln = np.array([c.n_tokens for c in completions[lo:hi]], dtype=np.int64)
-            _release_accelerators()
-        atomic_npz(
-            path,
-            features=np.asarray(f, dtype=np.float32),
-            lengths=np.asarray(ln),
-            lo=np.int64(lo),
-            hi=np.int64(hi),
-            n_rows=np.int64(hi - lo),
-            fingerprint=np.asarray(fingerprint),
-        )
-        feats.append(np.asarray(f, dtype=np.float32))
-        lengths.append(np.asarray(ln))
-        print(
-            f"[features] {kind} rows {lo}-{hi} of {len(completions)} in "
-            f"{time.perf_counter() - started:.1f}s",
-            flush=True,
-        )
+    finally:
+        del model, tokenizer, prepared
+        _release_accelerators()
     if not feats:
         return (
             np.zeros((0, 0), dtype=np.float32),
@@ -846,6 +1213,45 @@ def behaviour_alignment(
     }
 
 
+def _oracle_light_budgets(
+    table: AuditTable,
+    features: np.ndarray,
+    lengths: np.ndarray,
+    name: str,
+    *,
+    q: float,
+    divide_by_length: bool,
+    seed: int,
+) -> dict[str, Any]:
+    """``tau_pool_budget`` for the pre-registered oracle-light budgets."""
+    train = table.split == "train"
+    held = table.split == "heldout"
+    lens = lengths[train] if divide_by_length else None
+    direction = transfer_mod.velocity_direction(
+        features[train], table.pid[train], table.V[name][train], lens
+    )
+    scores = transfer_mod.velocities(features[held], direction)
+    budgets: dict[str, Any] = {}
+    for budget in transfer_mod.ORACLE_LIGHT_BUDGETS:
+        estimate = transfer_mod.tau_pool_budget(
+            scores,
+            table.O[held],
+            table.pid[held],
+            q=q,
+            budget=budget,
+            n_draws=transfer_mod.ORACLE_LIGHT_DRAWS,
+            seed=seed,
+            arm=name,
+        )
+        draws = estimate.get("draws")
+        if draws is not None:
+            kept = transfer_mod.ORACLE_LIGHT_STORED_DRAWS
+            estimate = dict(estimate)
+            estimate["draws"] = [round(float(value), 6) for value in list(draws)[:kept]]
+        budgets[str(budget)] = estimate
+    return budgets
+
+
 def forecast_arms(
     table: AuditTable,
     features: np.ndarray,
@@ -866,7 +1272,8 @@ def forecast_arms(
     ``divide_by_length`` is applied to train rows only. Each entry records
     ``length_divided`` and ``probe_heldout_auc`` (``None`` for oracle and
     natural arms, a float for one error channel, or ``{"fp", "fn"}`` when an
-    arm has both). ``behaviour`` holds :func:`behaviour_indicators` rows
+    arm has both). ``tau_pool_budget`` holds the oracle-light screen at budgets
+    32, 64, 128 and 192. ``behaviour`` holds :func:`behaviour_indicators` rows
     aligned with ``table``; the behaviour-alignment fields use train rows only.
     """
     if q is None:
@@ -907,6 +1314,15 @@ def forecast_arms(
             ),
             "length_divided": bool(divide_by_length),
             "probe_heldout_auc": _arm_probe(name, table, features, verifiers, seed),
+            "tau_pool_budget": _oracle_light_budgets(
+                table,
+                features,
+                lengths,
+                name,
+                q=q,
+                divide_by_length=divide_by_length,
+                seed=seed,
+            ),
             **behaviour_alignment(
                 None if verifiers is None else verifiers.get(name),
                 None if behaviour is None or name not in behaviour else behaviour[name][tr],
@@ -917,23 +1333,272 @@ def forecast_arms(
     return out
 
 
+def _apply_patch_stage(
+    out: Path,
+    manifest: dict[str, Any],
+    fingerprint: str,
+    arm_cfg: Mapping[str, Any],
+    arms: dict[str, Verifier],
+    run: AuditRun,
+    features: np.ndarray,
+    lengths: np.ndarray,
+    *,
+    q: float,
+    divide_by_length: bool,
+    n_boot: int,
+    seed: int,
+) -> dict[str, Any]:
+    """Select patched arms, write their verdicts, and commit ``patches.json``."""
+    from vfates.verifiers.patch import select_patched_arms
+
+    patched, verdicts, block = select_patched_arms(
+        _patch_specs(arm_cfg),
+        arms,
+        run.task,
+        run.problems,
+        run.completions,
+        run.parsed,
+        run.table,
+        features,
+        lengths,
+        q=q,
+        divide_by_length=divide_by_length,
+    )
+    arms.update(patched)
+    run.arms = dict(arms)
+    for name, column in verdicts.items():
+        run.table.V[name] = column
+    run.table.save(out / "audit.npz")
+    write_json(out / "confusion.json", confusion_report(run.table, n_boot=n_boot))
+    _record_patched_calibration(out / "calibration.json", patched, run.table, block, n_boot, seed)
+    write_json(out / "patches.json", block)
+    _commit_stage(out, manifest, "patches", fingerprint)
+    return block
+
+
+def _record_patched_calibration(
+    path: Path,
+    patched: Mapping[str, Verifier],
+    table: AuditTable,
+    block: Mapping[str, Any],
+    n_boot: int,
+    seed: int,
+) -> None:
+    """Store each patched arm's ``describe()`` spec so training can rebuild it."""
+    doc = read_json(path)
+    doc_arms = doc["arms"]
+    report_arms = doc["report"]["arms"]
+    train = table.split == "train"
+    for name, verifier in patched.items():
+        doc_arms[name] = verifier.describe()
+        info = block[name]
+        labels = table.O[train]
+        verdicts = table.V[name][train]
+        fpr, fnr = pooled_rates(labels, verdicts)
+        youden = float("nan") if fpr != fpr or fnr != fnr else (1.0 - fnr) - fpr
+        report_arms[name] = {
+            "type": "patched",
+            "achieved_fpr": fpr,
+            "achieved_fnr": fnr,
+            "target_fpr": None,
+            "target_fnr": None,
+            "abs_fpr_error": None,
+            "abs_fnr_error": None,
+            "channel": {"fpr": fpr, "fnr": fnr, "J": youden},
+            "realised": {"fpr": fpr, "fnr": fnr, "J": youden},
+            "rates": confusion_with_ci(
+                labels, verdicts, table.pid[train], n_boot=n_boot, seed=seed
+            ),
+            "details": {
+                "base": info["base"],
+                "by": info["by"],
+                "k": info["k"],
+                "categories": list(info["categories"]),
+                "tau_pool": info["tau_pool"],
+                "errors_fixed": info["errors_fixed"],
+                "step0_rates": dict(info["step0_rates"]),
+            },
+        }
+    write_json(path, doc)
+
+
 def _arms_from_calibration(path: Path, task: Task) -> dict[str, Verifier]:
     specs = read_json(path)["arms"]
     return {name: build_verifier(spec, task) for name, spec in specs.items()}
 
 
-def resolve_arms(arm_cfg: Mapping[str, Any]) -> dict[str, Any]:
+def resolve_arms(arm_cfg: Mapping[str, Any], *, domain: str | None = None) -> dict[str, Any]:
     """The ``arms`` section with ``file:`` (a YAML with ``targets`` and ``arms``) merged in.
 
-    Keys set next to ``file`` override the file's.
+    Keys set next to ``file`` override the file's. An ``include`` key inside a
+    file loads that YAML first and concatenates its arms in front of the
+    including file's arms. ``{domain}`` in any string is replaced with
+    ``domain``, or with an ``domain`` key on the arms config when that is set.
     """
     cfg = dict(arm_cfg)
     path = cfg.pop("file", None)
+    chosen = str(cfg["domain"]) if cfg.get("domain") else (None if domain is None else str(domain))
     if path is None:
-        return cfg
+        loaded: dict[str, Any] = {}
+    else:
+        loaded = _read_arms_tree(Path(path))
+    merged = {**loaded, **cfg}
+    return _expand_domain(merged, chosen)
+
+
+def _read_arms_tree(path: Path, seen: frozenset[Path] = frozenset()) -> dict[str, Any]:
+    path = path.resolve()
+    if path in seen:
+        raise ValueError(f"arms include cycle at {path}")
     from vfates.utils.io import read_yaml
 
-    return {**read_yaml(path), **cfg}
+    raw = read_yaml(path)
+    if not isinstance(raw, dict):
+        raise ValueError(f"arms file {path} must be a mapping")
+    doc = dict(raw)
+    include = doc.pop("include", None)
+    if include is None:
+        return doc
+    inc = Path(str(include))
+    if not inc.is_absolute():
+        inc = path.parent / inc
+    base = _read_arms_tree(inc.resolve(), seen | {path})
+    return _merge_arm_docs(base, doc)
+
+
+def _arms_tree_sha(path: Path, seen: frozenset[Path] = frozenset()) -> str:
+    path = path.resolve()
+    if path in seen:
+        raise ValueError(f"arms include cycle at {path}")
+    digest = artifact_sha256(path)
+    from vfates.utils.io import read_yaml
+
+    raw = read_yaml(path)
+    include = raw.get("include") if isinstance(raw, dict) else None
+    if not include:
+        return digest
+    inc = Path(str(include))
+    if not inc.is_absolute():
+        inc = path.parent / inc
+    child = _arms_tree_sha(inc.resolve(), seen | {path})
+    return sha256_text(canonical_json({"file": digest, "include": child}))
+
+
+def _merge_arm_docs(base: Mapping[str, Any], doc: Mapping[str, Any]) -> dict[str, Any]:
+    """Kit arms first, then the including file. Targets in ``doc`` override."""
+    merged = {**base, **doc}
+    merged["arms"] = list(base.get("arms") or []) + list(doc.get("arms") or [])
+    if "targets" in doc and isinstance(doc.get("targets"), Mapping):
+        merged["targets"] = {**dict(base.get("targets") or {}), **dict(doc["targets"])}
+    return merged
+
+
+def _expand_domain(obj: Any, domain: str | None) -> Any:
+    if isinstance(obj, str):
+        if _DOMAIN_TOKEN in obj:
+            if not domain:
+                raise ValueError("arms file uses {domain} but no domain was given")
+            return obj.replace(_DOMAIN_TOKEN, domain)
+        return obj
+    if isinstance(obj, list):
+        return [_expand_domain(item, domain) for item in obj]
+    if isinstance(obj, dict):
+        return {str(key): _expand_domain(value, domain) for key, value in obj.items()}
+    return obj
+
+
+def _accepted_kwargs(fn: Any, values: Mapping[str, Any]) -> dict[str, Any]:
+    """``values`` restricted to parameters ``fn`` accepts.
+
+    A ``**kwargs`` parameter keeps every key. Only keys already in ``values``
+    are returned, so unset config keys are not passed.
+    """
+    params = inspect.signature(fn).parameters
+    if any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        return dict(values)
+    names = {
+        name
+        for name, param in params.items()
+        if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    return {key: value for key, value in values.items() if key in names}
+
+
+def _extractor_forwarded(spec: Mapping[str, Any]) -> dict[str, Any]:
+    raw: dict[str, Any] = {}
+    for key in _FEATURE_PASSTHROUGH:
+        if key in spec:
+            raw[key] = spec[key]
+    load = spec.get("load") or {}
+    if isinstance(load, Mapping):
+        for source, dest in _LOAD_PASSTHROUGH:
+            if source in load:
+                raw[dest] = load[source]
+    return raw
+
+
+def _generator_kwargs(gen_cfg: Mapping[str, Any]) -> dict[str, Any]:
+    kwargs = dict(gen_cfg.get("kwargs") or {})
+    if "chat_template_kwargs" in gen_cfg:
+        kwargs["chat_template_kwargs"] = gen_cfg["chat_template_kwargs"]
+    return kwargs
+
+
+def visible_gpu_count() -> int | None:
+    """GPUs this process is using, or None when that count is not visible.
+
+    ``WORLD_SIZE`` is the accelerate process count (one GPU per process on
+    the study placements). Otherwise this is the CUDA device count, or 1 on
+    MPS. A CPU process with no accelerator returns None rather than a guess.
+    """
+    import os
+
+    world = os.environ.get("WORLD_SIZE")
+    if world is not None and world.isdigit() and int(world) > 0:
+        return int(world)
+    try:
+        import torch
+    except ImportError:
+        return None
+    if torch.cuda.is_available():
+        count = int(torch.cuda.device_count())
+        return count if count > 0 else None
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return 1
+    return None
+
+
+def _stamp_audit_timing(out: Path, started: float, *, fresh: bool = True) -> None:
+    """Record this audit's wall clock in ``audit.meta.json`` when it is absent.
+
+    A later resume does not replace a timing block that is already there.
+    The table sidecar is the audit meta. Missing keys stay missing. An audit
+    that resumed a directory with committed stages (``fresh`` false) records
+    ``wall_seconds`` as null with ``resumed`` true: this process saw only part
+    of the work, and a partial time would understate the screen's cost.
+    """
+    meta_path = out / "audit.meta.json"
+    if not meta_path.is_file():
+        return
+    try:
+        meta = read_json(meta_path)
+    except (OSError, ValueError):
+        return
+    if not isinstance(meta, dict):
+        return
+    existing = meta.get("timing")
+    if isinstance(existing, dict) and existing.get("wall_seconds") is not None:
+        return
+    from vfates.utils.env import hardware_class
+
+    meta["timing"] = {
+        "wall_seconds": (time.perf_counter() - started) if fresh else None,
+        "gpus": visible_gpu_count(),
+        "hardware_class": hardware_class(),
+        "resumed": not fresh,
+    }
+    write_json(meta_path, meta)
 
 
 def run_audit(config: Mapping[str, Any], out_dir: str | Path) -> AuditRun:
@@ -956,12 +1621,19 @@ def run_audit(config: Mapping[str, Any], out_dir: str | Path) -> AuditRun:
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
     task = build_task(config["task"])
     train, held = load_pools(task, config["pools"])
     problems = {p.pid: p for p in [*train, *held]}
     if len(problems) != len(train) + len(held):
         raise ValueError("train and held-out pools share problem ids")
     desired = stage_fingerprints(config)
+    # A resume reuses the completions already on disk. Hash their categories
+    # before the lock check so the patch fingerprint matches what was committed.
+    stored_categories = _reusable_category_digest(out, config, desired)
+    if stored_categories is not None:
+        desired = stage_fingerprints(config, row_categories=stored_categories)
+    fresh = not (out / MANIFEST_NAME).exists()
     manifest = _prepare_stage_manifest(out, config, desired)
     write_json(out / "config.json", {"config": dict(config), "env": environment_report()})
 
@@ -977,7 +1649,7 @@ def run_audit(config: Mapping[str, Any], out_dir: str | Path) -> AuditRun:
 
         gen_cfg = dict(config["generator"])
         generator = make_generator(
-            gen_cfg["backend"], gen_cfg["model_id"], **dict(gen_cfg.get("kwargs", {}))
+            gen_cfg["backend"], gen_cfg["model_id"], **_generator_kwargs(gen_cfg)
         )
         sample_completions(
             generator,
@@ -999,9 +1671,19 @@ def run_audit(config: Mapping[str, Any], out_dir: str | Path) -> AuditRun:
     parsed, O = grade_completions(task, problems, completions)
     grades = grades_sha256(completions, parsed, O)
     _check_grades(out, manifest, grades)
+    if "patches" in desired:
+        updated = stage_fingerprints(
+            config,
+            row_categories=_row_category_sha(task, problems, completions, parsed),
+        )
+        if updated["patches"] != desired["patches"] or updated["forecasts"] != desired["forecasts"]:
+            desired = updated
+            _reconcile_stages(out, manifest, desired, ("patches", "forecasts"))
+        else:
+            desired = updated
 
     calib_path = out / "calibration.json"
-    arm_cfg = resolve_arms(config["arms"])
+    arm_cfg = resolve_arms(config["arms"], domain=_arms_domain(config))
     if not _stage_ready(out, manifest, "calibration", desired["calibration"]):
         train_rows = [i for i, c in enumerate(completions) if problems[c.pid].split == "train"]
         data = CalibrationData.from_grades(
@@ -1046,6 +1728,7 @@ def run_audit(config: Mapping[str, Any], out_dir: str | Path) -> AuditRun:
 
     feat_cfg = config.get("features")
     if not feat_cfg:
+        _stamp_audit_timing(out, started, fresh=fresh)
         return run
 
     if not _stage_ready(out, manifest, "features", desired["features"]):
@@ -1068,6 +1751,28 @@ def run_audit(config: Mapping[str, Any], out_dir: str | Path) -> AuditRun:
 
     fc_cfg = dict(config.get("forecast") or {})
     divided = _forecast_length_division(feat_cfg, fc_cfg)
+    q = float(fc_cfg.get("q", transfer_mod.PRIMARY_Q))
+    selection: dict[str, Any] | None = None
+    if "patches" in desired:
+        if _stage_ready(out, manifest, "patches", desired["patches"]):
+            selection = read_json(out / "patches.json")
+        else:
+            selection = _apply_patch_stage(
+                out,
+                manifest,
+                desired["patches"],
+                arm_cfg,
+                arms,
+                run,
+                feats,
+                lengths,
+                q=q,
+                divide_by_length=divided,
+                n_boot=int(arm_cfg.get("n_boot", 1000)),
+                seed=int(arm_cfg.get("seed", 0)),
+            )
+            arms = run.arms
+            table = run.table
     forecasts_ready = _stage_ready(out, manifest, "forecasts", desired["forecasts"])
     if forecasts_ready:
         forecasts = read_json(out / "forecasts.json")
@@ -1077,7 +1782,7 @@ def run_audit(config: Mapping[str, Any], out_dir: str | Path) -> AuditRun:
             feats,
             lengths,
             list(arms),
-            q=float(fc_cfg.get("q", transfer_mod.PRIMARY_Q)),
+            q=q,
             qs=tuple(float(x) for x in fc_cfg.get("qs", transfer_mod.DEFAULT_QS)),
             n_boot=int(fc_cfg.get("n_boot", 500)),
             reliability_splits=int(fc_cfg.get("reliability_splits", 20)),
@@ -1086,6 +1791,8 @@ def run_audit(config: Mapping[str, Any], out_dir: str | Path) -> AuditRun:
             verifiers=arms,
             behaviour=behaviour_indicators(arms, problems, completions, parsed),
         )
+        if selection is not None:
+            forecasts["patch_selection"] = selection
     lock_path = out / "lock.json"
     if lock_path.exists():
         _assert_lock_payload(lock_path, forecasts)
@@ -1095,6 +1802,7 @@ def run_audit(config: Mapping[str, Any], out_dir: str | Path) -> AuditRun:
     if not lock_path.exists() and config.get("lock", False):
         arms_file = config["arms"].get("file") if isinstance(config.get("arms"), Mapping) else None
         _write_lock(out, config, forecasts, None if arms_file is None else str(arms_file), grades)
+    _stamp_audit_timing(out, started, fresh=fresh)
     return run
 
 

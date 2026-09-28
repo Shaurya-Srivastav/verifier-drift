@@ -1,0 +1,361 @@
+\section{Proofs}
+\label{app:proofs}
+
+The statements below are the ones the theory note records.
+Assumptions are stated with each result.
+Checks are the committed pilot P0 values, printed by the macros and by Tables~\ref{tab:p0fates} and~\ref{tab:p0checks}.
+The repository checks the finite-world case of the tilt geometry and does not re-prove \citet{mroueh2025tilt} or \citet{dorner2025tilt}.
+
+\begin{lemma}[Tilt invariance]
+\label{lem:tilt}
+An update $\pi_t(y \mid x) \propto \pi_0(y \mid x) \exp(g_t(x, V(x,y)))$ preserves $\pi_t(\cdot \mid V = v, x) = \pi_0(\cdot \mid V = v, x)$ on every prompt with $\pi_0(V = v \mid x) > 0$.
+\end{lemma}
+
+\begin{proof}
+The output space is finite, so the normaliser is a sum.
+The multiplier depends on the output only through $V(x,y)$, the base $\pi_0$ is held fixed, and $V$ does not change with $t$.
+On the level set $\{y : V(x,y) = v\}$ the factor $\exp(g_t(x,v))$ does not depend on $y$, so it cancels in the conditional.
+Specialise to $g_t(x,v) = t v$.
+For binary $V$ and a prompt that puts positive mass on both values, let $\alpha_t(x) = \pi_t(V = 1 \mid x)$, $\mathrm{Prec}_0(x) = \mathbb{E}_{\pi_0}[O \mid V = 1, x]$, and $\mathrm{FOR}_0(x) = \mathbb{E}_{\pi_0}[O \mid V = 0, x]$.
+Invariance gives
+\[
+\mathbb{E}_{\pi_t}[O \mid x] = \alpha_t(x)\,\mathrm{Prec}_0(x) + (1 - \alpha_t(x))\,\mathrm{FOR}_0(x).
+\]
+As $t \to +\infty$, accuracy tends to mean precision.
+As $t \to -\infty$, accuracy tends to the false-omission rate.
+If a prompt has no mass on one verdict, that endpoint is undefined and the forecast substitutes the prompt's base accuracy.
+The committed maximum absolute conditional error is $\PZeroTiltErr{}$.
+The $t \to +\infty$ endpoint matches prompt-mean precision to $\PZeroPrecGap{}$.
+\end{proof}
+
+\begin{proposition}[Euclidean policy gradient is mode-seeking]
+\label{prop:mode}
+Under a tabular softmax and the objective $\mathbb{E}_\pi[V] - \beta\,\mathrm{KL}(\pi \| \pi_0)$, Euclidean gradient ascent on the logits is mode-seeking inside a level set of $V$.
+For $\beta = 0$ and two outputs with the same verifier value $v$,
+\[
+\frac{d}{dt} \log \frac{\pi_y}{\pi_{y'}} = \eta \, a_t \, (\pi_y - \pi_{y'}), \qquad a_t = v - \mathbb{E}_\pi[V].
+\]
+The $\beta = 0$ limit, when the mode is unique, is modal precision.
+For every $\beta > 0$ the unique equilibrium is $\pi \propto \pi_0 \exp(V / \beta)$.
+\end{proposition}
+
+\begin{proof}
+The gradient is Euclidean in the logits: $\partial \mathbb{E}_\pi[V] / \partial z_y = \pi_y (V_y - \mathbb{E}_\pi[V])$.
+With $\beta = 0$, $\dot z_y = \eta \, \pi_y (V_y - \mathbb{E}_\pi[V])$.
+If $V_y = V_{y'} = v$, the pairwise identity follows because log-odds are logit differences.
+On the accepted set, $a_t = \pi(V = 0) \ge 0$, and $a_t > 0$ while any rejected mass remains, so the $\pi_0$-ordering inside $\{V = 1\}$ is preserved and strict gaps grow.
+Exact ties have derivative zero and stay ties, so the terminal accuracy averages the tied argmax with $\pi_0$ weights.
+The objective is strictly concave in $\pi$ for $\beta > 0$.
+Stationarity under $\sum_y \pi_y = 1$ gives $V(y) - \beta \log(\pi(y)/\pi_0(y)) = \lambda$, hence the finite tilt.
+For $J > 0$ that tilt sits strictly between base accuracy and mean precision.
+The $\beta = 0$ mode is where the unconstrained flow ends after it has left the exponential family.
+It is not stationary for any $\beta > 0$.
+A shared linear head cannot realise an arbitrary per-prompt tilt.
+The committed tabular gap at $\beta = 0$ is $\PZeroModalGap{}$, and the committed gap of the positive-penalty flows is $\PZeroBetaGap{}$.
+At $\beta = 0.5$ the theory note records equilibrium accuracy $0.3701$, mean precision $0.5028$, and modal precision $0.3000$.
+\end{proof}
+
+\begin{theorem}[Which errors move held-out prompts]
+\label{thm:transfer}
+Because $V = O - \mathrm{FN} + \mathrm{FP}$ on every sample, $g_V = g_O - g_{\mathrm{FN}} + g_{\mathrm{FP}}$.
+Class-conditional noise with rates $\rho_0 = \mathbb{P}(V = 1 \mid O = 0)$ and $\rho_1 = \mathbb{P}(V = 0 \mid O = 1)$, redrawn independently of $\phi$ given $O$, satisfies $\mathbb{E}[g_V] = J g_O$ with $J = 1 - \rho_0 - \rho_1$.
+A held-out prompt $x'$ moves only through $\theta$, and to first order $s(y) = \langle \phi(x', y), g_V \rangle$ is the growth rate of $\log \pi(y \mid x')$.
+\end{theorem}
+
+\begin{proof}
+Covariance is linear in the reward.
+Substitute $\mathrm{FN} = O(1-V)$ and $\mathrm{FP} = (1-O)V$:
+\[
+O - O(1-V) + (1-O)V = V.
+\]
+Taking the covariance and then the expectation over prompts yields the split.
+The committed decomposition error is $\PZeroDecompErr{}$.
+Conditioning gives $\mathbb{E}[V \mid O] = \rho_0 + J O$.
+Independence of the coins and $\phi$ given $O$ pulls the expectation inside the covariance, the constant $\rho_0$ drops out, and $\mathbb{E}[g_V] = J g_O$.
+The committed cosine between the Monte Carlo mean and $J g_O$ is $\PZeroCosine{}$, and the least-squares multiplier differs from 1 by $\PZeroScaleGap{}$.
+The first-order velocity freezes $g_V$ at $\pi_0$.
+Prompt-specific logits are not applied on held-out prompts, so $x'$ moves only through the shared inner product.
+
+A fixed false-positive bit that is a function of a shared behaviour, with that behaviour a coordinate of $\phi$ on held-out prompts, gives $g_{\mathrm{FP}}$ a component along the coordinate.
+The phrase trigger is this case.
+A bit that depends on the prompt and is independent of the shared coordinates has prompt-averaged covariance zero.
+In the toy worlds the shared exploit and its twin share $J$ and do not share the held-out fate: the committed gaps are $\PZeroHandGap{}$ and $\PZeroRfGap{}$, and the resampled arm stays within $\PZeroHandClose{}$ and $\PZeroRfClose{}$ of the twin.
+\end{proof}
+
+\subsection{Transfer precision, advantages, and the sketch}
+
+Exact $\tau$ is the $\pi_0$-weighted oracle accuracy of the held-out outputs that maximise $s = \phi g_V$, with ties averaged.
+On the 28-cell grid used to choose $q = 1/32$, its Spearman correlation with trained held-out accuracy is $\PZeroExactRho{}$, against $\PZeroJRho{}$ for step-0 $J$.
+The cell it misses is \texttt{rf05} / \texttt{fnC}: exact $\tau = \PZeroFnCTau{}$, observed accuracy $\PZeroFnCObs{}$, and $\tau_{\mathrm{pool}} = \PZeroFnCPool{}$.
+That is a fact about this grid.
+
+With $n$ audit samples per prompt, a soft tilt of strength $\kappa$ has the self-normalised estimator $\hat\tau(\kappa) = \mathbb{E}_{x'} (\sum_i O_i e^{\kappa s_i}) / (\sum_i e^{\kappa s_i})$.
+The hard limit is at most the fraction of held-out prompts with a correct sample.
+Dividing by the same hard limit in the oracle direction cancels that ceiling and does not cancel inflation from missing the favoured output.
+The committed Spearman correlation of that ratio is $\PZeroTauRelRho{}$, recorded and not used as a gate.
+
+$\tau_{\mathrm{pool}}(q)$ prompt-centres the velocities, pools them, and takes the oracle accuracy of the top fraction $q$, with $k = \max(1, \mathrm{round}(q N))$ and boundary ties shared equally.
+$q = 1/32$ was fixed before any language-model run.
+The committed Spearman correlation is $\PZeroTauPoolRho{}$, the within-band fraction is $\PZeroWithin{}$, and the mean split-half cosine of $g_V$ is $\PZeroReliability{}$.
+Sum features under a sequence-mean loss divide the train rows that form $g$ by completion length.
+Held-out velocities stay undivided, so $s$ is the change in sequence log-probability.
+The group-standardised direction is stored and is not the preregistered statistic.
+
+Inside a group of size $G$, with $\mathbb{E}[V_i \mid O_i] = \rho_0 + J O_i$,
+\[
+\mathbb{E}[A_1 \mid O_1] = \Bigl(1 - \frac{1}{G}\Bigr) J (O_1 - p).
+\]
+The false-positive rate cancels.
+Dividing by a positive group standard deviation does not change the sign of a nonzero advantage inside the group.
+Across prompts the scales differ, so the averaged direction can move.
+The committed maximum absolute $z$ for the identity is $\PZeroGroupZ{}$.
+
+At LoRA initialisation, $B = 0$, the adapter output is zero, and $\partial L / \partial A = 0$.
+The $B$ gradient is the full linear-map gradient with the layer input replaced by $Ax$.
+For a CountSketch $S$ of dimension $D$ with the same buckets and signs on both arguments, $\mathbb{E}[\langle Sa, Sb \rangle] = \langle a, b \rangle$, and
+\[
+\mathrm{Var}(\langle Sa, Sb \rangle) \le \frac{\lVert a \rVert^2 \lVert b \rVert^2 + \langle a, b \rangle^2}{D}.
+\]
+The cross term has mean zero, and a pair of summands in its second moment survives only when the index pairs coincide, which brings the factor $1/D$.
+
+\subsection{The knife-edge}
+
+$\tau$ uses $g_V$ at $\pi_0$.
+The counterexample is outside the 28-cell grid.
+Four atoms share a base mass on every prompt: a correct accepted atom on the skill coordinate with mass $0.15$; an incorrect accepted atom on an exploit coordinate of amplitude $1.10$ with mass $0.12$; a rejected atom at $0.99$ of the skill direction with mass $0.003$; and a rejected noise atom with mass $0.727$.
+Mean precision is $0.15 / 0.27 = 0.5556$.
+The false-positive rate is $0.12 / 0.85$, the false-negative rate is $0$, and $J = 0.8588$, matching $\PZeroKnifeJ{}$ from the committed rows.
+The committed transfer precisions run from $\PZeroKnifeTauMin{}$ to $\PZeroKnifeTauMax{}$.
+The theory note records an initial slope of held-out accuracy of $0.0119$ and peaks from $0.5465$ to $0.5768$.
+Along the shared flow the skill coordinate also raises the rejected impure atom, the skill covariance with $V$ falls, and the exploit coordinate does not pick up that penalty.
+Mean terminal held-out accuracy is $\PZeroKnifeTerminal{}$.
+The one-percent detune, plus feature noise of scale $0.008$, makes the top-velocity output unique.
+A failure of this world to rise and then collapse would mean the counterexample had not been reproduced.
+
+\section{Preregistration, stages, and deviations}
+\label{app:prereg}
+
+The confirmatory families, margins, bootstrap, and permutation counts are those in Section~\ref{sec:study}.
+Stage A is discovery: \texttt{e1-chain\_sum-qwen3-1.7b}, \texttt{e1-math-qwen3-1.7b}, \texttt{e1-code-qwen3-1.7b}, \texttt{e1-ifeval-qwen3-1.7b}, \texttt{e1-qa-qwen3-1.7b}, and the five E2 cells at Qwen3-4B.
+Stage B is replication: Qwen3-8B on math, code, and question answering; Qwen3-14B on math and code; Qwen3-32B on math; OLMo-3-7B-SFT on math and code; and Llama-3.1-8B-Instruct on math and code.
+Each stage is analysed once, when it is complete.
+The deviation log is whatever the report contains.
+
+\input{generated/deviations}
+
+\section{Domains, pools, and oracles}
+\label{app:domains}
+
+\begin{table*}[t]
+\caption{Domains. The natural verifier is what a practitioner would ship. It is not calibrated to the synthetic rate.}
+\label{tab:domains}
+\centering
+\small
+\input{generated/domains}
+\end{table*}
+
+Every domain uses 1,024 train prompts and 384 held-out prompts, plus a development pool for the pilots, disjoint after deduplication.
+Splits are a salted hash of the question, fixed before sampling.
+Difficulty is a bucket chosen by pilot P2, not a question dropped because of how the study model answered it.
+
+Chain sum is Reasoning Gym \texttt{decimal\_chain\_sum} in the configuration of \citet{egashira2026delay}: 3 to 6 terms, 3 to 6 digits, and 3 to 6 decimal places.
+The oracle is exact decimal equality of the last boxed answer, at a 1,024-token budget.
+The string-match verifier is audited and not trained.
+
+Math is Big-Math-RL-Verified with proofs and multiple choice removed, and with statements that match MATH-500, the GSM8K test set, or AIME 1983 to 2024 removed \citep{albalak2025bigmath}.
+Buckets are the dataset's Llama-8B solve-rate bands from $[0, 0.2)$ through $[0.6, 0.8)$.
+The oracle is symbolic equivalence of the last box, with floats rounded to 6 decimal places and no relative tolerance, on a 5-second CPU limit.
+A timeout is incorrect.
+The lenient natural verifier accepts the last box or the last number at relative tolerance $10^{-4}$.
+The strict one is strip-string exact match.
+The token budget is 1,536.
+
+Code is TACO, Python only, with at least five hidden tests and a public example in the statement \citep{li2023taco}.
+Easy is the dataset's easy bucket.
+Medium is the medium bucket together with medium-hard, because medium alone is 740 train and 250 held-out problems, short of the pools.
+There is no backup source.
+The oracle passes a fixed hashed subset of at most 32 hidden tests, at 2 seconds and 512 MB each.
+The process that runs a submission never holds an expected output.
+A guard installed in that process refuses file, process, and network access outside its working directory, and on Linux it is preceded by Landlock when the kernel provides it.
+Refused operations are counted per sample.
+The natural verifier runs the public examples in the statement.
+An example whose input is also a hidden test is scored against that test's expected output.
+The token budget is 1,024.
+
+Instruction following uses AllenAI's multi-constraint data with IFEval and IFBench checkers \citep{pyatkin2025ifbench,lambert2024tulu}.
+Buckets are 2 to 3 constraints and 4 to 5 constraints.
+The oracle requires every checker and a frozen Qwen3-14B content judge in non-thinking mode at temperature 0.
+The natural verifier is the checkers alone, so its false-negative rate is 0 by construction.
+The token budget is 768.
+Agreement with \texttt{gpt-4.1} is computed on 500 held-out evaluation samples after training and does not change a verdict.
+
+Question answering is WebInstruct-verified, restricted to answers with a canonical form \citep{ma2025reasoner}.
+The oracle is symbolic equivalence or normalised exact match, with no tolerance.
+The natural verifier is the 1.5B general verifier.
+The token budget is 1,024.
+Before the E1 lock, one annotator labels about 200 held-out audit samples on which the rule, Qwen3-32B, and an API model disagree.
+Pilot P6 adjudicates 100 step-0 false positives of each natural verifier on the development pool.
+None of these checks changes a verdict.
+
+Backups exist only for the pilot screens: DeepScaleR without AIME for math, and a second instruction-following source.
+Chain sum, code, and question answering have none.
+A source that fails to load stops the audit.
+
+\section{Arms and calibration}
+\label{app:arms}
+
+Targets, phrase rules, and the decoy are fixed in the arms files before sampling.
+The preference sign is the within-prompt association of the phrase with correctness, so a phrase that only marks a kind of prompt does not count as a behaviour.
+Candidates are proposed on seven eighths of the train prompts.
+The sign is checked on prompts with $u_{01}(\texttt{phrase\_validation}, \mathrm{pid}) < 1/8$.
+The rate tolerance is 0.02 on the full train pool.
+\texttt{fp\_trigger} passes the sign check if the validation association is at most 0 or its 90 percent prompt-bootstrap interval covers 0.
+\texttt{fp\_trigger\_enriched} and \texttt{fn\_behavior} pass if the validation association is positive.
+\texttt{fn\_behavior\_depleted} passes if it is negative.
+A phrase arm with no candidate inside the tolerance, or a failed sign check, is withdrawn.
+
+The chain-sum decoy's lower edge is the fitted tolerance of \texttt{fp\_tolerance}.
+Its upper edge is the smallest observed error whose pooled false-positive rate is closest to 0.15.
+The two arms accept disjoint sets of wrong answers.
+A difference between their fates is not explained by the rate or by answer formatting.
+The decoy contrast is reported beside H1 and is outside the Holm family.
+
+Patch categories are cheap predicates fixed in the task module before sampling.
+Both patch arms fix $k = 2$ categories.
+The selection runs after the features and before the lock.
+Natural verifiers are never withdrawn for their rate.
+A resampled control uses the matched arm's channel rates and the support named in the kit table.
+
+\section{Training and hardware}
+\label{app:train}
+
+The audit generator, the gradient features, and the training policy use the same checkpoint, chat template, token budget, and temperature.
+LoRA $A$ is saved by the audit and loaded by every seed, at rank 16, $\alpha = 32$, on all seven projections of every layer, with \texttt{lora\_seed} $= 0$.
+Model weights are bfloat16.
+Sketched gradients accumulate in float32.
+CountSketch dimension is 8,192 at sketch seed 0.
+Rollouts use temperature 1 and top-$p$ $1$, with no per-request seed, so seeds sample that variation rather than a bit-identical run.
+The learning rate warms up linearly for 10 steps.
+There is no importance-sampling correction and one update per batch.
+Evaluation uses 4 samples on each of the 384 held-out prompts and 128 train prompts.
+Every trained arm also runs seed 99 for 25 steps.
+That run is the step-25 baseline and is not confirmatory.
+
+Qwen3 checkpoints run with thinking disabled in sampling, features, training, and evaluation \citep{qwen2025qwen3}.
+OLMo-3 uses \texttt{allenai/Olmo-3-7B-Instruct-SFT}, the supervised checkpoint, at learning rate $1 \times 10^{-5}$.
+Llama-3.1-8B-Instruct uses its shipped template at the same learning rate.
+Versions are pinned in the GPU setup script and copied into every lock.
+A cell's audit, training, and early baselines run on that cell's hardware class.
+Training refuses another class.
+Pooled analyses use within-cell differences only.
+
+For each E1 domain, if the sample standard deviation of the two pilot oracle seeds on the development pool exceeds 0.03, that cell's H1 and H2 arms also run seeds 3 and 4.
+The seed list is written into the cell configuration before its audit.
+
+\section{Per-cell and secondary tables}
+\label{app:cells}
+
+\begin{table*}[t]
+\caption{Confirmatory cells. Oracle gain and the conclusive bit stay pending until the stage report publishes them.}
+\label{tab:cells}
+\centering
+\small
+\setlength{\tabcolsep}{3pt}
+\input{generated/per_cell}
+\end{table*}
+
+\begin{table*}[t]
+\caption{Matched pairs from the report. Class is $-1$ for a shared-behaviour rule and $0$ otherwise.}
+\label{tab:pairs}
+\centering
+\small
+\setlength{\tabcolsep}{3pt}
+\input{generated/pairs}
+\end{table*}
+
+\begin{table}[t]
+\caption{Stage A label budget. Medians are pending until the stored draws are in the report.}
+\label{tab:h9}
+\centering
+\small
+\input{generated/h9}
+\end{table}
+
+\begin{table}[t]
+\caption{Scale slopes of kit contrasts on $\log_{10}$ of the specification's parameter count. Pending until the union secondary is complete.}
+\label{tab:scale}
+\centering
+\small
+\input{generated/scale}
+\end{table}
+
+\section{Compute and cost}
+\label{app:compute}
+
+Hours below come from the program planner.
+They are projected while any job still uses a placeholder token rate, and measured only after pilot P5 writes a throughput file.
+Rented dollars use the planner's H100 price.
+Lab classes are priced at zero in that file, so the rented total is mostly stage B.
+The preregistration's planning range for rented H100 time is about 8,000 to 10,000 dollars, with about 500 dollars of API budget.
+At placeholder token rates stage B projects above that range.
+If the plan from measured rates still exceeds it, stage B cells leave in the fixed order of Section~\ref{sec:limits} before any stage B audit, and a cell that leaves is reported as not run.
+
+\begin{table*}[t]
+\caption{Projected compute by stage and hardware class.}
+\label{tab:compute}
+\centering
+\small
+\input{generated/compute}
+\end{table*}
+
+The break-even count in Table~\ref{tab:baselines} is recorded audit GPU-hours divided by the mean recorded GPU-hours of one step-25 run, on stage A cells.
+It is pending until that timing exists.
+A resumed audit records no wall time, so a partial time cannot understate the audit.
+The planner prices the audit as generation only and leaves out the gradient pass, so the paper quotes no projected ratio.
+
+\section{Pilot evidence}
+\label{app:pilots}
+
+Pilot P0 is the finite-world check of Appendix~\ref{app:proofs}.
+Tables~\ref{tab:p0fates} and~\ref{tab:p0checks} are the committed report.
+
+\begin{table}[t]
+\caption{Pilot P0 trained held-out accuracy at a matched $J$.}
+\label{tab:p0fates}
+\centering
+\small
+\input{generated/p0_fates}
+\end{table}
+
+\begin{table*}[t]
+\caption{Pilot P0 checks. Each value is the committed report's number for that check.}
+\label{tab:p0checks}
+\centering
+\small
+\setlength{\tabcolsep}{3pt}
+\input{generated/p0_checks}
+\end{table*}
+
+Pilots P1 through P6 are runs before the study.
+P1 checks the harness.
+P2 chooses each domain's difficulty bucket on the development pool.
+P3 checks the estimator, including agreement of bfloat16 features with float32 features.
+P4 is a short oracle run in every domain.
+P5 is the hardware gate, the seed rule, and the throughput measurement.
+P6 adjudicates natural-verifier false positives.
+A pilot that fails its preregistered rule removes or replaces a domain before any confirmatory lock.
+Those decisions are not confirmatory results, and this appendix does not restate them as hypothesis tests.
+
+\section{Reproducibility}
+\label{app:repro}
+
+The anonymous submission includes the code as supplementary material.
+The submission checklist records the anonymous archive address.
+A cell lock is the SHA-256 of the canonical forecasts, the cell configuration, the environment report, and every artefact the forecasts depend on: pools, step-0 completions, oracle grades, calibration, the arms file, the features, the patch selections, and the LoRA initialisation.
+Training refuses to start if any of them has changed, including when the current parser would grade an audited completion differently.
+
+\input{generated/locks}
+
+Generated macros, tables, and figures are produced by \texttt{python -m vfates.paper assets} and are part of the source, so the PDF builds from a clean clone without rerunning the study.
+Outcome macros render as pending until the corresponding stage block exists.
+The abstract file contains one sentence per confirmatory hypothesis that passed, and no sentence for a hypothesis that did not.

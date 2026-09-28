@@ -1,0 +1,24 @@
+\section{Limitations}
+\label{sec:limits}
+
+The screen is a first-order statistic at the base policy.
+The knife-edge world is the documented case in which transfer precision is high and the shared flow still collapses (Appendix~\ref{app:proofs}).
+A run whose held-out accuracy rises at least 0.05 above step 0 and later falls at least 0.10 below its running peak is labelled knife-edge.
+The label does not change a hypothesis.
+
+The features and the trained models are LoRA adapters that share one draw of $A$.
+The exploratory full-parameter run (X5) keeps the LoRA screen as its forecast, so it checks the fate and not a full-parameter feature.
+Qwen3 is trained in non-thinking mode, the confirmatory horizon is 300 steps, and X7 extends three arms to 600 steps as an exploratory check.
+
+The synthetic arms are planted; H7 answers with verifiers a practitioner would ship, and H10 with two planted rules of the same rate and structure class.
+Judge-based oracles, in instruction following and in the adjudication of natural errors, are checked against a second annotator or a second model, and those checks do not change a verdict.
+
+Compute is projected until pilot P5 measures token rates (Appendix~\ref{app:compute}).
+A budget cut removes stage B cells in a fixed order, 32B math, the two E3 code cells, 14B code, then 8B question answering, and cannot remove a stage A cell.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+A verifier error is a direction in the step-0 update, and a rate does not determine that direction.
+Resampled noise rescales the oracle update, a shared behaviour can transfer, and a prompt-specific error stays local.
+Sections~\ref{sec:results} and~\ref{sec:replication} test whether the locked screen, which reads that direction from the outputs it favours, orders held-out accuracy at one rate and inside one structure class.

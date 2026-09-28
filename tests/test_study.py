@@ -1,9 +1,8 @@
-"""Study runner, P4 go/no-go, and P5 full-gate helpers on synthetic directories."""
+"""Study runner on synthetic directories."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -12,7 +11,6 @@ from vfates.experiment import _check_audited_policy
 from vfates.forecast.lockbox import lock_forecasts
 from vfates.study import _check_model_ids, planned_seeds, reanalyze, run_study
 from vfates.train.config import GRPOConfig, NonFiniteLossError
-from vfates.types import GenOut
 from vfates.utils.io import append_jsonl, read_json, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -312,349 +310,6 @@ def test_withdrawn_contrast_stays_in_the_planned_menu(tmp_path: Path, monkeypatc
     assert contrasts["noise_fp_trigger - fp_trigger"]["status"] == "withdrawn"
 
 
-def _p4_config(
-    tmp_path: Path, *, hash_final: float = 0.8, tol_final: float = 0.5, oracle_final: float = 0.5
-) -> dict:
-    audit = tmp_path / "audit"
-    audit.mkdir(parents=True)
-    payload = {
-        name: _forecast(tau)
-        for name, tau in (
-            ("oracle", 0.2),
-            ("noise_fp", 0.4),
-            ("fp_tolerance", 0.6),
-            ("fp_hash", 0.5),
-        )
-    }
-    lock_forecasts(payload, audit / "lock.json", note="p4")
-    write_json(
-        audit / "calibration.json",
-        {
-            "arms": {
-                "oracle": {"type": "oracle"},
-                "noise_fp": {"type": "resampled"},
-                "fp_tolerance": {
-                    "type": "tolerance_fp",
-                    "channel": {"fpr": 0.15, "fnr": 0.0},
-                    "target_fpr": 0.15,
-                },
-                "fp_hash": {
-                    "type": "hash_fp",
-                    "channel": {"fpr": 0.16, "fnr": 0.0},
-                    "target_fpr": 0.15,
-                },
-            }
-        },
-    )
-    return {
-        "audit_dir": str(audit),
-        "title": "P4 synthetic",
-        "seeds": [0, 1],
-        "n_boot": 30,
-        "arms": ["oracle", "noise_fp", "fp_tolerance", "fp_hash"],
-        "families": [
-            {
-                "control": "noise_fp",
-                "kind": "fp",
-                "shared": ["fp_tolerance"],
-                "local": ["fp_hash"],
-            }
-        ],
-        "train": {"steps": 4, "model_id": "tiny"},
-        "gates": {"oracle_gain": 0.10, "fate_gap": 0.05, "local_tol": 0.05, "alpha": 0.05},
-        "_hash_final": hash_final,
-        "_tol_final": tol_final,
-        "_oracle_final": oracle_final,
-    }
-
-
-def _patch_p4(monkeypatch: pytest.MonkeyPatch, config: dict) -> None:
-    finals = {
-        "oracle": config.pop("_oracle_final"),
-        "noise_fp": 0.8,
-        "fp_tolerance": config.pop("_tol_final"),
-        "fp_hash": config.pop("_hash_final"),
-    }
-
-    def train_arm(audit_dir, arm, train_config, out_dir, **kwargs):
-        seed = int(train_config["seed"])
-        rate = (0.8 if seed == 0 else 0.2) if arm == "fp_tolerance" else 0.0
-        _write_run(
-            Path(out_dir),
-            arm,
-            int(train_config["steps"]),
-            step0=0.2,
-            final=finals[arm],
-            monitors_wrong={"fp_tolerance": rate},
-        )
-
-    monkeypatch.setattr("vfates.experiment.train_arm", train_arm)
-
-
-def _check(report: dict, check_id: str) -> dict:
-    return next(row for row in report["checks"] if row["id"] == check_id)
-
-
-def test_p4_go_is_the_oracle_signal_and_fates_are_documented(tmp_path: Path, monkeypatch) -> None:
-    from vfates.pilots.p4_micro_grpo import run
-
-    config = _p4_config(tmp_path)
-    _patch_p4(monkeypatch, config)
-    report = run(config, tmp_path / "p4")
-    assert report["ok"] is True
-    assert _check(report, "P4.1")["status"] == "pass"
-    assert _check(report, "P4.2")["status"] == "documented"
-    assert _check(report, "P4.2")["passed"] is True
-    assert _check(report, "P4.3.fp_hash")["status"] == "documented"
-    assert _check(report, "P4.3.fp_hash")["passed"] is True
-    assert _check(report, "P4.4")["status"] == "documented"
-    assert _check(report, "P4.5.fp_tolerance")["value"] == pytest.approx(0.5)
-    assert _check(report, "P4.5.fp_tolerance")["status"] == "documented"
-
-    miss = _p4_config(tmp_path / "screen", hash_final=0.2)
-    _patch_p4(monkeypatch, miss)
-    outside = run(miss, tmp_path / "screen-out")
-    assert outside["ok"] is True
-    assert _check(outside, "P4.3.fp_hash")["passed"] is False
-    assert "outside" in _check(outside, "P4.3.fp_hash")["metric"]
-
-    small = _p4_config(tmp_path / "shared", tol_final=0.79)
-    _patch_p4(monkeypatch, small)
-    no_hit = run(small, tmp_path / "shared-out")
-    assert no_hit["ok"] is True
-    assert _check(no_hit, "P4.2")["passed"] is False
-    assert _check(no_hit, "P4.2")["value"] == 0.0
-
-    flat = _p4_config(tmp_path / "flat", oracle_final=0.25)
-    _patch_p4(monkeypatch, flat)
-    no_signal = run(flat, tmp_path / "flat-out")
-    assert no_signal["ok"] is False
-    assert _check(no_signal, "P4.1")["status"] == "fail"
-
-
-def test_replication_model_rule_and_screen(tmp_path: Path, monkeypatch) -> None:
-    from vfates.pilots.p5_gpu_gate import (
-        LLAMA_3B,
-        QWEN_3B,
-        base_screen_summary,
-        choose_replication_model,
-        run_replication_screen,
-    )
-
-    assert choose_replication_model(0.30, 0.01)["model_id"] == LLAMA_3B
-    assert choose_replication_model(0.05, 0.0)["model_id"] == QWEN_3B
-    assert choose_replication_model(0.30, 0.06)["model_id"] == QWEN_3B
-    assert choose_replication_model(0.80, 0.0)["model_id"] == QWEN_3B
-    summary = base_screen_summary([1, 0, 1, 1], [False, True, False, False])
-    assert summary["accuracy"] == pytest.approx(0.75)
-    assert summary["truncation"] == pytest.approx(0.25)
-
-    def factory(backend, model_id, **kwargs):
-        def generate(prompts, n, **kw):
-            assert kw["max_tokens"] == 32
-            return [
-                [GenOut(text="not-a-number", n_tokens=2, finish_reason="stop") for _ in range(n)]
-                for _ in prompts
-            ]
-
-        return SimpleNamespace(generate=generate, model_id=model_id)
-
-    monkeypatch.setattr("vfates.gen.factory.make_generator", factory)
-    report = run_replication_screen(
-        {"n_prompts": 8, "samples": 1, "max_tokens": 32, "pool_seed": 50_000_000},
-        tmp_path,
-    )
-    assert report["ok"] is True
-    assert report["tables"]["choice"]["model_id"] == QWEN_3B
-    assert report["tables"]["choice"]["preferred_ok"] is False
-    assert set(report["tables"]["models"]) == {LLAMA_3B, QWEN_3B}
-
-
-def test_full_gate_oracle_gain_is_the_only_scientific_gate(tmp_path: Path, monkeypatch) -> None:
-    from vfates.pilots.p5_gpu_gate import arm_seed_timing, full_gate, project_measured_cost
-
-    run = tmp_path / "timed"
-    append_jsonl(
-        run / "metrics.jsonl",
-        {
-            "wall_s": 30.0,
-            "tokens_generated": 100.0,
-            "gen_seconds": 2.0,
-            "mean_completion_length": 50.0,
-        },
-    )
-    timing = arm_seed_timing(run)
-    assert timing["train_seconds"] == pytest.approx(30.0)
-    assert timing["source"] == "wall_s"
-    assert timing["gen_tok_s"] == pytest.approx(50.0)
-    clocked = tmp_path / "clock"
-    write_json(clocked / "timing.json", {"train_arm_wall_s": 12.5, "includes_eval": True})
-    append_jsonl(clocked / "metrics.jsonl", {"step": 1})
-    clock = arm_seed_timing(clocked)
-    assert clock["source"] == "timing.json"
-    assert clock["train_seconds"] == pytest.approx(12.5)
-    assert clock["eval_seconds"] == pytest.approx(0.0)
-    assert clock["eval_source"] == "in_train_clock"
-    assert clock["eval_included_in_wall"] is True
-    write_json(run / "timing.json", {"train_arm_wall_s": 50.0, "includes_eval": True})
-    stepped = arm_seed_timing(run)
-    assert stepped["source"] == "wall_s"
-    assert stepped["train_seconds"] == pytest.approx(30.0)
-    assert stepped["eval_seconds"] == pytest.approx(20.0)
-    assert stepped["eval_source"] == "train_arm_clock_minus_steps"
-    append_jsonl(run / "trl_eval.jsonl", {"step": 1, "eval_seconds": 4.0})
-    assert arm_seed_timing(run)["eval_source"] == "trl_eval"
-    assert arm_seed_timing(run)["eval_seconds"] == pytest.approx(4.0)
-    projected = project_measured_cost(
-        train_seconds_per_arm_seed=3600.0,
-        reference_steps=300,
-        spec={
-            "steps": 300,
-            "full_runs": 1,
-            "early_runs": 0,
-            "early_steps": 0,
-            "eval_every": 25,
-            "eval_prompts": 10,
-            "eval_samples": 1,
-            "audit_prompts": 10,
-            "audit_samples": 1,
-            "usd_per_h100_hour": 2.0,
-        },
-        eval_seconds_per_arm_seed=0.0,
-        gen_tok_s=1000.0,
-        mean_completion_len=100.0,
-    )
-    assert projected["train_hours"] == pytest.approx(1.0)
-    assert projected["eval_source"] == "measured_eval_seconds"
-    assert projected["eval_tokens_included"] is True
-    assert projected["audit_source"] == "measured_gen_rate"
-    assert projected["audit_hours"] == pytest.approx(10 * 100.0 / 1000.0 / 3600.0)
-    base = {
-        "train_seconds_per_arm_seed": 3600.0,
-        "reference_steps": 300,
-        "eval_seconds_per_arm_seed": 0.0,
-    }
-    spec = {
-        "steps": 300,
-        "full_runs": 1,
-        "eval_every": 25,
-        "eval_prompts": 10,
-        "eval_samples": 1,
-        "audit_prompts": 10,
-        "audit_samples": 2,
-        "usd_per_h100_hour": 2.0,
-    }
-    clocked_audit = project_measured_cost(
-        **base,
-        spec=spec,
-        gen_tok_s=1000.0,
-        mean_completion_len=100.0,
-        audit_seconds=36.0,
-        audit_completions=5,
-    )
-    assert clocked_audit["audit_source"] == "measured_audit_wall_clock"
-    assert clocked_audit["audit_hours"] == pytest.approx(36.0 / 5 * 20 / 3600.0)
-    with pytest.raises(ValueError, match="cannot be priced"):
-        project_measured_cost(**base, spec=spec)
-    placeholder = project_measured_cost(
-        **base, spec={**spec, "h100_gen_tok_s": 500.0, "mean_completion_len": 50.0}
-    )
-    assert placeholder["audit_source"] == "placeholder_gen_rate"
-    assert placeholder["audit_hours"] == pytest.approx(20 * 50.0 / 500.0 / 3600.0)
-
-    def run_audit(config, out_dir):
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
-
-    def train_arm(audit_dir, arm, train_config, out_dir, **kwargs):
-        seed = int(train_config["seed"])
-        final = (0.50 if seed == 0 else 0.58) if arm == "oracle" else 0.10
-        _write_run(
-            Path(out_dir),
-            arm,
-            int(train_config["steps"]),
-            step0=0.20,
-            final=final,
-            metrics={
-                "wall_s": 100.0,
-                "tokens_generated": 200.0,
-                "gen_seconds": 2.0,
-                "mean_completion_length": 40.0,
-            },
-        )
-
-    monkeypatch.setattr("vfates.audit.run_audit", run_audit)
-    monkeypatch.setattr("vfates.experiment.train_arm", train_arm)
-    config = {
-        "full": {
-            "audit": {"pools": {"train": 3, "heldout": 2}, "sampling": {"n": 4}},
-            "gate": {
-                "seeds": [0, 1],
-                "arms": ["oracle", "noise_fp"],
-                "families": [
-                    {"control": "noise_fp", "kind": "fp", "shared": ["oracle"], "local": []}
-                ],
-                "n_boot": 20,
-                "train": {"steps": 4},
-                "gates": {"oracle_gain": 0.10, "seed_sd_threshold": 0.03},
-            },
-        },
-        "e1_cost": {
-            "steps": 4,
-            "full_runs": 1,
-            "full_runs_if_extra_seeds": 2,
-            "early_runs": 0,
-            "early_steps": 0,
-            "eval_every": 2,
-            "eval_prompts": 2,
-            "eval_samples": 1,
-            "audit_prompts": 2,
-            "audit_samples": 1,
-            "usd_per_h100_hour": 2.5,
-        },
-    }
-    report = full_gate(config, tmp_path / "gate")
-    assert report["ok"] is True
-    assert _check(report, "P5.7")["status"] == "pass"
-    assert _check(report, "P5.8.oracle")["status"] == "documented"
-    assert report["tables"]["h1_h2_seeds"] == 5
-    assert report["tables"]["oracle_sd"] == pytest.approx(0.0565685424949238, rel=1e-6)
-    assert "3" in report["tables"]["power"]
-    assert "5" in report["tables"]["power"]
-    assert report["tables"]["e1_projection"]["seeds_5_on_h1_h2"]["eval_tokens_included"] is True
-    assert report["tables"]["timing"]["source"] == "wall_s"
-    assert report["tables"]["timing"]["audit_completions"] == 20
-    projection = report["tables"]["e1_projection"]["seeds_5_on_h1_h2"]
-    assert projection["audit_source"] == "measured_audit_wall_clock"
-    resumed = full_gate(config, tmp_path / "gate")
-    assert resumed["tables"]["timing"]["audit_wall_s"] == report["tables"]["timing"]["audit_wall_s"]
-
-    def bare(audit_dir, arm, train_config, out_dir, **kwargs):
-        _write_run(Path(out_dir), arm, 4, step0=0.20, final=0.50, metrics={"step": 1})
-
-    monkeypatch.setattr("vfates.experiment.train_arm", bare)
-    bare_report = full_gate(config, tmp_path / "bare-clock")
-    assert bare_report["ok"] is True
-    assert bare_report["tables"]["timing"]["source"] == "timing.json"
-    assert bare_report["tables"]["timing"]["eval_seconds_per_arm_seed"] == pytest.approx(0.0)
-    assert (tmp_path / "bare-clock" / "runs" / "oracle__s0" / "timing.json").exists()
-
-    def low(audit_dir, arm, train_config, out_dir, **kwargs):
-        _write_run(Path(out_dir), arm, 4, step0=0.20, final=0.22)
-
-    monkeypatch.setattr("vfates.experiment.train_arm", low)
-    quiet = full_gate(config, tmp_path / "low")
-    assert quiet["ok"] is False
-    assert _check(quiet, "P5.7")["status"] == "fail"
-
-    def empty(audit_dir, arm, train_config, out_dir, **kwargs):
-        return None
-
-    monkeypatch.setattr("vfates.experiment.train_arm", empty)
-    missing = full_gate(config, tmp_path / "missing")
-    assert missing["ok"] is False
-    assert _check(missing, "P5.0")["status"] == "fail"
-
-
 def test_model_ids_must_agree_before_the_audit(tmp_path: Path, monkeypatch) -> None:
     calls = _install(monkeypatch)
     config = _study_config()
@@ -666,25 +321,11 @@ def test_model_ids_must_agree_before_the_audit(tmp_path: Path, monkeypatch) -> N
 
 
 def test_every_config_trains_the_audited_policy() -> None:
-    def load(path: str) -> dict:
-        return yaml.safe_load((ROOT / path).read_text())
-
     pairs = []
-    for path in sorted((ROOT / "configs/experiments").glob("*.yaml")):
+    for path in sorted((ROOT / "configs" / "cells").glob("*.yaml")):
         cfg = yaml.safe_load(path.read_text())
         pairs.append((path.name, cfg["audit"], cfg["study"]["train"]))
-    p1 = load("pilots/p1_harness/config.yaml")
-    pairs.append(("p1", p1["audit"], {**p1["train"], "model_id": p1["model_id"]}))
-    p5 = load("pilots/p5_gpu_gate/config.yaml")
-    pairs.append(("p5 dry run", p5["audit"], p5["train"]))
-    pairs.append(("p5 full", p5["full"]["audit"], p5["full"]["gate"]["train"]))
-    pairs.append(
-        (
-            "p4",
-            load("pilots/p3_estimator/config.yaml")["audit"],
-            load("pilots/p4_micro_grpo/config.yaml")["train"],
-        )
-    )
+    assert pairs
     for name, audit, train in pairs:
         _check_model_ids(audit, {"train": train})
         policy = GRPOConfig.from_dict({**train, "out_dir": "unused", "seed": 0})
@@ -695,11 +336,11 @@ def test_every_config_trains_the_audited_policy() -> None:
 
 
 def test_experiment_configs_match_the_preregistration() -> None:
-    e1 = yaml.safe_load((ROOT / "configs/experiments/e1_chain_sum.yaml").read_text())
-    assert len(e1["study"]["arms"]) == 13
-    assert "natural_string_match" not in e1["study"]["arms"]
-    assert "fp_tolerance_decoy" in e1["study"]["arms"]
-    assert "noise_fp_trigger" in e1["study"]["arms"]
+    e1 = yaml.safe_load((ROOT / "configs/templates/chain_sum.yaml").read_text())
+    assert len(e1["menus"]["full"]) == 17
+    assert "natural_string_match" not in e1["menus"]["full"]
+    assert "fp_tolerance_decoy" in e1["menus"]["full"]
+    assert "noise_fp_trigger" in e1["menus"]["full"]
     assert e1["audit"]["forecast"]["loss_agg"] == "seq_mean"
     assert e1["study"]["train"]["loss_agg"] == "seq_mean"
     assert "gates" not in e1["study"]
@@ -710,39 +351,187 @@ def test_experiment_configs_match_the_preregistration() -> None:
     assert e1["study"]["seed_rule"]["apply"] is False
     assert e1["cost_model"]["audit_prompts"] == 1408
     assert e1["cost_model"]["eval_train_prompts"] == 128
-    assert e1["cost_model"]["full_runs"] == 39
+    assert e1["cost_model"]["full_runs"] == 51
 
-    kl = yaml.safe_load((ROOT / "configs/experiments/e1_kl_check.yaml").read_text())
-    assert kl["audit_dir"] == "runs/e1/audit"
-    assert kl["study"]["arms"] == ["oracle", "fp_tolerance"]
-    assert kl["study"]["seeds"] == [0]
-    assert kl["study"]["train"]["beta_kl"] == 0.01
-    assert kl["analysis"]["hypotheses"] is False
-    assert kl["analysis"]["early"]["enabled"] is False
+    program = yaml.safe_load((ROOT / "configs/program.yaml").read_text())
+    by_id = {cell["id"]: cell for cell in program["cells"]}
+    kl = next(row for row in by_id["e1-math-qwen3-1.7b"]["variants"] if row["name"] == "kl")
+    assert kl["arms"] == ["oracle", "fp_trigger"]
+    assert kl["seeds"] == [0]
+    assert kl["train_overrides"]["beta_kl"] == 0.01
+    streaming = by_id["e1-chain_sum-qwen3-1.7b"]["variants"][0]
+    assert streaming["name"] == "streaming"
+    assert streaming["arms"] == ["oracle", "fp_hash", "noise_fp"]
+    assert streaming["train_overrides"]["data_regime"] == "streaming"
 
-    rep = yaml.safe_load((ROOT / "configs/experiments/e1_replication_3b.yaml").read_text())
-    assert rep["study"]["seeds"] == [0, 1]
-    assert rep["study"]["arms"] == ["oracle", "noise_fp", "fp_hash", "fp_tolerance"]
-    assert rep["analysis"]["allow_partial_menu"] is True
-    assert rep["analysis"]["hypotheses"] is True
-    assert rep["analysis"]["h3"] == {"tested": False}
-    assert rep["analysis"]["early"] == {"enabled": False}
-    assert "audit_dir" not in rep
+    rep = by_id["e2-chain_sum-qwen3-4b"]
+    assert rep["seeds"] == [0, 1]
+    assert rep["menu"] == "core"
+    assert rep["experiment"] == "E2"
 
-    p4 = yaml.safe_load((ROOT / "pilots/p4_micro_grpo/config.yaml").read_text())
-    assert p4["train"]["max_tokens"] == 512
-    assert p4["train"]["eval_max_tokens"] == 512
-    assert "fp_tolerance_decoy" in p4["arms"]
-    assert "noise_fp_trigger" in p4["arms"]
-    families = {row["control"]: row for row in p4["families"]}
-    assert families["noise_fp_trigger"]["shared"] == ["fp_trigger"]
-    assert "fp_tolerance_decoy" in families["noise_fp"]["shared"]
-    assert "spearman" not in p4["gates"]
 
-    p5 = yaml.safe_load((ROOT / "pilots/p5_gpu_gate/config.yaml").read_text())
-    assert p5["full"]["audit"]["pools"] == {"train": 512, "heldout": 384, "seed": 50000000}
-    assert p5["cost_model"]["audit_prompts"] == 896
-    assert "fp_tolerance_decoy" in p5["full"]["gate"]["arms"]
-    assert "noise_fp_trigger" in p5["full"]["gate"]["arms"]
-    assert p5["full"]["gate"]["gates"] == {"oracle_gain": 0.10, "seed_sd_threshold": 0.03}
-    assert p5["e1_cost"]["full_runs_if_extra_seeds"] == 57
+def test_dev_audit_is_refused_unless_the_config_is_a_pilot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import vfates.audit as audit_mod
+
+    if not callable(getattr(audit_mod, "require_confirmatory_pools", None)):
+        pytest.skip("vfates.audit.require_confirmatory_pools is not available yet")
+    calls = _install(monkeypatch)
+    config = _study_config()
+    run_study(config, tmp_path, only="audit")
+    stored = read_json(tmp_path / "audit" / "config.json")
+    stored["config"]["pools"] = {"from": "dev"}
+    write_json(tmp_path / "audit" / "config.json", stored)
+    with pytest.raises(ValueError, match="development-pool"):
+        run_study(config, tmp_path, only="train", arm="oracle", seed=0)
+    assert [row[0] for row in calls] == ["audit"]
+    config["pilot"] = True
+    report = run_study(config, tmp_path, only="train", arm="oracle", seed=0)
+    assert report["ok"] is True
+    assert [row[0] for row in calls] == ["audit", "train"]
+
+
+def test_only_audit_does_not_train_or_write_the_report(tmp_path: Path, monkeypatch) -> None:
+    calls = _install(monkeypatch)
+    report = run_study(_study_config(), tmp_path, only="audit")
+    assert report["ok"] is True
+    assert report["summary"] == "AUDIT"
+    assert report["report_written"] is False
+    assert [row[0] for row in calls] == ["audit"]
+    assert (tmp_path / "withdrawals.json").exists()
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_only_train_selects_one_job_and_passes_hardware_class(tmp_path: Path, monkeypatch) -> None:
+    seen: list = []
+
+    def trainer(arm, train_config, out_dir, kwargs):
+        seen.append((kwargs.get("hardware_class"), train_config.get("hardware_class")))
+        _write_run(out_dir, arm, int(train_config["steps"]))
+
+    calls = _install(monkeypatch, trainer=trainer)
+    monkeypatch.setattr("vfates.utils.env.hardware_class", lambda: "h100-80gb", raising=False)
+    config = _study_config(arms=["oracle", "fp_trigger"])
+    config["study"]["hardware_class"] = "h100-80gb"
+    run_study(config, tmp_path, only="audit")
+    report = run_study(config, tmp_path, only="train", arm="oracle", seed=0)
+    assert report["report_written"] is False
+    assert not (tmp_path / "report.json").exists()
+    trains = [row for row in calls if row[0] == "train"]
+    assert len(trains) == 1
+    assert trains[0][1] == "oracle"
+    assert trains[0][2] == 0
+    assert seen == [("h100-80gb", "h100-80gb")]
+
+
+def test_only_train_writes_the_report_when_the_cell_is_complete(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _install(monkeypatch)
+    config = _study_config()
+    run_study(config, tmp_path, only="audit")
+    report = run_study(config, tmp_path, only="train", arm="oracle", seed=0)
+    assert report["ok"] is True
+    assert (tmp_path / "report.json").exists()
+
+
+def test_chat_template_kwargs_must_agree(tmp_path: Path, monkeypatch) -> None:
+    calls = _install(monkeypatch)
+    config = _study_config()
+    config["audit"]["generator"] = {"chat_template_kwargs": {"enable_thinking": False}}
+    config["audit"]["features"] = {"chat_template_kwargs": {"enable_thinking": True}}
+    with pytest.raises(ValueError, match="chat_template_kwargs"):
+        run_study(config, tmp_path)
+    assert calls == []
+    agreed = {"enable_thinking": False}
+    config["audit"]["features"]["chat_template_kwargs"] = dict(agreed)
+    config["study"]["train"]["chat_template_kwargs"] = dict(agreed)
+    config["study"]["eval_generator"] = {"kwargs": {"chat_template_kwargs": dict(agreed)}}
+    report = run_study(config, tmp_path, only="audit")
+    assert report["summary"] == "AUDIT"
+
+
+def test_hardware_class_mismatch_is_refused_unless_overridden(tmp_path: Path, monkeypatch) -> None:
+    calls = _install(monkeypatch)
+    monkeypatch.setattr("vfates.utils.env.hardware_class", lambda: "cpu", raising=False)
+    monkeypatch.delenv("VFATES_ALLOW_HARDWARE_MISMATCH", raising=False)
+    config = _study_config()
+    config["study"]["hardware_class"] = "h100-80gb"
+    with pytest.raises(ValueError, match="hardware_class"):
+        run_study(config, tmp_path)
+    assert calls == []
+    monkeypatch.setenv("VFATES_ALLOW_HARDWARE_MISMATCH", "1")
+    report = run_study(config, tmp_path, only="audit")
+    assert report["summary"] == "AUDIT"
+
+
+def test_same_selection_withdraws_patch_rate(tmp_path: Path, monkeypatch) -> None:
+    from vfates.study import _forecast_arm_names, _write_audit_withdrawals
+
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    write_json(audit / "calibration.json", {"arms": []})
+    forecasts = {
+        "patch_selection": {"same_selection": True},
+        "oracle": {"transfer": {"tau_pool": 0.1}},
+    }
+    write_json(audit / "forecasts.json", forecasts)
+    monkeypatch.setattr("vfates.verifiers.calibrate.arm_validity", lambda report: {})
+    record = _write_audit_withdrawals(audit, {}, tmp_path)
+    assert record["audit"]["patch_rate"]["reasons"] == ["same_selection"]
+    assert "patch_rate" in record["withdrawn"]
+    assert _forecast_arm_names(forecasts) == ["oracle"]
+
+
+def test_variant_run_uses_its_overrides_and_directory(tmp_path: Path, monkeypatch) -> None:
+    seen: list = []
+
+    def trainer(arm, train_config, out_dir, kwargs):
+        del arm, kwargs
+        seen.append((out_dir, train_config.get("beta_kl"), int(train_config["steps"])))
+        _write_run(out_dir, "oracle", int(train_config["steps"]))
+
+    _install(monkeypatch, trainer=trainer)
+    config = _study_config()
+    config["study"]["variants"] = [
+        {
+            "name": "kl",
+            "arms": ["oracle"],
+            "seeds": [0],
+            "train_overrides": {"beta_kl": 0.01, "steps": 600},
+        }
+    ]
+    run_study(config, tmp_path, only="audit")
+    report = run_study(config, tmp_path, only="train", arm="oracle", seed=0, variant="kl")
+    assert report["report_written"] is False
+    assert seen == [(tmp_path / "variants" / "kl" / "oracle__s0", 0.01, 600)]
+    finished = run_study(config, tmp_path, only="train", arm="oracle", seed=0)
+    assert finished["ok"] is True
+    assert (tmp_path / "runs" / "oracle__s0" / "summary.json").exists()
+
+
+def test_preempted_summary_is_not_a_complete_run(tmp_path: Path, monkeypatch) -> None:
+    def trainer(arm, train_config, out_dir, kwargs):
+        _write_run(out_dir, arm, int(train_config["steps"]))
+        summary = read_json(out_dir / "summary.json")
+        summary["status"] = "preempted"
+        write_json(out_dir / "summary.json", summary)
+
+    _install(monkeypatch, trainer=trainer)
+    config = _study_config()
+    report = run_study(config, tmp_path)
+    assert report["ok"] is False
+    assert (tmp_path / "report.json").exists()
+    again = reanalyze(config, tmp_path)
+    assert again["ok"] is False
+    assert again["report_written"] is False
+    assert not (tmp_path / "report.json").exists()
+    assert not (tmp_path / "report.md").exists()
+
+
+def test_single_job_selector_rejects_a_partial_request(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires arm"):
+        run_study(_study_config(), tmp_path, only="train")
+    with pytest.raises(ValueError, match="only valid with"):
+        run_study(_study_config(), tmp_path, arm="oracle")

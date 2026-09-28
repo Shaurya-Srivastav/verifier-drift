@@ -1,0 +1,30 @@
+# Qwen3-32B. Four 80 GB GPUs only. 48 GB and 40 GB cards are not placed.
+# revision from https://huggingface.co/api/models/Qwen/Qwen3-32B on 2026-09-28.
+# params_b is bf16 weight bytes / 2 (32762123264).
+name: qwen3-32b
+model_id: Qwen/Qwen3-32B
+revision: 9216db5781bf21249d130ec9da846c4624c16137
+family: qwen3
+params_b: 32.762123264
+chat_template_kwargs:
+  enable_thinking: false
+lora_keys: [q, k, v, o, gate, up, down]
+dtype: bfloat16
+attn_implementation: flash_attention_2
+gated: false
+lr: 1.0e-5
+placement:
+  # About 66 GB per copy. Four-way tensor parallel puts about 16 GB of each
+  # copy on a GPU. util 0.45 is 36 GB for the vLLM shard plus KV on an 80 GB
+  # card, leaving the FSDP shard and a micro-batch of 4. A 48 GB card would
+  # have almost nothing left after two 16 GB shards, so it is omitted.
+  h100-80gb:
+    gpus: 4
+    tp: 4
+    micro_batch_size: 4
+    vllm_gpu_memory_utilization: 0.45
+  a100-80gb:
+    gpus: 4
+    tp: 4
+    micro_batch_size: 4
+    vllm_gpu_memory_utilization: 0.45

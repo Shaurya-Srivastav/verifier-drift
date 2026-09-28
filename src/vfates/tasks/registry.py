@@ -11,7 +11,7 @@ from typing import Any
 
 from vfates.tasks.base import Task
 
-TASK_TYPES: tuple[str, ...] = ("chain_sum", "mbpp_plus", "ifeval")
+TASK_TYPES: tuple[str, ...] = ("chain_sum", "ifeval", "math", "qa", "code")
 
 
 def build_task(spec: Mapping[str, Any]) -> Task:
@@ -22,12 +22,20 @@ def build_task(spec: Mapping[str, Any]) -> Task:
         from vfates.tasks.chain_sum import ChainSumConfig, ChainSumTask
 
         return ChainSumTask(ChainSumConfig.from_dict(options))
-    if kind == "mbpp_plus":
-        from vfates.tasks.mbpp import MBPPPlusTask
-
-        return MBPPPlusTask(**options)
     if kind == "ifeval":
         from vfates.tasks.ifeval import IFEvalTask
 
         return IFEvalTask(**options)
+    if kind == "math":
+        from vfates.tasks.math import MathTask
+
+        return MathTask.from_mapping(options)
+    if kind == "qa":
+        from vfates.tasks.qa import QATask
+
+        return QATask.from_mapping(options)
+    if kind == "code":
+        from vfates.tasks.code import CodeTask
+
+        return CodeTask(**options)
     raise ValueError(f"unknown task type {kind!r}; expected one of {TASK_TYPES}")

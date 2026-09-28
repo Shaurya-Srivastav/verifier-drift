@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from vfates.tasks.chain_sum import ChainSumTask
 from vfates.types import Parsed, Problem
 from vfates.utils.io import read_yaml
@@ -149,11 +151,15 @@ def test_yaml_arm_list() -> None:
         "fp_tolerance",
         "fp_tolerance_decoy",
         "fp_trigger",
+        "fp_trigger_enriched",
         "noise_fp",
         "noise_fp_trigger",
+        "noise_fp_trigger_enriched",
         "fn_behavior",
+        "fn_behavior_depleted",
         "fn_prompt_subset",
         "noise_fn",
+        "noise_fn_depleted",
         "fn_form",
         "noise_fn_form",
         "combo_fnform_fphash",
@@ -161,7 +167,11 @@ def test_yaml_arm_list() -> None:
     ]
     by_name = {arm["name"]: arm for arm in document["arms"]}
     assert by_name["fp_trigger"]["prefer"] == "not_enriched"
+    assert by_name["fp_trigger_enriched"]["prefer"] == "enriched"
     assert by_name["fn_behavior"]["prefer"] == "enriched"
+    assert by_name["fn_behavior_depleted"]["prefer"] == "depleted"
+    assert by_name["noise_fp_trigger_enriched"]["match"] == "fp_trigger_enriched"
+    assert by_name["noise_fn_depleted"]["match"] == "fn_behavior_depleted"
     assert by_name["fp_tolerance_decoy"]["type"] == "tolerance_band_fp"
     assert by_name["fp_tolerance_decoy"]["inner"] == "fp_tolerance"
     assert by_name["noise_fp"]["match"] == "fp_tolerance"
@@ -179,8 +189,6 @@ def test_yaml_arm_list() -> None:
     assert "has_thousands_separator" in TASK.form_rules
     assert "has_leading_plus" in TASK.form_rules
     assert "not_plain_decimal" in TASK.form_rules
-    pilot = read_yaml(f"{ROOT}/pilots/p2_base_audit/config.yaml")
-    assert [arm["name"] for arm in pilot["arms"]["arms"]] == names
     missing = TriggerFP("is a").describe()
     del missing["word_boundary"]
     rebuilt = build_verifier(missing, task=TASK)
@@ -188,3 +196,106 @@ def test_yaml_arm_list() -> None:
     problem = _problem("p")
     parsed = TASK.parse(problem, "this arithmetic")
     assert rebuilt.accepts(problem, parsed, "this arithmetic") is False  # type: ignore[attr-defined]
+
+
+def test_task_verifier_types_are_a_fallback_and_patched_round_trips() -> None:
+    from vfates.verifiers.patch import PatchedVerifier
+
+    class Boom:
+        verifier_types = ("oracle", "toy_natural")
+
+        def build_verifier(self, spec: dict) -> Verifier:
+            raise AssertionError(spec["type"])
+
+        def support_answered(self, parsed: Parsed) -> bool:
+            del parsed
+            return False
+
+    oracle = build_verifier({"type": "oracle", "name": "oracle"}, Boom())
+    assert isinstance(oracle, OracleVerifier)
+
+    class Toy:
+        verifier_types = ("toy_natural",)
+        name = "toy"
+
+        def build_verifier(self, spec: dict) -> Verifier:
+            arm = StringMatchVerifier(name=str(spec.get("name", "toy")))
+            return arm
+
+        def categorize(self, problem: Problem, parsed: Parsed, text: str) -> frozenset[str]:
+            del problem, parsed
+            return frozenset({"alpha"}) if "alpha" in text else frozenset()
+
+        def support_answered(self, parsed: Parsed) -> bool:
+            return parsed.answer is None
+
+    toy = Toy()
+    natural = build_verifier({"type": "toy_natural", "name": "natural"}, toy)
+    assert natural.name == "natural"
+    base = OracleVerifier(name="natural")
+    patched = PatchedVerifier(base, ["alpha"], toy, name="patch_tau")
+    again = build_verifier(patched.describe(), toy)
+    assert isinstance(again, PatchedVerifier)
+    assert again.describe() == patched.describe()
+    problem = _problem("p")
+    parsed = Parsed(answer="1", raw="1")
+    assert again(problem, parsed, "alpha slip", 1) == 1
+    assert again(problem, parsed, "alpha slip", 0) == 0
+    assert again(problem, parsed, "clean", 0) == 0
+
+    blocked = build_verifier(
+        {
+            "type": "resampled",
+            "name": "noise",
+            "rho0": 1.0,
+            "rho1": 0.0,
+            "seed": 0,
+            "support": "answered",
+        },
+        toy,
+    )
+    assert blocked(problem, parsed, "t", 0, ("k", 0)) == 0
+
+
+def test_kit_include_expands_domain_and_keeps_chain_sum(tmp_path: Path) -> None:
+    from vfates.audit import resolve_arms
+
+    chain = ROOT / "configs" / "arms" / "chain_sum.yaml"
+    raw = read_yaml(chain)
+    resolved = resolve_arms({"file": str(chain)}, domain="chain_sum")
+    assert resolved["arms"] == raw["arms"]
+    assert resolved["targets"] == raw["targets"]
+    assert "domain" not in resolved
+
+    kit = ROOT / "configs" / "arms" / "kit.yaml"
+    (tmp_path / "kit.yaml").write_text(kit.read_text(encoding="utf-8"), encoding="utf-8")
+    domain_file = tmp_path / "math.yaml"
+    domain_file.write_text(
+        "include: kit.yaml\narms:\n- {name: natural, type: string_match}\n",
+        encoding="utf-8",
+    )
+    merged = resolve_arms({"file": str(domain_file)}, domain="math")
+    assert [arm["name"] for arm in merged["arms"]] == [
+        "oracle",
+        "fp_hash",
+        "fp_trigger",
+        "fp_trigger_enriched",
+        "noise_fp",
+        "noise_fp_trigger",
+        "noise_fp_trigger_enriched",
+        "fn_behavior",
+        "fn_behavior_depleted",
+        "fn_prompt_subset",
+        "noise_fn",
+        "noise_fn_depleted",
+        "natural",
+    ]
+    by_name = {arm["name"]: arm for arm in merged["arms"]}
+    assert by_name["fp_hash"]["salt"] == "math/fp_hash"
+    assert by_name["fn_prompt_subset"]["salt"] == "math/fn_prompt_subset"
+    assert by_name["noise_fp"]["match"] == "fp_hash"
+    assert by_name["noise_fp"]["support"] == "answered"
+    assert merged["targets"] == {"fpr": 0.15, "fnr": 0.30}
+    assert "include" not in merged
+    with pytest.raises(ValueError, match="domain"):
+        resolve_arms({"file": str(kit)})

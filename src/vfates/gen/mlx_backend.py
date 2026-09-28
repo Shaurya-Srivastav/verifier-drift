@@ -21,7 +21,7 @@ stream. The generator is not thread-safe.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -29,7 +29,8 @@ import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_sampler
 
-from vfates.gen.base import Generator, chat_messages, truncate_prompt_ids
+from vfates.gen.base import Generator, truncate_prompt_ids
+from vfates.gen.chat import encode_prompt as encode_chat_prompt
 from vfates.types import GenOut
 from vfates.utils.hashing import stable_seed
 
@@ -65,28 +66,25 @@ def encode_prompt(
     user: str,
     system_prompt: str | None = None,
     max_prompt_tokens: int | None = None,
+    *,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
 ) -> list[int]:
     """Chat-template encode. Longer prompts keep the suffix (TRL left-truncates)."""
-    messages = chat_messages(user, system_prompt)
-    raw = tokenizer.apply_chat_template(  # type: ignore[attr-defined]
-        messages, add_generation_prompt=True, tokenize=True
+    ids = truncate_prompt_ids(
+        encode_chat_prompt(
+            tokenizer, user, system_prompt, chat_template_kwargs=chat_template_kwargs
+        ),
+        max_prompt_tokens,
     )
-    ids = truncate_prompt_ids(_coerce_ids(raw), max_prompt_tokens)
     if not ids:
         raise ValueError("Chat template produced an empty token list")
     return ids
 
 
-def _coerce_ids(raw: object) -> list[int]:
-    if hasattr(raw, "input_ids"):
-        raw = raw.input_ids
-    if isinstance(raw, dict):
-        raw = raw["input_ids"]
-    if hasattr(raw, "tolist"):
-        raw = raw.tolist()
-    if isinstance(raw, list) and raw and isinstance(raw[0], list):
-        raw = raw[0]
-    return [int(x) for x in cast(Iterable[Any], raw)]
+def _copy_template_kwargs(kwargs: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not kwargs:
+        return None
+    return {str(key): value for key, value in kwargs.items()}
 
 
 @dataclass(frozen=True)
@@ -129,6 +127,7 @@ class MLXGenerator(Generator):
         max_sequences_per_call: int = 512,
         max_prompt_tokens: int | None = None,
         logprobs: bool = False,
+        chat_template_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
         from mlx_lm import load
 
@@ -140,6 +139,7 @@ class MLXGenerator(Generator):
         self.max_sequences_per_call = int(max_sequences_per_call)
         self.max_prompt_tokens = max_prompt_tokens
         self.logprobs = bool(logprobs)
+        self.chat_template_kwargs = _copy_template_kwargs(chat_template_kwargs)
         self._check_batch_sizes()
         self.model, self.tokenizer = load(model_id, adapter_path=adapter_path)
         self.model.eval()
@@ -160,6 +160,9 @@ class MLXGenerator(Generator):
         obj.max_sequences_per_call = int(cast(Any, kw.get("max_sequences_per_call", 512)))
         obj.max_prompt_tokens = cast(int | None, kw.get("max_prompt_tokens"))
         obj.logprobs = bool(kw.get("logprobs", False))
+        obj.chat_template_kwargs = _copy_template_kwargs(
+            cast(Mapping[str, Any] | None, kw.get("chat_template_kwargs"))
+        )
         obj._check_batch_sizes()
         return obj
 
@@ -204,7 +207,13 @@ class MLXGenerator(Generator):
             return []
         flat: list[list[int]] = []
         for prompt in prompts:
-            ids = encode_prompt(self.tokenizer, prompt, system_prompt, self.max_prompt_tokens)
+            ids = encode_prompt(
+                self.tokenizer,
+                prompt,
+                system_prompt,
+                self.max_prompt_tokens,
+                chat_template_kwargs=self.chat_template_kwargs,
+            )
             flat.extend([ids] * n)
         outs = self.generate_ids(
             flat, max_tokens=max_tokens, temperature=temperature, top_p=top_p, seed=seed

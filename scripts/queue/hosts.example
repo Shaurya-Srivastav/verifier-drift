@@ -1,0 +1,12 @@
+# vfates SSH workers. One worker per line.
+#
+#   host              hardware_class      gpus
+#
+# host is a hostname or user@host. hardware_class matches configs/program.yaml.
+# gpus is the count this machine claims (1, 2, or 4). The queue path passed to
+# scripts/queue/ssh_workers.sh must be visible at that same path on every host.
+#
+# gpu01.example.edu   rtx-a6000-48gb      1
+# gpu02.example.edu   rtx-5000-ada-32gb   1
+# gpu03.example.edu   a100-80gb           1
+# gpu04.example.edu   h100-80gb           4

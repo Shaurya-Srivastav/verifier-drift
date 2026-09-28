@@ -94,3 +94,29 @@ class CountSketch:
             buckets, signs = self._torch_hashes(device, index, numel, acc_dtype)
             out.index_add_(0, buckets, signs * flat)
         return out
+
+    def sketch_tensor(
+        self, tensor: Any, index: int, *, device: Any = None, dtype: Any = None
+    ) -> Any:
+        """Sketch one tensor as if it were position ``index`` in :meth:`sketch_torch`.
+
+        The result is a fresh vector. Summing those vectors in index order matches
+        :meth:`sketch_torch` up to floating-point association when several tensors
+        land in the same bucket. ``device`` and ``dtype`` default to the tensor's
+        device and to the dtype :meth:`sketch_torch` would accumulate in.
+        """
+        import torch
+
+        if device is None:
+            device = tensor.device
+        device = torch.device(device)
+        if dtype is None:
+            dtype = torch.float64 if device.type == "cpu" else torch.float32
+        out = torch.zeros(self.dim, dtype=dtype, device=device)
+        numel = int(tensor.numel())
+        if numel == 0:
+            return out
+        flat = tensor.detach().to(device=device, dtype=dtype).contiguous().reshape(-1)
+        buckets, signs = self._torch_hashes(device, index, numel, dtype)
+        out.index_add_(0, buckets, signs * flat)
+        return out

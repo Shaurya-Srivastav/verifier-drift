@@ -28,6 +28,19 @@ LOCK_SCHEMA = "vfates.lock/2"
 LOCK_SCHEMAS = ("vfates.lock/1", "vfates.lock/2")
 
 
+def _hardware_class() -> str | None:
+    """Current study hardware id, or ``None`` if the helper is not installed."""
+    import vfates.utils.env as env
+
+    fn = getattr(env, "hardware_class", None)
+    if not callable(fn):
+        return None
+    value = fn()
+    if value is None:
+        return None
+    return str(value)
+
+
 def lock_forecasts(
     payload: dict[str, Any],
     path: str | Path,
@@ -36,6 +49,7 @@ def lock_forecasts(
     note: str | None = None,
     artifacts: Mapping[str, str] | None = None,
     overwrite: bool = False,
+    pool_source: str | None = None,
 ) -> dict[str, Any]:
     """Write a ``vfates.lock/2`` file. Raises ``FileExistsError`` unless ``overwrite``.
 
@@ -43,7 +57,10 @@ def lock_forecasts(
     the digest field removed. The hashed body includes ``artifacts``, a map
     from artifact name to the sha256 hex of that file (empty when omitted).
     ``payload`` must be JSON-serialisable. :func:`verify_lock` still accepts
-    ``vfates.lock/1`` files, which have no artifact map.
+    ``vfates.lock/1`` files, which have no artifact map. ``hardware_class`` is
+    the class of the process that wrote the lock, next to ``env``.
+    ``pool_source`` is written only when set (a dev audit uses ``"dev"``), so
+    a confirmatory lock document stays the same shape.
     """
     path = Path(path)
     if path.exists() and not overwrite:
@@ -53,12 +70,15 @@ def lock_forecasts(
         "config": config,
         "note": note,
         "env": environment_report(),
+        "hardware_class": _hardware_class(),
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "schema": LOCK_SCHEMA,
         "artifacts": {}
         if artifacts is None
         else {str(key): str(value) for key, value in artifacts.items()},
     }
+    if pool_source is not None:
+        body["pool_source"] = str(pool_source)
     digest = sha256_text(canonical_json(body))
     record = {**body, "sha256": digest}
     write_json(path, record)

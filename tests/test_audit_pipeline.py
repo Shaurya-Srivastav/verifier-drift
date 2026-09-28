@@ -376,3 +376,17 @@ def test_sample_completions_rejects_a_short_group(tmp_path: Path) -> None:
             ShortGenerator(answers, calls), task, problems, path, n=4, max_tokens=16, seed=0
         )
     assert read_jsonl(path) == []
+
+
+def test_generator_chat_template_kwargs_override_nested_kwargs() -> None:
+    from vfates.audit import _generator_kwargs
+
+    assert _generator_kwargs({"kwargs": {}}) == {}
+    forwarded = _generator_kwargs(
+        {
+            "kwargs": {"chat_template_kwargs": {"a": 1}, "temperature": 0.0},
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+    )
+    assert forwarded["chat_template_kwargs"] == {"enable_thinking": False}
+    assert forwarded["temperature"] == 0.0

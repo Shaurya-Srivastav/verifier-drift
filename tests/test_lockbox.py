@@ -28,6 +28,7 @@ def test_lock_round_trip_and_schema(tmp_path) -> None:
     assert record["config"]["task"] == "decimal_chain_sum"
     assert record["note"] == "pre-registered"
     assert "hardware" in record["env"]
+    assert "hardware_class" in record
     assert record["created_utc"].endswith("Z")
     body = {key: value for key, value in record.items() if key != "sha256"}
     assert record["sha256"] == sha256_text(canonical_json(body))
@@ -118,3 +119,11 @@ def test_assert_matches_lock_canonicalises_floats_and_nan(tmp_path) -> None:
     assert_matches_lock(path, {"gap": float("nan"), "rate": 1e-1})
     with pytest.raises(ValueError, match="does not match"):
         assert_matches_lock(path, {"rate": 0.2, "gap": float("nan")})
+
+
+def test_lock_records_hardware_class(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("vfates.utils.env.hardware_class", lambda: "apple-silicon")
+    path = tmp_path / "forecast.lock.json"
+    record = lock_forecasts({"tau_pool": 0.5}, path)
+    assert record["hardware_class"] == "apple-silicon"
+    assert verify_lock(path) is True

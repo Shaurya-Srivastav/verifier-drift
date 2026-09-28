@@ -10,7 +10,7 @@ as text may not reproduce the token ids the model sampled. When
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from vfates.gen.base import chat_messages
@@ -28,15 +28,27 @@ def _as_id_list(encoded: Any) -> list[int]:
     return [int(i) for i in encoded]
 
 
-def encode_prompt(tokenizer: Any, user: str, system_prompt: str | None = None) -> list[int]:
+def encode_prompt(
+    tokenizer: Any,
+    user: str,
+    system_prompt: str | None = None,
+    *,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
+) -> list[int]:
     """Token ids of the chat prompt, including the generation prefix.
 
     ``system_prompt=None`` does not strip a default system turn that the
     tokenizer's own chat template inserts (Qwen's template does). Pass
-    ``system_prompt`` to replace that turn.
+    ``system_prompt`` to replace that turn. ``chat_template_kwargs`` is
+    forwarded to ``apply_chat_template`` (Qwen3 uses ``enable_thinking``).
     """
     messages = chat_messages(user, system_prompt)
-    encoded = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+    encoded = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        **dict(chat_template_kwargs or {}),
+    )
     return _as_id_list(encoded)
 
 
@@ -53,6 +65,8 @@ def encode_prompt_completion(
     user: str,
     completion: str,
     system_prompt: str | None = None,
+    *,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
 ) -> tuple[list[int], int]:
     """``(prompt_ids + completion_ids, completion_start)``.
 
@@ -61,7 +75,9 @@ def encode_prompt_completion(
     and appended, not because the strings were tokenised together. See the
     module docstring for the BPE boundary caveat.
     """
-    prompt_ids = encode_prompt(tokenizer, user, system_prompt)
+    prompt_ids = encode_prompt(
+        tokenizer, user, system_prompt, chat_template_kwargs=chat_template_kwargs
+    )
     completion_ids = encode_completion(tokenizer, completion)
     return prompt_ids + completion_ids, len(prompt_ids)
 
@@ -71,6 +87,8 @@ def prompt_completion_ids(
     user: str,
     completion_ids: Sequence[int],
     system_prompt: str | None = None,
+    *,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
 ) -> tuple[list[int], int]:
     """``(prompt_ids + completion_ids, completion_start)`` with no re-tokenisation.
 
@@ -80,7 +98,9 @@ def prompt_completion_ids(
     the first completion id. Length is ``len(completion_ids)`` before any
     later truncation.
     """
-    prompt_ids = encode_prompt(tokenizer, user, system_prompt)
+    prompt_ids = encode_prompt(
+        tokenizer, user, system_prompt, chat_template_kwargs=chat_template_kwargs
+    )
     completion = [int(token) for token in completion_ids]
     return prompt_ids + completion, len(prompt_ids)
 

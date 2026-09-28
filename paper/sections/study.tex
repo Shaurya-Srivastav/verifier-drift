@@ -1,0 +1,112 @@
+\section{A preregistered matched-rate study}
+\label{sec:study}
+
+A cell is one domain, one model, and one menu of verifiers, trained from the same audit.
+Stage A is ten cells: the five E1 cells at Qwen3-1.7B (chain sum, math, code, instruction following, and judged question answering), each with the full menu, and the five E2 cells at Qwen3-4B with the core menu.
+Stage B is the remaining confirmatory cells: Qwen3-8B, 14B, and 32B on the core menu, and OLMo-3-7B-SFT and Llama-3.1-8B-Instruct on math and code.
+Exploratory cells are outside both stages.
+Table~\ref{tab:cells} in the appendix lists every confirmatory cell.
+
+The domains are Reasoning Gym chain sums \citep{stojanovski2025gym}, Big-Math \citep{albalak2025bigmath}, TACO code \citep{li2023taco}, multi-constraint instruction following \citep{pyatkin2025ifbench,lambert2024tulu}, and WebInstruct question answering \citep{ma2025reasoner}.
+Table~\ref{tab:domains} in the appendix is the domain contract.
+Pools are 1,024 train prompts and 384 held-out prompts, disjoint at the question, and shared by every model of a domain.
+The code oracle runs the submission in a process that does not hold the expected outputs.
+An audit hook, and Landlock on Linux kernels that support it, refuses file, process, and network access outside the working directory.
+The natural code verifier is the statement's public examples, scored against the dataset's expected output when the example input is also a hidden test.
+Appendix~\ref{app:domains} records pools, judges, and adjudication.
+
+\subsection{Arms at one rate}
+
+Every imperfect synthetic arm is fitted on the base model's step-0 samples of that cell's train pool only, to a false-positive rate of 0.15 or a false-negative rate of 0.30.
+The channel then has $J = 0.55$.
+Resampled controls copy the matched arm's rates.
+A targeted arm whose rate misses the target by more than 0.02 is withdrawn before training, and so is a phrase arm that fails its sign check.
+Withdrawals are written down and remove every contrast that uses the arm.
+Table~\ref{tab:kit} is the kit, including the four arms that exist so the structure class can be held fixed.
+
+\begin{table*}[t]
+\caption{The kit. Full-menu arms are trained in E1. The core menu used at 4B and above drops the four direction-reversal arms.}
+\label{tab:kit}
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\input{generated/kit}
+\end{table*}
+
+The phrase rules are the running example.
+A phrase is one to three word tokens, with digit candidates excluded.
+The preference is a within-prompt association, fit on seven eighths of the train prompts and checked on the remaining eighth.
+\texttt{fp\_trigger} passes when the held-out association is at most zero or its 90 percent prompt-bootstrap interval covers zero: the phrase is not enriched for correct answers.
+\texttt{fp\_trigger\_enriched} passes when that association is positive.
+\texttt{fn\_behavior} passes when the phrase predicts correctness, and \texttt{fn\_behavior\_depleted} when the phrase is depleted among correct answers.
+Both false-positive phrases are accepted on wrong completions at the same rate.
+Both false-negative phrases are rejected on correct completions at the same rate.
+The structure class is $-1$ for either member of a pair.
+A label that only says ``shared behaviour is bad'' cannot separate them.
+Appendix~\ref{app:arms} records the sign checks and the chain-sum decoy, whose band is disjoint from the fitted tolerance at the same rate.
+
+Natural verifiers run at whatever rate the audit measures.
+Each has a resampled control at that rate.
+Math has a lenient cascade and a strict string match.
+Instruction following uses the constraint checkers alone, so its natural errors are false positives.
+Judged question answering uses a 1.5B model judge.
+Chain sum audits an exact string match and does not train it.
+
+The patch arms, on the E1 cells of math, code, instruction following, and judged question answering, start from the natural verifier and hand two error categories back to the oracle.
+\texttt{patch\_rate} takes the two categories with the most step-0 errors.
+\texttt{patch\_tau} takes the pair with the highest locked transfer precision.
+If the two selections coincide, the error-count patch is withdrawn and the domain leaves the patch test.
+
+\subsection{Training, locks, and tests}
+
+Training is GRPO \citep{shao2024deepseekmath} with LoRA rank 16 and $\alpha = 32$, for 300 steps of 64 prompts by 8 samples, no KL penalty, group-standardised advantages, and a sequence-mean loss.
+The endpoint is held-out oracle accuracy at step 300.
+The learning rate is $2 \times 10^{-5}$ up to 4B and $1 \times 10^{-5}$ from 8B.
+Qwen3 runs in non-thinking mode.
+Evaluation is every 25 steps.
+TRL 0.25.1 samples with colocated vLLM.
+14B trains on 2 GPUs and 32B on 4, with tensor parallelism, and one optimiser step always sees 512 completions.
+Appendix~\ref{app:train} records hardware and the seed rule.
+
+Before the first training step of a cell, the run writes the SHA-256 of the forecasts, the full cell configuration, the environment, and every input artefact the forecasts depend on.
+Training refuses to start if any of them has changed.
+Stage A's confirmatory analysis is computed once, when every planned stage A run has a summary.
+Stage B's analysis is computed once, on stage B's pairs only.
+The union of the two stages is a secondary analysis, computed only when both stages are complete.
+No seed is added after a confirmatory contrast has been computed.
+
+Table~\ref{tab:hypotheses} is the confirmatory list.
+Stage A carries H1, H1-pooled, H2, H3, H10, H7, and H8.
+Stage B carries H3-replication.
+H9, the scale slopes, the within-shared stratum, the class baseline, and the union correlation are secondary.
+There is no family-wise claim across the confirmatory families.
+The abstract states only a hypothesis that passed its own test.
+
+\begin{table*}[t]
+\caption{Confirmatory tests. Each family is tested at $\alpha = 0.05$. H1 rejects if at least one of its Holm-adjusted contrasts rejects and every completed seed of that contrast is positive.}
+\label{tab:hypotheses}
+\centering
+\small
+\setlength{\tabcolsep}{3pt}
+\input{generated/hypotheses}
+\end{table*}
+
+A contrast pairs arm seed $s$ with control seed $s$.
+The estimate is the mean, over seeds and held-out prompts, of the accuracy gap at step 300.
+Uncertainty is a crossed bootstrap with 10,000 resamples: seeds and prompts are drawn independently with replacement \citep{owen2007pigeonhole}.
+H1-pooled, H8, and H10 stratify that bootstrap by cell and give cells equal weight.
+H3 and H3-replication permute the accuracy gap inside each cell, 100,000 draws at seed 0, and also require the bootstrap 5th percentile of the Spearman correlation to lie above 0, on at least 20 pairs.
+Multiplicity inside a family uses the Holm procedure \citep{holm1979simple}.
+A cell is conclusive when its oracle arm gains at least 0.10 held-out accuracy in E1 and at least 0.05 in E2 and E3.
+Inconclusive cells are reported, excluded from the pooled tests, and put back in a sensitivity.
+
+Stage A plans 63 matched pairs in ten cells and stage B plans 50 in ten.
+By simulation of the permutation test, stage A has power 0.69 at a true within-cell Spearman correlation of 0.3 and 0.93 at 0.4.
+Stage B has 0.60 and 0.83, or 0.42 and 0.64 if the budget removes three of its cells.
+
+\paragraph{What a null means.}
+If every H1 contrast fails in conclusive cells, these shared rules do not move held-out accuracy by more than 0.05 relative to rate-matched noise at 1.7B, and that is the finding.
+If H3 fails, the screen does not order fates beyond the rate at this power.
+If H3 passes and H10 fails, the screen orders fates across structures but does not read the direction of a shared behaviour.
+If H3 passes and H3-replication fails, the screen's reach is the stage A models.
+The thresholds are not revisited after the data.

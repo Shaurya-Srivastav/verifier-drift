@@ -23,7 +23,7 @@ attention mask that ``generate`` uses (``cumsum(mask) - 1``, pads filled with
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -88,30 +88,143 @@ def _truncate_left(
     return ids[-max_len:], max(0, completion_start - overflow)
 
 
+def _check_device_map(device_map: str | None) -> None:
+    if device_map not in (None, "auto"):
+        raise ValueError(f"device_map must be None or 'auto', got {device_map!r}")
+
+
+def _embedding_device(model: Any, fallback: torch.device) -> torch.device:
+    """Device of the input embedding, which is where a sharded forward expects ids."""
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    if hasattr(base, "get_input_embeddings"):
+        embedding = base.get_input_embeddings()
+        weight = getattr(embedding, "weight", None)
+        if weight is not None and getattr(weight, "device", None) is not None:
+            return weight.device
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return fallback
+
+
+def _shard_model(model: Any, device_map: str) -> Any:
+    """Shard ``model`` across CUDA devices. Without CUDA the module stays put.
+
+    ``device_map='auto'`` uses accelerate. A model that already carries
+    ``hf_device_map`` (``from_pretrained(..., device_map=...)``) is not moved again.
+    """
+    _check_device_map(device_map)
+    if device_map is None:
+        return model
+    if getattr(model, "hf_device_map", None):
+        return model
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+        return model
+    from accelerate import dispatch_model, infer_auto_device_map
+
+    no_split = list(getattr(model, "_no_split_modules", []) or [])
+    mapping = infer_auto_device_map(model, no_split_module_classes=no_split)
+    return dispatch_model(model, device_map=mapping)
+
+
+def _place_model(
+    model: Any,
+    *,
+    device: str | torch.device | None,
+    dtype: str | None,
+    device_map: str | None,
+) -> Any:
+    """Move or shard ``model``. ``device`` and ``device_map`` are mutually exclusive."""
+    _check_device_map(device_map)
+    if device is not None and device_map is not None:
+        raise ValueError("pass device or device_map, not both")
+    if getattr(model, "hf_device_map", None):
+        if device is not None:
+            raise ValueError("model is already sharded; do not pass device")
+        if dtype is not None:
+            raise ValueError("model is already sharded; set dtype when loading it")
+        return model
+    if device_map is not None:
+        if dtype is not None:
+            model.to(dtype=_resolve_dtype(dtype))
+        return _shard_model(model, device_map)
+    if device is None and dtype is None:
+        return model
+    kwargs: dict[str, Any] = {}
+    if device is not None:
+        kwargs["device"] = _resolve_device(device)
+    if dtype is not None:
+        kwargs["dtype"] = _resolve_dtype(dtype)
+    model.to(**kwargs)
+    return model
+
+
+def _encode_feature_row(
+    tokenizer: Any,
+    prompt: str,
+    completion: str,
+    system_prompt: str | None,
+    completion_row: Sequence[int] | None,
+    chat_template_kwargs: Mapping[str, Any] | None,
+) -> tuple[list[int], int]:
+    """Prompt plus completion ids, forwarding chat-template kwargs only when set.
+
+    ``vfates.gen.chat`` is gaining ``chat_template_kwargs``. Passing the keyword
+    only when it is not ``None`` keeps this callable before and after that lands.
+    """
+    if completion_row is None:
+        if chat_template_kwargs is None:
+            return encode_prompt_completion(tokenizer, prompt, completion, system_prompt)
+        return encode_prompt_completion(
+            tokenizer,
+            prompt,
+            completion,
+            system_prompt,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+    if chat_template_kwargs is None:
+        return prompt_completion_ids(tokenizer, prompt, completion_row, system_prompt)
+    return prompt_completion_ids(
+        tokenizer,
+        prompt,
+        completion_row,
+        system_prompt,
+        chat_template_kwargs=chat_template_kwargs,
+    )
+
+
 def load_model(
     model_id: str,
     device: str | torch.device | None = None,
     dtype: str = "float32",
     *,
     local_files_only: bool = False,
+    device_map: str | None = None,
 ) -> tuple[Any, Any]:
     """Load a causal LM and its tokenizer in eval mode.
 
     The model is moved to ``device`` (CUDA, then MPS, then CPU when ``device``
-    is ``None``). ``local_files_only`` skips the hub when the snapshot is cached.
+    is ``None``). ``device_map='auto'`` instead shards the load with accelerate
+    and must not be combined with ``device``. ``local_files_only`` skips the hub
+    when the snapshot is cached.
     """
-    resolved = _resolve_device(device)
+    _check_device_map(device_map)
+    if device is not None and device_map is not None:
+        raise ValueError("pass device or device_map, not both")
     tokenizer = AutoTokenizer.from_pretrained(model_id, local_files_only=local_files_only)
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token is None:
             raise ValueError(f"{model_id} tokenizer has no pad token and no eos token")
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        dtype=_resolve_dtype(dtype),
-        local_files_only=local_files_only,
-    )
-    model.to(device=resolved)
+    load_kwargs: dict[str, Any] = {
+        "dtype": _resolve_dtype(dtype),
+        "local_files_only": local_files_only,
+    }
+    if device_map is not None:
+        load_kwargs["device_map"] = device_map
+    model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+    if device_map is None:
+        model.to(device=_resolve_device(device))
     model.eval()
     return model, tokenizer
 
@@ -156,6 +269,9 @@ def hidden_features(
     max_len: int | None = None,
     completion_ids: Sequence[Sequence[int]] | None = None,
     pad_multiple: int = 1,
+    dtype: str | None = None,
+    device_map: str | None = None,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
 ) -> np.ndarray:
     """Pooled final-layer hidden state of each completion, float32 ``[N, H]``.
 
@@ -178,6 +294,12 @@ def hidden_features(
     float32). Padding does not change the real tokens' states: they never
     attend to later positions, and left pads are masked.
 
+    ``dtype`` casts the module when set. ``None`` leaves the loaded dtype alone,
+    which is the historical behaviour. ``device_map='auto'`` shards with
+    accelerate when CUDA is present and is mutually exclusive with ``device``.
+    ``chat_template_kwargs`` is forwarded to the chat encoder only when it is
+    not ``None``.
+
     A PEFT model is unwrapped with ``get_base_model()`` before its backbone is
     taken; the injected adapter layers stay active.
 
@@ -198,14 +320,20 @@ def hidden_features(
             f"completion_ids ({len(completion_ids)}) and prompts ({len(prompts)}) differ"
         )
     source = "token_ids" if completion_ids is not None else "text"
-    hidden_features.meta = {"completion_source": source}  # type: ignore[attr-defined]
+    hidden_features.meta = {  # type: ignore[attr-defined]
+        "completion_source": source,
+        "dtype": dtype,
+        "device_map": device_map,
+    }
     hidden_size = int(model.config.hidden_size)
     if not prompts:
         hidden_features.peak_memory = None  # type: ignore[attr-defined]
         return np.zeros((0, hidden_size), dtype=np.float32)
-    if device is not None:
-        model.to(_resolve_device(device))
-    param_device = next(model.parameters()).device
+    model = _place_model(model, device=device, dtype=dtype, device_map=device_map)
+    if device_map is not None or getattr(model, "hf_device_map", None):
+        param_device = _embedding_device(model, _resolve_device(device))
+    else:
+        param_device = next(model.parameters()).device
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         pad_id = tokenizer.eos_token_id
@@ -214,14 +342,14 @@ def hidden_features(
     side = getattr(tokenizer, "padding_side", "right") or "right"
     encoded: list[tuple[list[int], int, int]] = []
     for index, prompt in enumerate(prompts):
-        if completion_ids is None:
-            ids, start = encode_prompt_completion(
-                tokenizer, prompt, completions[index], system_prompt
-            )
-        else:
-            ids, start = prompt_completion_ids(
-                tokenizer, prompt, completion_ids[index], system_prompt
-            )
+        ids, start = _encode_feature_row(
+            tokenizer,
+            prompt,
+            completions[index],
+            system_prompt,
+            None if completion_ids is None else completion_ids[index],
+            chat_template_kwargs,
+        )
         ids, start = _truncate_left(ids, start, max_len)
         encoded.append((ids, start, len(ids)))
     features = np.zeros((len(encoded), hidden_size), dtype=np.float32)

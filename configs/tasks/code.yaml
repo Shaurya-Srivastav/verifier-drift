@@ -1,0 +1,54 @@
+# BAAI/TACO train split, hash-split inside that split. The TACO test split is unused.
+# Pin is the Hugging Face dataset repo sha.
+# There is no backup source. If no TACO bucket qualifies, code leaves the program.
+# N_min (min_tests) is 5. Floors are train >= 1024, dev >= 128, held-out >= 384.
+# easy is EASY. medium is MEDIUM and MEDIUM_HARD, deduped across that union.
+# K (max_tests) is 32: the K tests with the smallest u01("code/test-order", problem_id, index),
+# ties broken by index, then executed in increasing original index.
+# Split membership is u01("code/split", problem_id). problems() seed does not enter the hash.
+# Intervals: [0, heldout) heldout, [heldout, heldout+dev) dev, the rest train.
+# Held-out is drawn first, so raising dev_fraction does not move held-out problems.
+# Public examples come from the statement (Example / Sample Input / Sample Output).
+# A sample body ends at the next header. Trailing blank-line paragraphs that are
+# not data are dropped. The first paragraph is kept.
+# When a public example's whitespace-normalised input equals a hidden test's
+# input, that public test's expected output is the hidden test's output.
+# The match uses the full hidden list, before the 32 cap. The first match wins.
+# An unmatched example keeps the extracted output. public_source counts
+# dataset versus statement on each problem.
+# The first hidden test is used only when the row marks test 0 public:
+# public is true, is_public[0] is true, or inputs[0] is a dict with public or is_public true.
+# Stock TACO rows have no such flag, so a statement with no extracted example is dropped.
+# Stdout comparison is strip equality or whitespace-split token equality (order kept).
+# Finite float tokens also use numpy allclose defaults (rtol 1e-05, atol 1e-08).
+# This is narrower than TACO's compare_std_results, which also accepts an order-free
+# set of tokens and, for call-based problems, return_value == expected[0].
+# Function-call problems compare return values (tuples become lists, digit-string dict
+# keys become ints, bool is not an int).
+# TACO pool at dev_fraction 0.20, min_tests 5, public example required, dedup,
+# hash split train / dev / held-out. Held-out problem ids match the 0.10 split.
+# Both clear train >= 1024, dev >= 128, held-out >= 384.
+#   easy (EASY)                         1647 / 548 / 579
+#   medium (MEDIUM and MEDIUM_HARD)     1475 / 482 / 530
+# Public outputs on that pool (input match against the full hidden list):
+#   easy    dataset 4301, statement 371, 945 of the dataset outputs differ
+#           from the extracted text, 2413 of 2774 problems entirely dataset-backed
+#   medium  dataset 4636, statement 203, 1353 of the dataset outputs differ
+#           from the extracted text, 2291 of 2487 problems entirely dataset-backed
+type: code
+dataset: BAAI/TACO
+revision: d593ed0a2becbbc952230bb89be09189bf1056dc
+bucket: easy
+buckets:
+  easy: [EASY]
+  medium: [MEDIUM, MEDIUM_HARD]
+python_only: true
+min_tests: 5
+max_tests: 32
+heldout_fraction: 0.20
+dev_fraction: 0.20
+require_public_example: true
+per_test_timeout_s: 2.0
+wall_timeout_s: 120.0
+memory_mb: 512
+max_output_bytes: 1048576

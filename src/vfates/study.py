@@ -4,10 +4,17 @@
 confirmatory analysis was computed. Hypothesis outcomes are in the report, not
 in ``ok``. Training is separate from the analysis, so :func:`reanalyze` can
 recompute the report from a finished directory.
+
+``only='audit'`` or ``only='train'`` runs one queue job. A train job writes
+the cell report only when every planned run is then complete. ``reanalyze``
+does the same: an incomplete cell, including a run whose summary status is
+``preempted``, does not keep a cell report.
 """
 
 from __future__ import annotations
 
+import inspect
+import os
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -28,8 +35,27 @@ from vfates.utils.env import environment_report
 from vfates.utils.io import read_json, write_json
 
 
-def run_study(config: Mapping[str, Any], out_dir: str | Path) -> dict[str, Any]:
-    """Audit, lock, withdraw, train, then analyse when every planned run is complete."""
+def run_study(
+    config: Mapping[str, Any],
+    out_dir: str | Path,
+    *,
+    only: str | None = None,
+    arm: str | None = None,
+    seed: int | None = None,
+    early: bool = False,
+    variant: str | None = None,
+) -> dict[str, Any]:
+    """Audit, lock, withdraw, train, then analyse when every planned run is complete.
+
+    ``only=None`` is the whole cell. ``only='audit'`` stops after the lock.
+    ``only='train'`` trains one ``(arm, seed)`` pair, the early baseline when
+    ``early`` is true, or one declared variant when ``variant`` is set.
+    Variant runs write under ``out/variants/<name>/<arm>__s<seed>`` and are
+    not required for the confirmatory report. ``summary == 'PREEMPTED'``
+    means the trainer checkpointed and the process should exit 0 so the
+    queue can requeue it.
+    """
+    _check_selector(only, arm, seed, early, variant)
     started = time.perf_counter()
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -37,28 +63,49 @@ def run_study(config: Mapping[str, Any], out_dir: str | Path) -> dict[str, Any]:
     analysis = dict(config.get("analysis") or {})
     audit_dir = Path(config["audit_dir"]) if config.get("audit_dir") else out / "audit"
     _check_model_ids(config["audit"], study)
+    _check_chat_template_kwargs(config["audit"], study)
+    _check_hardware(study)
+    if only == "train":
+        _require_confirmatory_pools(config, audit_dir)
     if analysis.get("agreement_check") is not None:
         checked_agreement_spec(analysis["agreement_check"])
+
+    if only == "train":
+        assert arm is not None and seed is not None
+        return _run_one_train(
+            config,
+            out,
+            audit_dir,
+            study,
+            analysis,
+            arm=arm,
+            seed=seed,
+            early=early,
+            variant=variant,
+            started=started,
+        )
 
     from vfates.audit import run_audit
 
     run_audit(config["audit"], audit_dir)
-    record = _write_audit_withdrawals(audit_dir, analysis, out)
+    _require_confirmatory_pools(config, audit_dir)
+    record = _write_audit_withdrawals(audit_dir, analysis, out, study.get("arms"))
     _verify_lock(audit_dir)
     _check_loss_agg(audit_dir, study)
+    steps = _check_final_step(analysis, study)
+    early_enabled, early_steps, early_seed = _early_settings(analysis)
+    if only == "audit":
+        return {
+            "summary": "AUDIT",
+            "ok": True,
+            "reason": f"audit written to {audit_dir}",
+            "elapsed_sec": time.perf_counter() - started,
+            "withdrawals": record,
+            "only": "audit",
+            "report_written": False,
+        }
 
     train_cfg = dict(study["train"])
-    steps = int(train_cfg["steps"])
-    final_step = int(analysis["final_step"])
-    if final_step != steps:
-        raise ValueError(
-            f"analysis.final_step ({final_step}) must equal study.train.steps ({steps})"
-        )
-    hypotheses = bool(analysis.get("hypotheses", True))
-    early_cfg = dict(analysis.get("early") or {})
-    early_enabled = bool(early_cfg.get("enabled", hypotheses))
-    early_steps = int(early_cfg.get("steps", 25))
-    early_seed = int(early_cfg.get("seed", 99))
     planned = planned_seeds(study)
     backend = str(study.get("backend", "trl"))
     withdrawn = set(record["withdrawn"])
@@ -116,7 +163,12 @@ def run_study(config: Mapping[str, Any], out_dir: str | Path) -> dict[str, Any]:
 
 
 def reanalyze(config: Mapping[str, Any], out_dir: str | Path) -> dict[str, Any]:
-    """Recompute ``report.json`` from finished runs. Does not train or rewrite withdrawals."""
+    """Recompute ``report.json`` from finished runs. Does not train or rewrite withdrawals.
+
+    The cell report is written only when every planned run is complete. A
+    summary status of ``preempted`` is not complete. An incomplete cell drops
+    ``report.json`` and ``report.md`` so a stale PASS does not remain.
+    """
     started = time.perf_counter()
     out = Path(out_dir)
     audit_dir = Path(config["audit_dir"]) if config.get("audit_dir") else out / "audit"
@@ -126,20 +178,48 @@ def reanalyze(config: Mapping[str, Any], out_dir: str | Path) -> dict[str, Any]:
     record = read_json(record_path)
     analysis = dict(config.get("analysis") or {})
     study = dict(config["study"])
-    hypotheses = bool(analysis.get("hypotheses", True))
-    early_cfg = dict(analysis.get("early") or {})
-    early_enabled = bool(early_cfg.get("enabled", hypotheses))
+    early_enabled, early_steps, early_seed = _early_settings(analysis)
+    planned = planned_seeds(study)
+    steps = int(study["train"]["steps"])
+    withdrawn = {str(name) for name in record.get("withdrawn", [])}
+    missing = _missing(
+        out,
+        planned,
+        withdrawn,
+        steps=steps,
+        early_enabled=early_enabled,
+        early_steps=early_steps,
+        early_seed=early_seed,
+    )
+    _require_confirmatory_pools(config, audit_dir)
+    if missing:
+        for name in ("report.json", "report.md"):
+            path = out / name
+            if path.exists():
+                path.unlink()
+        return {
+            "summary": "FAIL",
+            "ok": False,
+            "reason": "planned runs incomplete: " + ", ".join(missing),
+            "elapsed_sec": time.perf_counter() - started,
+            "withdrawals": record,
+            "planned_seeds": planned,
+            "analysis": None,
+            "report_written": False,
+            "config": dict(config),
+            "environment": environment_report(),
+        }
     return _finish(
         config,
         out,
         audit_dir,
         analysis,
-        planned_seeds(study),
+        planned,
         record,
-        steps=int(study["train"]["steps"]),
+        steps=steps,
         early_enabled=early_enabled,
-        early_steps=int(early_cfg.get("steps", 25)),
-        early_seed=int(early_cfg.get("seed", 99)),
+        early_steps=early_steps,
+        early_seed=early_seed,
         started=started,
     )
 
@@ -161,6 +241,276 @@ def planned_seeds(study: Mapping[str, Any]) -> dict[str, list[int]]:
     return planned
 
 
+def _check_selector(
+    only: str | None,
+    arm: str | None,
+    seed: int | None,
+    early: bool,
+    variant: str | None = None,
+) -> None:
+    if only not in (None, "audit", "train"):
+        raise ValueError(f"only must be 'audit', 'train', or omitted, got {only!r}")
+    if only != "train" and (arm is not None or seed is not None or early or variant is not None):
+        raise ValueError("arm, seed, early, and variant are only valid with only='train'")
+    if only == "train" and (arm is None or seed is None):
+        raise ValueError("only='train' requires arm and seed")
+    if variant is not None and early:
+        raise ValueError("variant and early cannot be combined")
+
+
+def _early_settings(analysis: Mapping[str, Any]) -> tuple[bool, int, int]:
+    hypotheses = bool(analysis.get("hypotheses", True))
+    early_cfg = dict(analysis.get("early") or {})
+    enabled = bool(early_cfg.get("enabled", hypotheses))
+    return enabled, int(early_cfg.get("steps", 25)), int(early_cfg.get("seed", 99))
+
+
+def _check_final_step(analysis: Mapping[str, Any], study: Mapping[str, Any]) -> int:
+    steps = int(study["train"]["steps"])
+    final_step = int(analysis["final_step"])
+    if final_step != steps:
+        raise ValueError(
+            f"analysis.final_step ({final_step}) must equal study.train.steps ({steps})"
+        )
+    return steps
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return tuple(sorted((str(key), _freeze(item)) for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _check_chat_template_kwargs(audit: Mapping[str, Any], study: Mapping[str, Any]) -> None:
+    """Refuse when the four templating sites (and generator kwargs, if set) differ."""
+    generator = dict(audit.get("generator") or {})
+    features = dict(audit.get("features") or {})
+    train = dict(study.get("train") or {})
+    eval_kwargs = dict((study.get("eval_generator") or {}).get("kwargs") or {})
+    found: dict[str, Any] = {
+        "audit.generator.chat_template_kwargs": generator.get("chat_template_kwargs"),
+        "audit.features.chat_template_kwargs": features.get("chat_template_kwargs"),
+        "study.train.chat_template_kwargs": train.get("chat_template_kwargs"),
+        "study.eval_generator.kwargs.chat_template_kwargs": eval_kwargs.get("chat_template_kwargs"),
+    }
+    gen_kwargs = dict(generator.get("kwargs") or {})
+    if "chat_template_kwargs" in gen_kwargs:
+        found["audit.generator.kwargs.chat_template_kwargs"] = gen_kwargs["chat_template_kwargs"]
+    frozen: dict[str, Any] = {}
+    for key, value in found.items():
+        if value is None:
+            frozen[key] = None
+            continue
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{key} must be a mapping or null")
+        frozen[key] = _freeze(value)
+    if len(set(frozen.values())) > 1:
+        detail = ", ".join(f"{key}={found[key]!r}" for key in found)
+        raise ValueError(f"chat_template_kwargs differ across the study: {detail}")
+
+
+def _require_confirmatory_pools(config: Mapping[str, Any], audit_dir: Path) -> None:
+    """Refuse a development-pool audit unless this config is a pilot.
+
+    ``require_confirmatory_pools`` is imported lazily. A build that does not
+    have the helper yet leaves the check for a later revision.
+    """
+    if config.get("pilot") is True:
+        return
+    try:
+        from vfates.audit import require_confirmatory_pools
+    except ImportError:
+        return
+    require_confirmatory_pools(audit_dir)
+
+
+def _check_hardware(study: Mapping[str, Any]) -> None:
+    expected = study.get("hardware_class")
+    if expected is None or str(expected).strip() == "":
+        return
+    from vfates.utils.env import hardware_class
+
+    expected_text = str(expected)
+    current = str(hardware_class())
+    if current == expected_text:
+        return
+    if os.environ.get("VFATES_ALLOW_HARDWARE_MISMATCH") == "1":
+        return
+    raise ValueError(
+        f"hardware_class is {current} but this cell requires {expected_text}. "
+        "Set VFATES_ALLOW_HARDWARE_MISMATCH=1 to run anyway."
+    )
+
+
+def _call_train_arm(
+    audit_dir: Path,
+    arm: str,
+    train_cfg: Mapping[str, Any],
+    run_dir: Path,
+    seed: int,
+    *,
+    study: Mapping[str, Any],
+    backend: str,
+    resume: bool,
+) -> Any:
+    """Call ``train_arm`` and pass ``hardware_class`` by keyword when it is accepted.
+
+    The backends owner adds that keyword. Until the signature has it (or
+    ``**kwargs``), the class still rides on the train mapping, which
+    ``GRPOConfig`` already stores.
+    """
+    from vfates.experiment import train_arm
+
+    hardware = study.get("hardware_class")
+    body = {**dict(train_cfg), "seed": int(seed)}
+    if hardware is not None:
+        body["hardware_class"] = hardware
+    kwargs: dict[str, Any] = {
+        "backend": backend,
+        "resume": resume,
+        "max_train": study.get("max_train"),
+        "max_heldout": study.get("max_heldout"),
+        "eval_generator": study.get("eval_generator"),
+    }
+    params = inspect.signature(train_arm).parameters
+    accepts = "hardware_class" in params or any(
+        item.kind is inspect.Parameter.VAR_KEYWORD for item in params.values()
+    )
+    if accepts:
+        kwargs["hardware_class"] = hardware
+    return train_arm(audit_dir, arm, body, run_dir, **kwargs)
+
+
+def _run_one_train(
+    config: Mapping[str, Any],
+    out: Path,
+    audit_dir: Path,
+    study: Mapping[str, Any],
+    analysis: Mapping[str, Any],
+    *,
+    arm: str,
+    seed: int,
+    early: bool,
+    started: float,
+    variant: str | None = None,
+) -> dict[str, Any]:
+    if not audit_dir.is_dir():
+        raise ValueError(f"audit directory is missing: {audit_dir}")
+    _verify_lock(audit_dir)
+    _check_loss_agg(audit_dir, study)
+    steps = _check_final_step(analysis, study)
+    early_enabled, early_steps, early_seed = _early_settings(analysis)
+    planned = planned_seeds(study)
+    if arm not in planned:
+        raise ValueError(f"arm {arm!r} is not in the planned menu")
+    if variant is not None:
+        row = _variant_row(study, variant)
+        if arm not in {str(name) for name in row.get("arms") or []}:
+            raise ValueError(f"arm {arm!r} is not in variant {variant}")
+        if seed not in {int(item) for item in row.get("seeds") or []}:
+            raise ValueError(f"seed {seed} is not in variant {variant}")
+        overrides = dict(row.get("train_overrides") or {})
+        train_cfg = {**dict(study["train"]), **overrides}
+        run_steps = int(train_cfg["steps"])
+        run_dir = out / "variants" / variant / f"{arm}__s{seed}"
+    elif early:
+        if not early_enabled:
+            raise ValueError("early baselines are disabled for this cell")
+        if seed != early_seed:
+            raise ValueError(f"early seed is {early_seed}, got {seed}")
+        run_steps = early_steps
+        train_cfg = {**dict(study["train"]), "steps": early_steps}
+        run_dir = _run_dir(out, arm, seed, early=True)
+    else:
+        if seed not in planned[arm]:
+            raise ValueError(f"seed {seed} is not planned for {arm}")
+        run_steps = steps
+        train_cfg = study["train"]
+        run_dir = _run_dir(out, arm, seed)
+    record_path = out / "withdrawals.json"
+    if record_path.exists():
+        record = read_json(record_path)
+    else:
+        record = _write_audit_withdrawals(audit_dir, analysis, out, study.get("arms"))
+    backend = str(study.get("backend", "trl"))
+    withdrawn = {str(name) for name in record.get("withdrawn", [])}
+    if arm not in withdrawn:
+        outcome = _train_with_retry(
+            audit_dir,
+            arm,
+            seed,
+            train_cfg,
+            run_dir,
+            run_steps,
+            study=study,
+            backend=backend,
+        )
+        if outcome == "withdraw":
+            _withdraw_training(out, record, arm, seed, "non_finite_loss")
+    if record_path.exists():
+        record = read_json(record_path)
+    withdrawn = {str(name) for name in record.get("withdrawn", [])}
+    if arm not in withdrawn and _summary_status(run_dir) == "preempted":
+        return {
+            "summary": "PREEMPTED",
+            "ok": False,
+            "reason": f"{arm} seed {seed} was preempted",
+            "elapsed_sec": time.perf_counter() - started,
+            "only": "train",
+            "arm": arm,
+            "seed": seed,
+            "early": early,
+            "report_written": False,
+            "withdrawals": record,
+            "planned_seeds": planned,
+            "analysis": None,
+            "config": dict(config),
+            "environment": environment_report(),
+        }
+    missing = _missing(
+        out,
+        planned,
+        withdrawn,
+        steps=steps,
+        early_enabled=early_enabled,
+        early_steps=early_steps,
+        early_seed=early_seed,
+    )
+    if missing:
+        label = "WITHDRAWN" if arm in withdrawn else "TRAIN"
+        return {
+            "summary": label,
+            "ok": True,
+            "reason": "planned runs incomplete: " + ", ".join(missing),
+            "elapsed_sec": time.perf_counter() - started,
+            "only": "train",
+            "arm": arm,
+            "seed": seed,
+            "early": early,
+            "report_written": False,
+            "withdrawals": record,
+            "planned_seeds": planned,
+            "analysis": None,
+            "config": dict(config),
+            "environment": environment_report(),
+        }
+    return _finish(
+        config,
+        out,
+        audit_dir,
+        analysis,
+        planned,
+        record,
+        steps=steps,
+        early_enabled=early_enabled,
+        early_steps=early_steps,
+        early_seed=early_seed,
+        started=started,
+    )
+
+
 def _run_dir(out: Path, arm: str, seed: int, *, early: bool = False) -> Path:
     root = "early" if early else "runs"
     return out / root / f"{arm}__s{seed}"
@@ -170,7 +520,20 @@ def _finished(run_dir: Path, steps: int) -> bool:
     path = run_dir / "summary.json"
     if not path.exists():
         return False
-    return read_json(path).get("steps_completed") == steps
+    summary = read_json(path)
+    # A preempted trainer can still have written the last step count. The run
+    # is not complete until a later attempt finishes without that status.
+    if summary.get("status") == "preempted":
+        return False
+    return summary.get("steps_completed") == steps
+
+
+def _summary_status(run_dir: Path) -> str | None:
+    path = run_dir / "summary.json"
+    if not path.exists():
+        return None
+    status = read_json(path).get("status")
+    return None if status is None else str(status)
 
 
 def _partial(run_dir: Path) -> bool:
@@ -202,23 +565,21 @@ def _train_with_retry(
     """Train one run. A non-finite loss resumes once; a second failure withdraws the arm."""
     if _finished(run_dir, steps):
         return "skipped"
-    from vfates.experiment import train_arm
 
     resume = _partial(run_dir)
     nonfinite = _nonfinite_class()
     failures = 0
     while True:
         try:
-            train_arm(
+            _call_train_arm(
                 audit_dir,
                 arm,
-                {**dict(train_cfg), "seed": seed},
+                train_cfg,
                 run_dir,
+                seed,
+                study=study,
                 backend=backend,
                 resume=resume,
-                max_train=study.get("max_train"),
-                max_heldout=study.get("max_heldout"),
-                eval_generator=study.get("eval_generator"),
             )
             return "trained"
         except Exception as exc:
@@ -231,16 +592,43 @@ def _train_with_retry(
 
 
 def _write_audit_withdrawals(
-    audit_dir: Path, analysis: Mapping[str, Any], out: Path
+    audit_dir: Path,
+    analysis: Mapping[str, Any],
+    out: Path,
+    menu: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     from vfates.verifiers.calibrate import arm_validity
 
     withdrawal_cfg = analysis.get("withdrawal") or {}
     rate_miss_max = float(withdrawal_cfg.get("rate_miss_max", analysis.get("rate_miss_max", 0.02)))
     validity = arm_validity(read_json(audit_dir / "calibration.json"))
-    record = decide_audit_withdrawals(validity, rate_miss_max=rate_miss_max)
+    forecasts_path = audit_dir / "forecasts.json"
+    forecasts = read_json(forecasts_path) if forecasts_path.is_file() else None
+    _forecast_arm_names(forecasts)
+    record = decide_audit_withdrawals(
+        validity, rate_miss_max=rate_miss_max, forecasts=forecasts, menu=menu
+    )
     write_json(out / "withdrawals.json", record)
     return record
+
+
+def _forecast_arm_names(forecasts: Mapping[str, Any] | None) -> list[str]:
+    """Arm names in a forecasts document, skipping non-arm keys such as ``patch_selection``."""
+    if not isinstance(forecasts, Mapping):
+        return []
+    from vfates.audit import iter_forecast_arms
+
+    names = [name for name, _entry in iter_forecast_arms(forecasts)]
+    if "patch_selection" in names:
+        raise ValueError("patch_selection was treated as a forecast arm")
+    return names
+
+
+def _variant_row(study: Mapping[str, Any], name: str) -> dict[str, Any]:
+    for row in study.get("variants") or []:
+        if str(row.get("name")) == name:
+            return dict(row)
+    raise ValueError(f"unknown variant {name!r}")
 
 
 def _withdraw_training(out: Path, record: dict[str, Any], arm: str, seed: int, reason: str) -> None:

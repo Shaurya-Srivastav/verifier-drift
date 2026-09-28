@@ -1,16 +1,33 @@
-# allenai/RLVR-IFeval. Natural verifier: the constraint checker.
-# Oracle: checker and a content judge (heuristic by default).
-# E2 replaces the heuristic with the vLLM judge in configs/experiments/e2_ifeval.yaml.
-name: ifeval
-dataset: allenai/RLVR-IFeval
+# allenai/IF_multi_constraints_upto5 (ODC-BY), revision pinned.
+# Backup source rlvr_ifeval is allenai/RLVR-IFeval (unpinned, same row-id split as before).
+# Difficulty is the constraint count. null keeps 1 through 5.
+# Pilot P2 picks a bucket such as [2, 3] or [4, 5].
+# Length filter: budget_words = floor(max_completion_tokens * words_per_token).
+# 0.75 words per token is about 4/3 tokens per word. 768 tokens gives 576 words.
+# A prompt is dropped when a constraint requires strictly more words than that:
+# length_constraints:number_words with relation "at least", or
+# count:counting_composition (3 * n_sent * n_words).
+# "less than" does not force a minimum and is kept.
+# Dedup is the normalised prompt (strip, casefold, collapse whitespace)
+# after the bucket and budget filters.
+# Split: u01("ifeval/prompt", seed, normalised prompt).
+# dev if u < dev_fraction, heldout if u < dev_fraction + heldout_fraction,
+# else train. The constraint list is not part of the hash.
+type: ifeval
+source: if_multi
+dataset: allenai/IF_multi_constraints_upto5
+revision: 2e3a77407b7fce69f95b248d64a884e3ae1c2423
 heldout_fraction: 0.33
-seed: 0
-n: null
-judge:
-  name: heuristic
-  min_content_words: 12
-  max_repeat_ratio: 0.4
-  max_keyword_density: 0.5
-verifier:
-  kind: natural
-  name: ifeval_checker
+dev_fraction: 0.10
+constraint_counts: null
+max_completion_tokens: 768
+words_per_token: 0.75
+judge_config:
+  type: llm
+  model: Qwen/Qwen3-14B
+  revision: 40c069824f4251a91eefaf281ebe4c544efd3e18
+  max_tokens: 16
+  chat_template_kwargs:
+    enable_thinking: false
+  # temperature is 0 inside LLMJudge. Rubric is judges.DEFAULT_RUBRIC.
+  rubric_sha256: 59ebed8ea69c8ee22c8b5c3372f1d99b42d499f32c8449bc956fa7f602e47db0

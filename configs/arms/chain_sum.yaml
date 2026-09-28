@@ -54,6 +54,18 @@ arms:
     ngram_range: [1, 3]
     min_chars: 4
 
+  # Same trigger rule as fp_trigger, with the opposite sign. prefer=enriched
+  # keeps phrases whose within-prompt association with oracle correctness is
+  # > 0 (enriched for correct answers). Same tolerance, n-gram range, and
+  # 7/8 fit plus 1/8 validation split. The held-out check passes when that
+  # association is > 0.
+  - name: fp_trigger_enriched
+    type: trigger_fp
+    prefer: enriched
+    tolerance: 0.02
+    ngram_range: [1, 3]
+    min_chars: 4
+
   # Resampled class-conditional noise matched to fp_tolerance's achieved
   # pooled (FPR, FNR). Same rates, independent draw per completion: the
   # control for "the rate, without the shared arithmetic feature". Like
@@ -77,6 +89,15 @@ arms:
     support: all
     seed: 0
 
+  # Resampled control for fp_trigger_enriched. The trigger fires on raw text,
+  # including completions with no parsed answer, so the control uses support
+  # all, the same support as noise_fp_trigger.
+  - name: noise_fp_trigger_enriched
+    type: resampled
+    match: fp_trigger_enriched
+    support: all
+    seed: 0
+
   # Shared false negatives from a behavior phrase on correct responses.
   # prefer=enriched keeps phrases with positive within-prompt association
   # between the phrase and oracle correctness (a conformance tax). The
@@ -87,6 +108,17 @@ arms:
   - name: fn_behavior
     type: behavior_fn
     prefer: enriched
+    tolerance: 0.02
+    ngram_range: [1, 3]
+    min_chars: 4
+
+  # Same behavior rule as fn_behavior, with the opposite sign. prefer=depleted
+  # keeps phrases whose within-prompt association with oracle correctness is
+  # < 0 (the phrase predicts wrong answers). The held-out check passes when
+  # that association is < 0. Same tolerance and candidate rules as fn_behavior.
+  - name: fn_behavior_depleted
+    type: behavior_fn
+    prefer: depleted
     tolerance: 0.02
     ngram_range: [1, 3]
     min_chars: 4
@@ -102,6 +134,12 @@ arms:
   - name: noise_fn
     type: resampled
     match: fn_behavior
+    seed: 0
+
+  # Resampled noise matched to fn_behavior_depleted's achieved pooled rates.
+  - name: noise_fn_depleted
+    type: resampled
+    match: fn_behavior_depleted
     seed: 0
 
   # Fixed in advance, not selected among surface rules. Rejects a correct

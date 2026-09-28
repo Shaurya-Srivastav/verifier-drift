@@ -1,0 +1,18 @@
+\section{Replication at scale and across families: stage B}
+\label{sec:replication}
+
+Stage B is computed once, on its own pairs, after its own runs.
+Stage A's pairs do not enter the test.
+H3-replication is the same three gates as H3: a within-cell permutation $p$-value below 0.05, a bootstrap 5th percentile above 0, and at least 20 pairs.
+The correlation on stage B is $\HThreeRepRho{}$ (permutation $p = \HThreeRepP{}$, 5th percentile $\HThreeRepQFive{}$, $n = \HThreeRepN{}$).
+% AFTER-RESULTS: (H3-replication holds) The screen orders pairs on models and families that stage A did not use to choose the test.
+% AFTER-RESULTS: (H3-replication does not hold) The screen's ordering does not replicate on the stage B pairs.
+
+The secondary union, which is computed only when both stages are complete, has correlation $\HThreeAllRho{}$ (permutation $p = \HThreeAllP{}$, 5th percentile $\HThreeAllQFive{}$, $n = \HThreeAllN{}$).
+Scale slopes are ordinary least squares of each kit contrast on $\log_{10}$ of the model specification's parameter count, with a cell-level bootstrap interval.
+They are secondary, and they are empty until the ladder is complete.
+Appendix~\ref{app:cells} prints the slope table.
+% AFTER-RESULTS: (union holds) Pooling the stages does not remove the ordering.
+% AFTER-RESULTS: (union does not hold) The pooled correlation does not clear the same three gates.
+% AFTER-RESULTS: (slopes are flat) The kit gaps do not show a monotone scale trend on this ladder.
+% AFTER-RESULTS: (slopes are not flat) Read each slope's interval before describing a scale trend. The intervals are in the appendix table.

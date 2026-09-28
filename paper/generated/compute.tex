@@ -1,0 +1,14 @@
+\begin{tabular}{llrrrr}
+\toprule
+Stage & Hardware & Jobs & H100 hours & Class hours & USD \\
+\midrule
+A & a100-\allowbreak{}80gb & 149 & 831.10 & 1511.09 & 0.00 \\
+A & rtx-\allowbreak{}5000-\allowbreak{}ada-\allowbreak{}32gb & 203 & 550.28 & 1834.25 & 0.00 \\
+A & rtx-\allowbreak{}a6000-\allowbreak{}48gb & 154 & 614.06 & 1754.46 & 0.00 \\
+B & h100-\allowbreak{}80gb & 310 & 6826.69 & 6826.69 & 17066.74 \\
+exploratory & rtx-\allowbreak{}5000-\allowbreak{}ada-\allowbreak{}32gb & 600 & 14.15 & 47.17 & 0.00 \\
+exploratory & rtx-\allowbreak{}a6000-\allowbreak{}48gb & 500 & 189.20 & 540.56 & 0.00 \\
+\bottomrule
+\end{tabular}
+
+Rates are projected. Placeholder token rates stay projected until pilot P5 writes measured rates. H100-equivalent hours are the planner's \texttt{gpu\_hours}. Class hours divide those by \texttt{speed\_vs\_h100}. Rented dollars use \texttt{usd\_per\_gpu\_hour}. The rented total is \PlanRentedUsd{}.

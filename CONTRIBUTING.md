@@ -57,29 +57,30 @@ Tests that need a downloaded model, the network or a specific accelerator carry 
 
 1. Rerun the pilot that produces the number (`vfates pilot <name>`), and commit its new `results/report.md` and `results/report.json` in the same pull request.
 2. Update every document that quotes the number. `rg` for the old value.
-3. If the change alters the design (an arm, a gate, an endpoint), add an entry to the decision log in [`pilots/README.md`](pilots/README.md) that names the evidence. After the preregistration is frozen, log it under Deviations in [`PREREGISTRATION.md`](PREREGISTRATION.md) instead, with a date and reason.
+3. If the change alters the design (an arm, a gate, an endpoint), add an entry to the design evidence in [`pilots/README.md`](pilots/README.md) that names the evidence. After the preregistration is frozen, log it under Deviations in [`PREREGISTRATION.md`](PREREGISTRATION.md) instead, with a date and reason.
 
 ## Pilots
 
-Run a pilot with `vfates pilot <name>`, `make <name>` or `python pilots/<folder>/run.py`. All three accept `--config`, `--out` and repeated `--set key=value`. `make pilots-mac` runs P0 through P4 in order.
+Run a pilot with `vfates pilot <name>`, `make <name>` or `python pilots/<folder>/run.py`. All three accept `--config`, `--out` and repeated `--set key=value`. `make pilots-mac` runs P0, P1 with `live=true`, and smoke runs of P2 to P6 into `runs/smoke/`; the scored runs of P2 to P5 need GPUs. The order, hardware and go/no-go rules are in [`pilots/README.md`](pilots/README.md).
 
 | Target | Folder | What it checks |
 | --- | --- | --- |
 | `p0` | `pilots/p0_theory` | Identities, same-rate fates and transfer precision on exactly solvable worlds |
-| `p1` | `pilots/p1_harness` | Every pipeline stage with the real model |
-| `p2` | `pilots/p2_base_audit` | Model and difficulty sweep for chain sum |
-| `p3` | `pilots/p3_estimator` | The step-0 estimator on a real audit; locks the forecasts |
-| `p4` | `pilots/p4_micro_grpo` | Micro-GRPO scored against the lock |
-| `p5` | `pilots/p5_gpu_gate` | Dry run of the GPU path, then the H100 gate |
-| `p6` | `pilots/p6_natural` | Step-0 screen of the MBPP+ and IFEval natural verifiers |
+| `p1` | `pilots/p1_harness` | Every stage of every domain, the program runner and the analysis, on Qwen3-0.6B |
+| `p2` | `pilots/p2_base_audit` | Each domain's difficulty bucket and token budget at `qwen3-1.7b` and `qwen3-4b` |
+| `p3` | `pilots/p3_estimator` | Reliability of `g_V`, sketch fidelity, bfloat16 agreement and the lock, per domain |
+| `p4` | `pilots/p4_micro_grpo` | The oracle arm's 150-step held-out gain per domain |
+| `p5` | `pilots/p5_gpu_gate` | Every placement, preemption and resume, per-model gain, the seed rule, throughput |
+| `p6` | `pilots/p6_natural` | Step-0 rates of every natural verifier and the human adjudication of its false positives |
 
 ## What is tracked
 
 | Tracked | Not tracked |
 | --- | --- |
-| Every pilot's `results/report.md` and `results/report.json` | Everything else under `pilots/*/results/` (completions, features, checkpoints, cell dumps) |
-| An audit's `calibration.json`, `forecasts.json` and `lock.json` | `runs/`, `checkpoints/`, `wandb/`, `*.pt`, `*.safetensors`, `*.log` |
-| The P5 gate's `results/gate/report.{md,json}` | Private chat exports (`cursor_*.md`) and any credentials |
+| Every pilot's `results/report.md`, `results/report.json` and `results/decisions.json` | Everything else under `pilots/*/results/` (completions, features, checkpoints, cell dumps) |
+| A pilot audit's `calibration.json`, `forecasts.json` and `lock.json`, and P6's labelled `results/adjudication/*.csv` | `runs/`, `checkpoints/`, `wandb/`, `*.pt`, `*.safetensors`, `*.log` |
+| `configs/throughput.yaml` once P5 has measured it | Private chat exports (`cursor_*.md`) and any credentials |
+| `paper/` sources, `paper/generated/`, `paper/figures/` and `paper/main.pdf` (rebuild with `make paper` after the report changes) | LaTeX build files (`paper/*.aux`, `*.bbl`, `*.blg`, `*.fls`, `*.fdb_latexmk`, `*.out`, `*.log`) |
 
 ## Pull requests
 

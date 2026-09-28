@@ -1,0 +1,52 @@
+# Qwen3-0.6B. Mac pilots and any single CUDA GPU.
+# revision is the Hub commit from https://huggingface.co/api/models/Qwen/Qwen3-0.6B
+# fetched 2026-09-28. params_b is bf16 weight bytes / 2 (751650164), not the
+# marketed 0.6B label. Non-thinking: the chat template's enable_thinking flag.
+name: qwen3-0.6b
+model_id: Qwen/Qwen3-0.6B
+revision: c1899de289a04d12100db370d81485cdf75e47ca
+family: qwen3
+params_b: 0.751650164
+chat_template_kwargs:
+  enable_thinking: false
+lora_keys: [q, k, v, o, gate, up, down]
+dtype: bfloat16
+# CUDA uses flash_attention_2 when the wheel imports. The trainer records sdpa
+# on Apple silicon, CPU, and when flash-attn is missing.
+attn_implementation: flash_attention_2
+gated: false
+lr: 2.0e-5
+placement:
+  # One copy of the 0.6B weights is about 1.5 GB. micro 32 matches the H100
+  # train yaml (512 completions, accumulation 16). vLLM util 0.35 leaves the
+  # rest of the card for the training copy. MLX ignores the vLLM fields.
+  apple-silicon:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 4
+    vllm_gpu_memory_utilization: 0.35
+  h100-80gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 32
+    vllm_gpu_memory_utilization: 0.35
+  a100-80gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 32
+    vllm_gpu_memory_utilization: 0.35
+  a100-40gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 32
+    vllm_gpu_memory_utilization: 0.35
+  rtx-a6000-48gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 32
+    vllm_gpu_memory_utilization: 0.35
+  rtx-5000-ada-32gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 16
+    vllm_gpu_memory_utilization: 0.35

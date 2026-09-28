@@ -16,6 +16,9 @@ explicit ``repetition_penalty=1``, ``top_k=0`` when sampling.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -31,6 +34,31 @@ _DTYPES = {
     "float16": torch.float16,
     "float32": torch.float32,
 }
+
+
+def _read_full_state(path: Path) -> dict[str, torch.Tensor]:
+    """Load a Hugging Face checkpoint directory into one state dict."""
+    single = path / "model.safetensors"
+    if single.is_file():
+        from safetensors.torch import load_file
+
+        return dict(load_file(str(single)))
+    index = path / "model.safetensors.index.json"
+    if index.is_file():
+        from safetensors.torch import load_file
+
+        weight_map = json.loads(index.read_text())["weight_map"]
+        shards: dict[str, torch.Tensor] = {}
+        for filename in sorted(set(weight_map.values())):
+            shards.update(load_file(str(path / filename)))
+        return shards
+    binary = path / "pytorch_model.bin"
+    if binary.is_file():
+        loaded = torch.load(binary, map_location="cpu", weights_only=True)
+        if not isinstance(loaded, dict):
+            raise ValueError(f"{binary} did not contain a state dict")
+        return loaded
+    raise FileNotFoundError(f"{path} has no full-model weights")
 
 
 def _resolve_device(device: str | torch.device | None) -> torch.device:
@@ -163,6 +191,7 @@ class HFGenerator(Generator):
         tokenizer: Any = None,
         local_files_only: bool = False,
         max_prompt_tokens: int | None = None,
+        chat_template_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
         if dtype not in _DTYPES:
             raise ValueError(f"dtype must be one of {sorted(_DTYPES)}, got {dtype!r}")
@@ -175,6 +204,7 @@ class HFGenerator(Generator):
         self.batch_size = int(batch_size)
         self.local_files_only = local_files_only
         self.max_prompt_tokens = max_prompt_tokens
+        self.chat_template_kwargs = None if not chat_template_kwargs else dict(chat_template_kwargs)
         if tokenizer is None:
             tokenizer = AutoTokenizer.from_pretrained(model_id, local_files_only=local_files_only)
         if tokenizer.pad_token_id is None:
@@ -196,6 +226,48 @@ class HFGenerator(Generator):
         self.stop_ids = _stop_ids(self.tokenizer, self.model)
         self.adapter: str | None = None
         self._adapters: dict[str, str] = {}
+        self._full_base_state: dict[str, Any] | None = None
+        self._full_checkpoint: str | None = None
+
+    def load_full_checkpoint(self, path: str | None) -> None:
+        """Replace weights with a full-model checkpoint. ``None`` restores the base.
+
+        The base state is snapshotted on the first call. Tied ``lm_head.weight``
+        may be absent from the file when ``tie_word_embeddings`` is true.
+        """
+        from peft import PeftModel
+
+        target = self.model.get_base_model() if isinstance(self.model, PeftModel) else self.model
+        if path is None:
+            if self._full_base_state is not None:
+                target.load_state_dict(self._full_base_state)
+                self._full_base_state = None
+            self._full_checkpoint = None
+            if isinstance(self.model, PeftModel):
+                self.model.base_model.disable_adapter_layers()
+            self.adapter = None
+            target.eval()
+            return
+        if self._full_base_state is None:
+            self._full_base_state = {
+                key: value.detach().cpu().clone() for key, value in target.state_dict().items()
+            }
+        state = _read_full_state(Path(path))
+        if state and all(key.startswith("module.") for key in state):
+            state = {key[len("module.") :]: value for key, value in state.items()}
+        cast = {key: value.to(dtype=self.dtype) for key, value in state.items()}
+        missing, unexpected = target.load_state_dict(cast, strict=False)
+        allowed_missing = (
+            {"lm_head.weight"} if getattr(target.config, "tie_word_embeddings", False) else set()
+        )
+        if unexpected or set(missing) - allowed_missing:
+            raise RuntimeError(
+                f"{path} does not match this model: missing {sorted(missing)}, "
+                f"unexpected {sorted(unexpected)}"
+            )
+        self._full_checkpoint = str(path)
+        self.adapter = str(path)
+        target.eval()
 
     def set_adapter(self, path: str | None) -> None:
         """Generate with the PEFT LoRA checkpoint at ``path`` (``None``: the base model)."""
@@ -226,6 +298,9 @@ class HFGenerator(Generator):
             "batch_size": self.batch_size,
             "adapter": self.adapter,
             "max_prompt_tokens": self.max_prompt_tokens,
+            "chat_template_kwargs": (
+                None if self.chat_template_kwargs is None else dict(self.chat_template_kwargs)
+            ),
         }
 
     def generate(
@@ -244,7 +319,13 @@ class HFGenerator(Generator):
             return []
         encoded = [
             truncate_prompt_ids(
-                encode_prompt(self.tokenizer, prompt, system_prompt), self.max_prompt_tokens
+                encode_prompt(
+                    self.tokenizer,
+                    prompt,
+                    system_prompt,
+                    chat_template_kwargs=self.chat_template_kwargs,
+                ),
+                self.max_prompt_tokens,
             )
             for prompt in prompts
         ]

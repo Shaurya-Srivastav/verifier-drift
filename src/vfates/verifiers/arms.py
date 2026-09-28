@@ -18,10 +18,9 @@ from __future__ import annotations
 import re
 from abc import abstractmethod
 from collections.abc import Mapping, Sequence
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from vfates.tasks.chain_sum import abs_error
 from vfates.types import DrawKey, Parsed, Problem
 from vfates.utils.hashing import u01
 from vfates.verifiers.base import Verifier
@@ -160,6 +159,65 @@ def literal_hit_matrix(
     return [[int(needle in row) for row in found] for needle in needles]
 
 
+def _coerce_decimal(raw: Any) -> Decimal | None:
+    if raw is None:
+        return None
+    if isinstance(raw, Decimal):
+        value = raw
+    else:
+        try:
+            value = Decimal(str(raw))
+        except InvalidOperation:
+            return None
+    if not value.is_finite():
+        return None
+    return value
+
+
+def _unattached_decimal_error(problem: Problem, parsed: Parsed) -> Decimal | None:
+    """Chain-sum distance used when a tolerance arm was built without a task.
+
+    Calibration and the registry pass the task. This keeps direct constructions
+    that predate the task hook bit-identical on chain-sum parses.
+    """
+    if not parsed.extras:
+        return None
+    raw = parsed.extras.get("value")
+    if raw is None:
+        return None
+    try:
+        value = Decimal(str(raw))
+        gold = Decimal(problem.answer)
+    except InvalidOperation:
+        return None
+    return abs(value - gold)
+
+
+def numeric_abs_error(task: Any, problem: Problem, parsed: Parsed) -> Decimal | None:
+    """Absolute error for a tolerance rule.
+
+    ``task.abs_error`` when a task is attached. ``None`` means the rule does
+    not fire and the row is not a calibration candidate. Without a task, the
+    chain-sum decimal distance is used.
+    """
+    if task is None:
+        raw: Any = _unattached_decimal_error(problem, parsed)
+    else:
+        raw = task.abs_error(problem, parsed)
+    return _coerce_decimal(raw)
+
+
+def answered_support(task: Any, parsed: Parsed) -> bool:
+    """Whether ``parsed`` is in the resampled ``answered`` support.
+
+    Uses ``task.support_answered`` when the task is available. Otherwise a
+    parsed answer, which is the chain-sum rule.
+    """
+    if task is not None and callable(getattr(task, "support_answered", None)):
+        return bool(task.support_answered(parsed))
+    return parsed.answer is not None
+
+
 def _oracle_bit(o: int) -> int:
     bit = int(o)
     if bit not in (0, 1):
@@ -273,16 +331,24 @@ class HashFP(FPRule):
 class NumericToleranceFP(FPRule):
     """Accept a wrong answer whose parsed value is within ``abs_tol`` of gold.
 
-    The comparison is :class:`~decimal.Decimal` absolute error, via
-    :func:`vfates.tasks.chain_sum.abs_error`.
+    The comparison is :class:`~decimal.Decimal` absolute error from
+    ``task.abs_error``. ``None`` does not fire. Without a task the chain-sum
+    decimal distance is used, so existing constructions stay bit-identical.
     """
 
-    def __init__(self, abs_tol: Decimal | str | float, name: str = "tolerance_fp") -> None:
+    def __init__(
+        self,
+        abs_tol: Decimal | str | float,
+        name: str = "tolerance_fp",
+        *,
+        task: Any = None,
+    ) -> None:
         self.abs_tol = abs_tol if isinstance(abs_tol, Decimal) else Decimal(str(abs_tol))
         self.name = name
+        self.task = task
 
     def accepts(self, problem: Problem, parsed: Parsed, text: str) -> bool:
-        err = abs_error(problem, parsed)
+        err = numeric_abs_error(self.task, problem, parsed)
         if err is None:
             return False
         return err <= self.abs_tol
@@ -294,9 +360,9 @@ class NumericToleranceFP(FPRule):
 class ToleranceBandFP(FPRule):
     """Accept a wrong parsed answer with ``lo < |value - gold| <= hi``.
 
-    Absolute error is :func:`vfates.tasks.chain_sum.abs_error`. Unparsed
-    answers are not accepted. ``lo`` is the inner tolerance arm's fitted
-    ``abs_tol``, so the band sits outside that arm's near-miss ball.
+    Absolute error is ``task.abs_error``. Unparsed answers (error ``None``)
+    are not accepted. ``lo`` is the inner tolerance arm's fitted ``abs_tol``,
+    so the band sits outside that arm's near-miss ball.
     """
 
     def __init__(
@@ -304,13 +370,16 @@ class ToleranceBandFP(FPRule):
         lo: Decimal | str | float,
         hi: Decimal | str | float,
         name: str = "tolerance_band_fp",
+        *,
+        task: Any = None,
     ) -> None:
         self.lo = lo if isinstance(lo, Decimal) else Decimal(str(lo))
         self.hi = hi if isinstance(hi, Decimal) else Decimal(str(hi))
         self.name = name
+        self.task = task
 
     def accepts(self, problem: Problem, parsed: Parsed, text: str) -> bool:
-        err = abs_error(problem, parsed)
+        err = numeric_abs_error(self.task, problem, parsed)
         if err is None:
             return False
         return self.lo < err <= self.hi
@@ -488,6 +557,8 @@ class ResampledNoise(Verifier):
         seed: int,
         name: str = "resampled",
         support: str = "all",
+        *,
+        task: Any = None,
     ) -> None:
         if support not in ("all", "answered"):
             raise ValueError(f"support must be 'all' or 'answered', got {support!r}")
@@ -495,6 +566,7 @@ class ResampledNoise(Verifier):
         self.rho1 = float(rho1)
         self.seed = int(seed)
         self.name = name
+        self.task = task
         self.support = support
 
     def verdict(
@@ -513,7 +585,7 @@ class ResampledNoise(Verifier):
         u = u01("resampled", self.seed, *key)
         if bit == 1:
             return int(u >= self.rho1)
-        if self.support == "answered" and parsed.answer is None:
+        if self.support == "answered" and not answered_support(self.task, parsed):
             return 0
         return int(u < self.rho0)
 

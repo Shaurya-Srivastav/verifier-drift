@@ -1,4 +1,4 @@
-"""Run pilot P4: ``python pilots/p4_micro_grpo/run.py [--config ...] [--out ...]``."""
+"""Run pilot P4: ``python pilots/p4_micro_grpo/run.py [--set smoke=true]``."""
 
 from vfates.pilots.common import main_guard
 from vfates.pilots.p4_micro_grpo import run

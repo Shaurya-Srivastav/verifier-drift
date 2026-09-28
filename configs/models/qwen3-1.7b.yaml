@@ -1,0 +1,66 @@
+# Qwen3-1.7B. Fits one GPU on every CUDA class, including 32 GB.
+# revision from https://huggingface.co/api/models/Qwen/Qwen3-1.7B on 2026-09-28.
+# params_b is bf16 weight bytes / 2 (2031739904).
+name: qwen3-1.7b
+model_id: Qwen/Qwen3-1.7B
+revision: 70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+family: qwen3
+params_b: 2.031739904
+chat_template_kwargs:
+  enable_thinking: false
+lora_keys: [q, k, v, o, gate, up, down]
+dtype: bfloat16
+attn_implementation: flash_attention_2
+gated: false
+lr: 2.0e-5
+placement:
+  # About 4 GB per copy. Two copies (train + colocated vLLM) fit a 32 GB card
+  # at micro 8. Larger cards keep micro 32, the same per-device batch as the
+  # 1.5B H100 config. tp stays 1 because the model is not sharded.
+  apple-silicon:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 4
+    vllm_gpu_memory_utilization: 0.35
+  h100-80gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 32
+    vllm_gpu_memory_utilization: 0.35
+  a100-80gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 32
+    vllm_gpu_memory_utilization: 0.35
+  a100-40gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 16
+    vllm_gpu_memory_utilization: 0.35
+  rtx-a6000-48gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 16
+    vllm_gpu_memory_utilization: 0.35
+  rtx-5000-ada-32gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 8
+    vllm_gpu_memory_utilization: 0.40
+# Full-parameter GRPO (GRPOConfig.full_finetune: true) on rtx-a6000-48gb.
+# 2.031739904e9 params are 4.06 GB in bf16. AdamW keeps those parameters in
+# bf16, so one step holds weights, gradients, and two moments: 4 * 4.06 GB
+# = 16.25 GB, plus a colocated vLLM copy of 4.06 GB, about 20.3 GB before
+# activations and the KV cache. One 48 GB card is tight once a GRPO group is
+# resident. Two cards with FSDP FULL_SHARD and vLLM tp 2 put about 10.2 GB
+# of that on each GPU before KV and activations. Launch with
+# configs/accelerate/fsdp_2gpu_full.yaml so the saved checkpoint is one
+# Hugging Face folder (FULL_STATE_DICT) that eval can load. Set
+# gradient_checkpointing: true on the cell. micro 8 gives
+# 512 / (8 * 2) = 32 accumulation steps.
+placement_full:
+  rtx-a6000-48gb:
+    gpus: 2
+    tp: 2
+    micro_batch_size: 8
+    vllm_gpu_memory_utilization: 0.40

@@ -1,0 +1,14 @@
+\begin{tabular}{p{0.16\textwidth}p{0.14\textwidth}p{0.48\textwidth}}
+\toprule
+Hypothesis & Sample & Preregistered test \\
+\midrule
+H1 & Stage A, E1 & Superiority over 0.05 on 12 contrasts; Holm; every seed positive; at least one rejection. \\
+H1-pooled & Stage A, E1 & Equal-weight mean of each kit contrast above 0; at least 3 cells; Holm on the two; one-sided bootstrap. \\
+H2 & Stage A, E1 & TOST at $\pm 0.05$ on 10 prompt-specific contrasts; Holm. \\
+H3 & Stage A pairs & Spearman of locked $\Delta\tau$ with $\Delta$acc; permutation $p < 0.05$; 5th percentile above 0; at least 20 pairs. \\
+H10 & Stage A, E1 & Mean of $\mathrm{sign}(\Delta\tau)\,(\mathrm{acc}_a - \mathrm{acc}_b)$ above 0; Holm on 2 pairs; at least 3 cells. \\
+H7 & Stage A, E1 & Natural minus its resampled control differs from 0; Holm on 5 pairs; sign against locked $\Delta\tau$. \\
+H8 & Stage A, E4 & Mean of screen patch minus error-count patch above 0; at least 2 domains; one-sided bootstrap. \\
+H3-replication & Stage B pairs & The H3 test on stage B pairs only. Stage A does not enter it. \\
+\bottomrule
+\end{tabular}

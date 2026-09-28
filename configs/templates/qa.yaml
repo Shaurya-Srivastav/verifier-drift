@@ -1,0 +1,272 @@
+# Domain template for qa. `vfates program render` fills ${...} placeholders
+# from the model spec and the cell, then keeps the selected menu.
+# Placeholders are whole YAML scalars and must be quoted.
+# core = kit + natural + noise_natural (10). full adds patch_tau, patch_rate,
+# natural_robust, and noise_natural_robust (18). natural_robust is the
+# reported Master-RM judge (sarosavo/Master-RM, revision
+# 9fd43a7a4194a703d02be3fbdcfc276cb046d8e4, base Qwen/Qwen2.5-7B-Instruct).
+# It is outside every confirmatory family. Its control is
+# noise_natural_robust.
+# Max completion tokens: 1024.
+# The general-verifier judge is a separate server at VFATES_JUDGE_BASE_URL
+# (TIGER-Lab/general-verifier, revision dc59c0c82360170cab0be91c91ae545ff32ea896,
+# temperature 0, max_tokens 1024). Its calls are not in the cost model.
+# Verdict cache key: (model id, revision, sha256 of the filled prompt).
+# run_judge_agreement is the IFEval rubric check and does not apply.
+# vfates.tasks.qa.judge_agreement_row feeds agreement_statistics.
+# A human check of about 200 disagreements is preregistered and does not
+# change verdicts.
+# mean_completion_len is an estimate until a pilot measures completions.
+title: qa template
+
+menus:
+  full:
+    - oracle
+    - fp_hash
+    - fp_trigger
+    - fp_trigger_enriched
+    - noise_fp
+    - noise_fp_trigger
+    - noise_fp_trigger_enriched
+    - fn_behavior
+    - fn_behavior_depleted
+    - fn_prompt_subset
+    - noise_fn
+    - noise_fn_depleted
+    - natural
+    - noise_natural
+    - patch_tau
+    - patch_rate
+    - natural_robust
+    - noise_natural_robust
+  core:
+    - oracle
+    - fp_hash
+    - fp_trigger
+    - noise_fp
+    - noise_fp_trigger
+    - fn_behavior
+    - fn_prompt_subset
+    - noise_fn
+    - natural
+    - noise_natural
+
+audit:
+  task:
+    type: qa
+    dataset: TIGER-Lab/WebInstruct-verified
+    revision: 3e8a350b3a935d68fe70bdf379692500abc9ff51
+    hf_split: train
+    # P2 may set one of Primary School, Junior High School, Senior High School,
+    # University, PhD. null keeps every difficulty.
+    difficulty_bucket: null
+    judge:
+      type: llm
+      model: TIGER-Lab/general-verifier
+      revision: dc59c0c82360170cab0be91c91ae545ff32ea896
+      max_tokens: 1024
+  pools: {train: 1024, heldout: 384, seed: 0}
+  generator:
+    backend: vllm
+    model_id: "${model.model_id}"
+    revision: "${model.revision}"
+    chat_template_kwargs: "${model.chat_template_kwargs}"
+    kwargs:
+      gpu_memory_utilization: "${placement.vllm_gpu_memory_utilization}"
+      tensor_parallel_size: "${placement.tp}"
+      seed: 0
+      max_model_len: 4096
+      chat_template_kwargs: "${model.chat_template_kwargs}"
+  sampling: {n: 16, max_tokens: 1024, temperature: 1.0, top_p: 1.0, seed: 0, chunk_prompts: 256}
+  arms: {file: configs/arms/qa.yaml, n_boot: 1000, seed: 0}
+  features:
+    kind: lora_grad
+    model_id: "${model.model_id}"
+    chat_template_kwargs: "${model.chat_template_kwargs}"
+    target_modules: "${model.lora_target_modules}"
+    sketch_dim: 8192
+    lora_r: 16
+    lora_alpha: 32
+    lora_seed: 0
+    sketch_seed: 0
+    load: {dtype: float32, device: cuda}
+  forecast: {n_boot: 1000, reliability_splits: 20, seed: 0, loss_agg: seq_mean}
+  lock: true
+
+study:
+  backend: trl
+  hardware_class: "${cell.hardware_class}"
+  gpus: "${placement.gpus}"
+  seeds: "${cell.seeds}"
+  # apply stays false until P5's two oracle seeds have sample SD of final
+  # held-out accuracy strictly above 0.03. Extra seeds are only H1 and H2 arms
+  # that are also in the selected menu (render drops the rest).
+  seed_rule:
+    apply: false
+    threshold: 0.03
+    extra_seeds: [3, 4]
+    arms:
+      - noise_fp
+      - fp_trigger
+      - noise_fp_trigger
+      - fp_hash
+      - noise_fn
+      - fn_behavior
+      - fn_prompt_subset
+  arms: "${menu.arms}"
+  eval_generator:
+    backend: vllm
+    kwargs:
+      gpu_memory_utilization: "${placement.vllm_gpu_memory_utilization}"
+      tensor_parallel_size: "${placement.tp}"
+      seed: 0
+      max_model_len: 4096
+      chat_template_kwargs: "${model.chat_template_kwargs}"
+  train:
+    model_id: "${model.model_id}"
+    model_revision: "${model.revision}"
+    chat_template_kwargs: "${model.chat_template_kwargs}"
+    steps: 300
+    prompts_per_step: 64
+    group_size: 8
+    max_tokens: 1024
+    eval_max_tokens: 1024
+    temperature: 1.0
+    lr: "${model.lr}"
+    warmup_steps: 10
+    beta_kl: 0.0
+    loss_agg: seq_mean
+    adv_mode: std
+    num_iterations: 1
+    grad_clip: 1.0
+    micro_batch_size: "${placement.micro_batch_size}"
+    gradient_checkpointing: true
+    data_regime: multi_epoch
+    eval_every: 25
+    save_every: 25
+    eval_heldout_n: 384
+    eval_train_n: 128
+    eval_samples_per_prompt: 4
+    eval_temperature: 1.0
+    use_vllm: true
+    vllm_mode: colocate
+    vllm_gpu_memory_utilization: "${placement.vllm_gpu_memory_utilization}"
+    vllm_tensor_parallel_size: "${placement.tp}"
+    lora_seed: 0
+    lora:
+      rank: 16
+      alpha: 32
+      dropout: 0.0
+      keys: "${model.lora_keys}"
+      num_layers: -1
+
+analysis:
+  hypotheses: true
+  final_step: 300
+  margin: 0.05
+  alpha: 0.05
+  level: 0.95
+  n_boot: 10000
+  seed: 0
+  oracle_gain_min: 0.10
+  j_split: train
+  allow_partial_menu: false
+  withdrawal: {rate_miss_max: 0.02}
+  knife_edge: {rise: 0.05, fall: 0.10}
+  early: {enabled: true, seed: 99, steps: 25}
+  # Judge serving is not the IFEval agreement_check. See the file header.
+  judge:
+    model: TIGER-Lab/general-verifier
+    revision: dc59c0c82360170cab0be91c91ae545ff32ea896
+    temperature: 0
+    max_tokens: 1024
+    base_url_env: VFATES_JUDGE_BASE_URL
+    cache_key: [model, revision, prompt_sha256]
+  by_menu:
+    full:
+      h1:
+        contrasts:
+          - {control: noise_fp_trigger, arm: fp_trigger}
+          - {control: noise_fn, arm: fn_behavior}
+        beside: []
+      h2:
+        contrasts:
+          - {control: noise_fp, arm: fp_hash}
+          - {control: noise_fn, arm: fn_prompt_subset}
+      h3:
+        min_pairs: 4
+        pairs:
+          - {arm: fp_hash, control: noise_fp}
+          - {arm: fp_trigger, control: noise_fp_trigger}
+          - {arm: fp_trigger_enriched, control: noise_fp_trigger_enriched}
+          - {arm: fn_behavior, control: noise_fn}
+          - {arm: fn_behavior_depleted, control: noise_fn_depleted}
+          - {arm: fn_prompt_subset, control: noise_fn}
+          - {arm: natural, control: noise_natural}
+      h10:
+        pairs:
+          - {a: fp_trigger_enriched, b: fp_trigger}
+          - {a: fn_behavior_depleted, b: fn_behavior}
+      h4:
+        shared: [fp_trigger, fp_trigger_enriched, fn_behavior, fn_behavior_depleted]
+        prompt_specific: [fp_hash, fn_prompt_subset]
+        shared_min: 0.65
+        prompt_specific_max: 0.60
+      natural: {natural: natural, control: noise_natural, oracle: oracle}
+      h8:
+        arm: patch_tau
+        baseline: patch_rate
+      # Outside h1, h2, h3, h4, and natural. Full cells only.
+      reported:
+        - {arm: natural_robust, control: noise_natural_robust, kind: natural}
+    core:
+      h1:
+        contrasts:
+          - {control: noise_fp_trigger, arm: fp_trigger}
+          - {control: noise_fn, arm: fn_behavior}
+        beside: []
+      h2:
+        contrasts:
+          - {control: noise_fp, arm: fp_hash}
+          - {control: noise_fn, arm: fn_prompt_subset}
+      h3:
+        min_pairs: 4
+        pairs:
+          - {arm: fp_hash, control: noise_fp}
+          - {arm: fp_trigger, control: noise_fp_trigger}
+          - {arm: fn_behavior, control: noise_fn}
+          - {arm: fn_prompt_subset, control: noise_fn}
+          - {arm: natural, control: noise_natural}
+      h4:
+        shared: [fp_trigger, fn_behavior]
+        prompt_specific: [fp_hash, fn_prompt_subset]
+        shared_min: 0.65
+        prompt_specific_max: 0.60
+      natural: {natural: natural, control: noise_natural, oracle: oracle}
+
+# Token rates are single-GPU H100 rates at reference_params_b.
+# Judge calls are served separately and are not in this model.
+# full_runs is 18 arms x 3 seeds. The seed rule's 7 arms add 2 seeds each
+# (68) when apply is true. full_runs is not read by the planner.
+# mean_completion_len is an estimate, not a measured length.
+cost_model:
+  reference_params_b: 1.7
+  mean_completion_len: 450
+  steps: 300
+  prompts_per_step: 64
+  group_size: 8
+  full_runs: 54
+  full_runs_if_extra_seeds: 68
+  early_runs: 18
+  early_steps: 25
+  eval_every: 25
+  eval_prompts: 384
+  eval_train_prompts: 128
+  eval_samples: 4
+  transfer_prompts: 384
+  audit_prompts: 1408
+  audit_samples: 16
+  h100_gen_tok_s: 10000
+  h100_train_tok_s: 30000
+  overhead: 1.25
+  usd_per_h100_hour: 2.5

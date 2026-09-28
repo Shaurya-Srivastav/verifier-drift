@@ -1,42 +1,49 @@
-# P3: estimator pilot
+# P3 estimator
 
-Runs the E1 audit on the Mac pilot model, checks the step-0 estimator before any training, and locks the forecasts that P4 is scored against.
+Question: on the development pool, with the E1 cell's arms, is `g_V` reliable, does the sketch preserve inner products, do bf16 features agree with float32, and does the lock verify?
 
-The committed run is [`results/report.md`](results/report.md) and the lock is [`results/audit/lock.json`](results/audit/lock.json).
+## Rule
 
-## What each check is for
+Per domain, on the dev split, with the E1 arms and the cell's pool sizes where the dev split allows. A smaller pool than the E1 train pool is conservative for split-half reliability.
 
-| Check | Claim |
-| --- | --- |
-| P3.1 | Documented: held-out base accuracy and pass@16 coverage of the audit cell. |
-| P3.2 | The velocity direction `g_V` of the oracle arm is stable: mean cosine between `g` estimated on disjoint halves of the train prompts is at least `gates.reliability`. |
-| P3.3 | The same for the least reliable arm, so no forecast rests on an unstable direction. |
-| P3.10 | Documented: a noise model of `g_V` (`reliability_budget`). With `signal = \|E c_p\|^2` and `noise = tr Cov(c_p)` over prompt contributions `c_p`, the split-half cosine on `m` prompts per half is about `signal / (signal + noise / m)`. The report gives the largest gap between predicted and measured cosine (marked as passing at or below `gates.noise_model_gap`, 0.05), the share of the noise that is within-prompt sampling noise (the mean jackknife variance of `c_p`, not capped at 1), and the train pool that would reach `gates.reliability`. |
-| P3.4 | CountSketch preserves inner products of exact LoRA-B gradients: on `fidelity.n` completions drawn from the train split only, the off-diagonal Gram entries of the sketched and exact gradients correlate at least `gates.sketch_corr`. Held-out rows are not in this subset. |
-| P3.5 | Documented: the prompt-specific false positive (`fp_hash`) is not linearly decodable from step-0 features on unseen prompts (prompt-grouped cross-validated AUC at most `gates.hash_auc_max`). There is no shared feature for training to amplify. |
-| P3.6 | Documented: at least one shared false positive (`fp_tolerance`, `fp_trigger`) is decodable on unseen prompts (AUC at least `gates.shared_auc_min`): the mechanism that makes a fixed error transfer is visible at step 0. |
-| P3.7 | Documented: pooled hidden states rank the arms' `tau_pool` like LoRA-B gradients (Spearman across arms). The cheap feature map is an ablation, not the estimator. Batch widths are rounded up to a multiple of 64 (`pad_multiple`): at exact widths every new shape left about 0.2 GiB of MPS graph buffers behind, and the first 1,024-prompt run ran out of memory at part 10 of 44. The rounding changed no row by more than 4.3e-7 relative to the exact-width features. |
-| P3.8 | The forecasts are locked (SHA-256 over the canonical payload, config, and artifact hashes) before P4 trains a step. |
-| P3.9 | Documented, not a gate. Features are extracted again with `lora_seed: 1` into `lora_seed_1/` (a sibling of the audit). The report gives the Spearman of `tau_pool` across arms and the max absolute difference of `tau_pool` between seeds 0 and 1. That is evidence the screen does not hinge on one draw of LoRA A. The result is cached in `lora_seed_sensitivity.json`. |
+Gated. A domain that fails any of these fails the pilot.
 
-The forecasted fates (which arm is predicted to generalise) are reported in the "Locked forecasts" table and are not gated: gating on the prediction the study tests would be circular. P4 scores them.
+| Id | Check | Threshold |
+| --- | --- | --- |
+| P3.2 | Split-half cosine of `g_V` for oracle and natural arms (worst arm). Empty oracle/natural group fails. | >= 0.8 |
+| P3.3 | Same cosine for every other forecast arm: targeted, resampled, patch, random | >= 0.8 |
+| P3.4 | CountSketch off-diagonal Gram correlation against exact LoRA-B gradients, train rows | >= 0.95 |
+| P3.11 | `bf16_float32_gate` and `direction_agreement` on at least 256 rows | both cosines > 0.99 |
+| P3.8 | The lock verifies | verify |
 
-## How to run
+Oracle and natural types are `oracle`, `math_lenient`, `math_strip_string`, `code_public_tests`, `ifeval_checker`, `model_judge`, `master_rm`, `natural_string_match`, and `string_match`, plus a name `natural` or `natural_*`. Resampled arms and names that start with `noise_` are P3.3.
+
+Documented, not gates: P3.5 prompt-specific FP AUC at most 0.60, P3.6 shared FP AUC at least 0.65, P3.9 LoRA seed sensitivity, P3.10 noise-model gap at most 0.05. A hidden-state ablation, if a config asks for one, does not divide by length. It is not a go/no-go check.
+
+Smoke does not score the numbers and does not write a decision. The thresholds are not loosened.
+
+## Hardware and commands
+
+Mac smoke:
 
 ```bash
-python pilots/p3_estimator/run.py          # or: vfates pilot p3
+python pilots/p3_estimator/run.py --set smoke=true
 ```
 
-Every stage is resumable: sampling appends to `completions.jsonl`, features are cached in `feature_parts/`, and the fidelity and probe results are cached next to the report. Delete `results/` to start over. Never delete or edit `results/audit/lock.json` after P4 has started.
+Study gates, qwen3-1.7b, development pool. The execute path rescores the first 256 feature rows in bf16 with the audit's LoRA A and compares them to the float32 rows. chain_sum and math use `rtx-a6000-48gb`. code, ifeval, and qa use `rtx-5000-ada-32gb`.
 
-## Configuration
-
-The task cell is written out in `config.yaml` (P2's recommendation for the pilot model), so the locked configuration is the one on disk. The arms come from `configs/arms/chain_sum.yaml` and are fitted on the train pool only; held-out samples never touch calibration. Pools have E1's counts (not its model or task cell): 1,024 train and 384 held-out prompts with 16 samples each, which gives `tau_pool` at `q = 1/32` a 192-sample held-out tail. They are disjoint at the question level from E1's pools and from P5's H100 development pool. P1 and the P5 dry run use the same cell and seed, so their toy pools are the first 24 and 12 questions of these. A first audit with 256 train and 128 held-out prompts failed P3.2 and P3.3 (see the decision log in [`../README.md`](../README.md)); its questions are the first 256 and 128 of these pools. This is the last P3 size. P4 trains on the first 256 train prompts only (`max_train` in its config). Sampling stays at `max_tokens: 512`. The forecast block sets `loss_agg: seq_mean`, the same aggregation P4 trains with, so the locked screen divides sum-gradients by completion length.
+```bash
+python pilots/p3_estimator/run.py --set smoke=false --set execute=true --set hardware_class=rtx-a6000-48gb
+```
 
 ## Runtime
 
-About 8 hours on a Mac Studio with an M4 Max. This is an extrapolation from the stage logs of the 256-prompt audit (6,144 completions), not yet a measured run: sampling 22,528 completions with MLX (about 2.2 hours at 36 minutes per 6,144), calibration (about 1.2 hours), LoRA-B gradient features in float32 on MPS (about 1.4 hours), the same feature pass again at `lora_seed` 1 (about 1.4 hours), hidden-state features (about 25 minutes), the forecasts and their bootstrap, 48 exact train-split gradients for the fidelity check, and the probe. Every stage is cached, so an interrupted run resumes.
+About 10 GPU-hours. Basis, not a measurement: 5 domains, 1408 prompts, 16 samples, about 400 tokens, about 3500 tokens/s is about 3.6 hours of generation, plus a feature pass and a second LoRA-seed pass. A short dev split reduces this. The estimate assumes the E1 pool fits in the dev split.
 
-## Expected outcome
+## Files
 
-Exit code 0 and summary `PASS`: the estimator checks (P3.2, P3.3, P3.4, P3.8) gate. P3.5 and P3.6 are documented. A miss there is informative rather than fatal to the study: it says the step-0 features do not separate prompt-specific from shared errors on this model, and training decides whether the fates differ.
+`results/report.json`, `results/report.md`, and on a real screen `results/decisions.json` (schema `vfates.p3_decisions/1`). Each domain is `pass` or `fail` with the failed check ids. `apply` is false on smoke and on a report that did not execute. A failing domain fails the pilot. The lead does not edit a template from a smoke file.
+
+## How this feeds the study
+
+A domain that fails P3.2, P3.3, P3.4, P3.11, or P3.8 does not enter the GPU study. Documented checks are reported beside the decision and do not by themselves drop the domain.

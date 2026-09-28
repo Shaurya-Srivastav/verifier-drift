@@ -9,13 +9,17 @@ the smaller threshold.
 Phrase arms add a sign preference inside a tolerance of the target, using the
 within-prompt association between the phrase indicator and ``O`` (the mean over
 rows of ``(b - mean_p(b)) * (O - mean_p(O))``). ``not_enriched`` keeps triggers
-whose association is ``<= 0``. ``enriched`` keeps behaviors whose association
-is ``> 0``. The marginal advantage and the accuracy lift are still reported.
-If nothing in tolerance has the preferred sign, the closest phrase is used and
-the report sets ``fell_back``. Auto n-grams that contain a digit are dropped.
-Candidate proposal and the sign use the prompts with
-``u01("phrase_validation", pid) >= 0.125``; the other eighth validates the
-sign. The rate tolerance is measured on the full train pool, where every
+whose association is ``<= 0``. ``enriched`` keeps phrases whose association is
+``> 0`` (a behavior, or a trigger that prefers correct answers). ``depleted``
+keeps behaviors whose association is ``< 0``. The marginal advantage and the
+accuracy lift are still reported. If nothing in tolerance has the preferred
+sign, the closest phrase is used and the report sets ``fell_back``. Auto
+n-grams that contain a digit are dropped. Candidate proposal and the sign use
+the prompts with ``u01("phrase_validation", pid) >= 0.125``; the other eighth
+validates the sign. An enriched phrase passes when that held-out association
+is ``> 0``. A depleted phrase passes when it is ``< 0``. A ``not_enriched``
+trigger passes when the held-out association is ``<= 0`` or its interval
+covers 0. The rate tolerance is measured on the full train pool, where every
 other arm is fitted and where the channel rate is reported, so a phrase that
 did not fall back is inside the tolerance of its target.
 
@@ -40,7 +44,7 @@ from typing import Any, cast
 import numpy as np
 
 from vfates.forecast.confusion import confusion_with_ci
-from vfates.tasks.chain_sum import FORM_RULES, abs_error
+from vfates.tasks.chain_sum import FORM_RULES
 from vfates.types import Completion, Parsed, Problem
 from vfates.utils.hashing import u01
 from vfates.utils.io import write_json
@@ -60,8 +64,10 @@ from vfates.verifiers.arms import (
     StringMatchVerifier,
     ToleranceBandFP,
     TriggerFP,
+    answered_support,
     contains_pattern,
     literal_hit_matrix,
+    numeric_abs_error,
     phrase_start,
 )
 from vfates.verifiers.base import Verifier
@@ -91,8 +97,8 @@ _RATE_METRICS = (
 _PHRASE_VALIDATION_SALT = "phrase_validation"
 _PHRASE_VALIDATION_FRACTION = 0.125
 _PHRASE_VALIDATION_ALPHA = 0.10
-_TRIGGER_PREFER = frozenset({"not_enriched", "closest"})
-_BEHAVIOR_PREFER = frozenset({"enriched", "closest"})
+_TRIGGER_PREFER = frozenset({"not_enriched", "enriched", "closest"})
+_BEHAVIOR_PREFER = frozenset({"enriched", "depleted", "closest"})
 _BAND_CAP = 0.02
 _EARLY_CHARS = 40
 
@@ -239,19 +245,21 @@ def calibrate_tolerance_fp(
     target_fpr: float,
     *,
     name: str = "tolerance_fp",
+    task: Any = None,
 ) -> tuple[NumericToleranceFP, dict[str, Any]]:
     """Smallest-distance absolute tolerance, in :class:`~decimal.Decimal`.
 
-    Unparsable wrong rows are never accepted and stay in the denominator.
-    ``|error| <= tol`` is the acceptance test, so each distinct error is one
-    candidate and the accept-none candidate is included.
+    Unparsable wrong rows (``task.abs_error`` is ``None``) are never accepted
+    and stay in the denominator. ``|error| <= tol`` is the acceptance test, so
+    each distinct error is one candidate and the accept-none candidate is
+    included.
     """
     wrong = [row for row in data.rows if row.O == 0]
     if not wrong:
         raise ValueError("tolerance_fp calibration needs at least one wrong row")
     errors: list[Decimal] = []
     for row in wrong:
-        err = abs_error(data.problems[row.pid], row.parsed)
+        err = numeric_abs_error(task, data.problems[row.pid], row.parsed)
         if err is not None:
             errors.append(err)
     counts: dict[Decimal, int] = {}
@@ -277,7 +285,7 @@ def calibrate_tolerance_fp(
     actual = sum(1 for err in errors if err <= tol)
     if actual != accepted:
         raise RuntimeError(f"tolerance {tol} accepts {actual} rows, expected {accepted}")
-    verifier = NumericToleranceFP(tol, name=name)
+    verifier = NumericToleranceFP(tol, name=name, task=task)
     report = {
         "abs_tol": format(tol, "f"),
         "achieved_fpr": accepted / n_wrong,
@@ -296,6 +304,7 @@ def calibrate_tolerance_band_fp(
     *,
     name: str = "tolerance_band_fp",
     inner: str | None = None,
+    task: Any = None,
 ) -> tuple[ToleranceBandFP, dict[str, Any]]:
     """Smallest observed ``hi`` with ``lo < |error| <= hi`` closest to ``target_fpr``.
 
@@ -310,7 +319,7 @@ def calibrate_tolerance_band_fp(
         raise ValueError("tolerance_band_fp calibration needs at least one wrong row")
     parsed_rows: list[tuple[Decimal, CalibrationRow]] = []
     for row in wrong:
-        err = abs_error(data.problems[row.pid], row.parsed)
+        err = numeric_abs_error(task, data.problems[row.pid], row.parsed)
         if err is not None:
             parsed_rows.append((err, row))
     if not parsed_rows:
@@ -329,7 +338,7 @@ def calibrate_tolerance_band_fp(
     actual = sum(1 for err, _row in parsed_rows if bound < err <= hi)
     if actual != accepted:
         raise RuntimeError(f"band hi {hi} accepts {actual} rows, expected {accepted}")
-    verifier = ToleranceBandFP(bound, hi, name=name)
+    verifier = ToleranceBandFP(bound, hi, name=name, task=task)
     achieved = accepted / n_wrong
     band_abs, band_rel = _error_medians(data, parsed_rows, lambda err: bound < err <= hi)
     tol_abs, tol_rel = _error_medians(data, parsed_rows, lambda err: err <= bound)
@@ -375,8 +384,9 @@ def select_trigger_fp(
     contain a digit are dropped. Scoring uses the same token-span test as
     :class:`TriggerFP`. ``prefer='not_enriched'`` keeps phrases whose
     within-prompt association with ``O`` is ``<= 0`` inside ``tolerance`` of
-    the target. The marginal advantage is still reported. Regex candidates
-    must be passed explicitly and keep raw regex semantics.
+    the target. ``prefer='enriched'`` keeps phrases whose association is
+    ``> 0`` inside that tolerance. The marginal advantage is still reported.
+    Regex candidates must be passed explicitly and keep raw regex semantics.
     """
     if prefer not in _TRIGGER_PREFER:
         known = ", ".join(sorted(_TRIGGER_PREFER))
@@ -388,7 +398,7 @@ def select_trigger_fp(
         rate_key="fpr",
         prefer=prefer,
         tolerance=float(tolerance),
-        want_positive=False,
+        want_positive=prefer == "enriched",
         pool="wrong",
         candidates=candidates,
         ngram_range=ngram_range,
@@ -515,10 +525,12 @@ def select_behavior_fn(
     """Pick a behavior phrase whose train-pool FNR is closest to the target.
 
     ``prefer='enriched'`` keeps phrases with positive within-prompt association
-    inside ``tolerance``. Auto candidates are word n-grams from correct
-    responses on the fitting prompts; spans containing a digit are dropped.
-    Lift is undefined for a phrase present in every fit row or in none; those
-    phrases are dropped. The marginal lift is still reported.
+    inside ``tolerance``. ``prefer='depleted'`` keeps phrases whose association
+    is negative (``< 0``) inside ``tolerance``. Auto candidates are word
+    n-grams from correct responses on the fitting prompts; spans containing a
+    digit are dropped. Lift is undefined for a phrase present in every fit
+    row or in none; those phrases are dropped. The marginal lift is still
+    reported.
     """
     if prefer not in _BEHAVIOR_PREFER:
         known = ", ".join(sorted(_BEHAVIOR_PREFER))
@@ -530,7 +542,7 @@ def select_behavior_fn(
         rate_key="fnr",
         prefer=prefer,
         tolerance=float(tolerance),
-        want_positive=True,
+        want_positive=prefer != "depleted",
         pool="correct",
         candidates=candidates,
         ngram_range=ngram_range,
@@ -553,6 +565,7 @@ def resampled_matched(
     name: str = "resampled",
     support: str = "all",
     answered_wrong: float = 1.0,
+    task: Any = None,
 ) -> tuple[ResampledNoise, dict[str, Any]]:
     """Noise arm whose expected pooled rates are the supplied ``(FPR, FNR)``.
 
@@ -569,7 +582,7 @@ def resampled_matched(
         rho0 = float(fpr) / float(answered_wrong)
     else:
         rho0 = float(fpr)
-    verifier = ResampledNoise(rho0, float(fnr), int(seed), name=name, support=support)
+    verifier = ResampledNoise(rho0, float(fnr), int(seed), name=name, support=support, task=task)
     report = {
         "rho0": rho0,
         "rho1": float(fnr),
@@ -608,14 +621,21 @@ def calibrate_arms(
     arms: dict[str, Verifier] = {}
     arm_reports: dict[str, dict[str, Any]] = {}
     labels, pid = _labels(data)
+    pending: list[dict[str, Any]] = []
+    pending_names: set[str] = set()
     for raw in specs:
         spec = dict(raw)
         if "name" not in spec or "type" not in spec:
             raise ValueError("each arm spec needs 'name' and 'type'")
         name = str(spec["name"])
         typ = str(spec["type"])
-        if name in arms:
+        if name in arms or name in pending_names:
             raise ValueError(f"duplicate arm name {name!r}")
+        if typ == "patch_select":
+            _check_patch_select(spec, name, arms)
+            pending.append(dict(spec))
+            pending_names.add(name)
+            continue
         verifier, details, channel = _fit_arm(
             task, data, spec, name, typ, seed, n_boot, global_targets, arms, arm_reports
         )
@@ -666,6 +686,8 @@ def calibrate_arms(
         "n_prompts": len({row.pid for row in data.rows}),
         "arms": arm_reports,
     }
+    if pending:
+        report["patch_select"] = pending
     return CalibrationResult(arms=arms, report=report)
 
 
@@ -687,7 +709,7 @@ def _fit_arm(
         return OracleVerifier(name=name), {}, None
     if typ == "string_match":
         return StringMatchVerifier(name=name), {}, None
-    if typ in ("mbpp_base_tests", "ifeval_checker"):
+    if typ == "ifeval_checker":
         # Fixed natural verifiers. No target is fitted. The pooled train rates
         # are the channel a matched resampled arm copies.
         from vfates.verifiers.registry import build_verifier
@@ -700,7 +722,7 @@ def _fit_arm(
         return verifier, details, None
     if typ == "tolerance_fp":
         verifier, details = calibrate_tolerance_fp(
-            data, _target(spec, targets, "fpr", name), name=name
+            data, _target(spec, targets, "fpr", name), name=name, task=task
         )
         return verifier, details, None
     if typ == "tolerance_band_fp":
@@ -723,6 +745,7 @@ def _fit_arm(
             inner.abs_tol,
             name=name,
             inner=str(inner_name),
+            task=task,
         )
         return verifier, details, None
     if typ == "trigger_fp":
@@ -776,7 +799,12 @@ def _fit_arm(
         )
         return verifier, details, None
     if typ == "resampled":
-        if spec.get("match"):
+        has_match = bool(spec.get("match"))
+        has_rates = spec.get("rates") is not None
+        if has_match and has_rates:
+            raise ValueError(f"resampled arm {name!r} sets both match and rates")
+        declared = False
+        if has_match:
             other = spec["match"]
             if other not in arm_reports:
                 raise KeyError(
@@ -786,6 +814,18 @@ def _fit_arm(
             rho0 = float(arm_reports[other]["achieved_fpr"])
             rho1 = float(arm_reports[other]["achieved_fnr"])
             matched = other
+        elif has_rates:
+            rates = spec["rates"]
+            if not isinstance(rates, Mapping) or "fpr" not in rates or "fnr" not in rates:
+                raise ValueError(f"resampled arm {name!r} rates must be a mapping with fpr and fnr")
+            rho0 = float(rates["fpr"])
+            rho1 = float(rates["fnr"])
+            if not 0.0 <= rho0 <= 1.0 or not 0.0 <= rho1 <= 1.0:
+                raise ValueError(
+                    f"resampled arm {name!r} rates must lie in [0, 1], got {(rho0, rho1)}"
+                )
+            matched = None
+            declared = True
         else:
             rho0 = float(_need_field(spec, "rho0"))
             rho1 = float(_need_field(spec, "rho1"))
@@ -794,12 +834,20 @@ def _fit_arm(
         support = str(spec.get("support", "all"))
         wrong = [row for row in data.rows if row.O == 0]
         answered = (
-            sum(row.parsed.answer is not None for row in wrong) / len(wrong) if wrong else 1.0
+            sum(answered_support(task, row.parsed) for row in wrong) / len(wrong) if wrong else 1.0
         )
         verifier, details = resampled_matched(
-            rho0, rho1, noise_seed, name=name, support=support, answered_wrong=answered
+            rho0,
+            rho1,
+            noise_seed,
+            name=name,
+            support=support,
+            answered_wrong=answered,
+            task=task,
         )
         details["matched_arm"] = matched
+        if declared:
+            details["rates_declared"] = True
         return verifier, details, (rho0, rho1)
     if typ == "composite":
         fn_rules = [_take_rule(arms, item, FNRule, "fn") for item in spec.get("fn", [])]
@@ -809,7 +857,26 @@ def _fit_arm(
         )
         details = {"fn": list(spec.get("fn", [])), "fp": list(spec.get("fp", []))}
         return verifier, details, None
+    if task is not None and typ in getattr(task, "verifier_types", ()):
+        from vfates.verifiers.registry import build_verifier
+
+        return build_verifier(spec, task), {}, None
     raise ValueError(f"unknown arm type {typ!r}")
+
+
+def _check_patch_select(spec: Mapping[str, Any], name: str, arms: Mapping[str, Verifier]) -> None:
+    """Record a patch menu. The categories are chosen after features exist."""
+    base = spec.get("base")
+    if not isinstance(base, str) or not base:
+        raise ValueError(f"patch arm {name!r} needs a string 'base'")
+    if base not in arms:
+        raise KeyError(f"patch arm {name!r} base {base!r} is missing; specs are applied in order")
+    by = spec.get("by")
+    if by not in ("tau", "rate"):
+        raise ValueError(f"patch arm {name!r} by must be 'tau' or 'rate', got {by!r}")
+    k = spec.get("k")
+    if isinstance(k, bool) or not isinstance(k, int) or k < 1:
+        raise ValueError(f"patch arm {name!r} k must be a positive int, got {k!r}")
 
 
 def _arm_targets(
@@ -1024,6 +1091,17 @@ def _ngrams(text: str, lo: int, hi: int, min_chars: int) -> set[str]:
     return grams
 
 
+def _phrase_sign_ok(association: float, prefer: str) -> bool:
+    """Whether ``association`` has the sign ``prefer`` asks for inside tolerance."""
+    if association != association:
+        return False
+    if prefer == "enriched":
+        return association > 0.0
+    if prefer == "depleted":
+        return association < 0.0
+    return association <= 0.0
+
+
 def _pick_phrase(
     scored: list[dict[str, Any]],
     *,
@@ -1047,14 +1125,11 @@ def _pick_phrase(
     if prefer == "closest":
         pool = list(scored)
     else:
-        if want_positive:
-            pool = [
-                row for row in scored if row[sign_key] > 0 and distance(row) <= tolerance + 1e-12
-            ]
-        else:
-            pool = [
-                row for row in scored if row[sign_key] <= 0 and distance(row) <= tolerance + 1e-12
-            ]
+        pool = [
+            row
+            for row in scored
+            if _phrase_sign_ok(row[sign_key], prefer) and distance(row) <= tolerance + 1e-12
+        ]
         if not pool:
             pool = list(scored)
             fell_back = True
@@ -1226,8 +1301,10 @@ def _select_phrase(
     val_assoc, val_lo, val_hi = _validation_association(
         val_rows, val_flags, n_boot=n_boot, seed=seed
     )
-    if kind == "trigger":
+    if kind == "trigger" and prefer != "enriched":
         validated = _trigger_validated(val_assoc, val_lo, val_hi)
+    elif prefer == "depleted":
+        validated = _depleted_validated(val_assoc)
     else:
         validated = _behavior_validated(val_assoc)
     diagnostics = _phrase_diagnostics(
@@ -1291,9 +1368,13 @@ def arm_validity(calibration_report: Mapping[str, Any]) -> dict[str, dict[str, A
 
     ``targeted`` is true for arms fitted to a rate target (``hash_fp``,
     ``tolerance_fp``, ``tolerance_band_fp``, ``trigger_fp``, ``behavior_fn``,
-    ``prompt_subset_fn``). ``form_fn`` is capped by design
-    (``targeted`` false, ``capped`` true). Resampled arms are not targeted.
-    ``rate_miss`` is ``|channel rate - target|`` on the targeted rate, else
+    ``prompt_subset_fn``) and for a resampled arm that declares ``rates``.
+    ``form_fn`` is capped by design (``targeted`` false, ``capped`` true).
+    A matched resampled arm is not targeted. ``rate_miss`` is
+    ``|channel rate - target|`` on the targeted rate. For a declared-rate
+    resampled arm it is the larger of ``|realised fpr - declared fpr|`` and
+    ``|realised fnr - declared fnr|``, the same absolute-error rule a matched
+    arm would use against its copied channel. Otherwise ``rate_miss`` is
     ``None``. ``fell_back`` and ``validated`` come from phrase-arm details
     (``validated`` is ``None`` when the arm has no sign check). ``capped`` is
     true for ``form_fn`` and for a tolerance band whose achieved FPR misses
@@ -1306,8 +1387,14 @@ def arm_validity(calibration_report: Mapping[str, Any]) -> dict[str, dict[str, A
         details = entry.get("details") or {}
         if not isinstance(details, Mapping):
             details = {}
-        targeted = typ in _TARGETED_RATE
-        rate_miss = _targeted_rate_miss(entry, _TARGETED_RATE[typ]) if targeted else None
+        declared_rates = typ == "resampled" and bool(details.get("rates_declared"))
+        targeted = typ in _TARGETED_RATE or declared_rates
+        if declared_rates:
+            rate_miss = _declared_rate_miss(entry)
+        elif targeted:
+            rate_miss = _targeted_rate_miss(entry, _TARGETED_RATE[typ])
+        else:
+            rate_miss = None
         if typ == "form_fn":
             capped = True
         elif typ == "tolerance_band_fp":
@@ -1338,6 +1425,25 @@ def _validity_arms(calibration_report: Mapping[str, Any]) -> Mapping[str, Any]:
     if isinstance(arms, Mapping):
         return arms
     raise KeyError("calibration report has no arms")
+
+
+def _declared_rate_miss(entry: Mapping[str, Any]) -> float | None:
+    """Larger absolute miss of the realised draw against the declared rates."""
+    realised = entry.get("realised")
+    if not isinstance(realised, Mapping):
+        return None
+    misses: list[float] = []
+    for kind in ("fpr", "fnr"):
+        target = entry.get(f"target_{kind}")
+        rate = realised.get(kind)
+        if target is None or rate is None:
+            return None
+        rate_f = float(rate)
+        target_f = float(target)
+        if rate_f != rate_f or target_f != target_f:
+            return None
+        misses.append(abs(rate_f - target_f))
+    return max(misses)
 
 
 def _targeted_rate_miss(entry: Mapping[str, Any], kind: str) -> float | None:
@@ -1457,6 +1563,10 @@ def _trigger_validated(association: float, lo: float, hi: float) -> bool:
 
 def _behavior_validated(association: float) -> bool:
     return association == association and association > 0.0
+
+
+def _depleted_validated(association: float) -> bool:
+    return association == association and association < 0.0
 
 
 def _match_flags(

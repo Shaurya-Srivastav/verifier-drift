@@ -1,159 +1,17 @@
-# P5: the GPU gate. mode defaults to dry_run without CUDA and full with it.
-# Mac dry run: about 4 min on MPS. Full gate: one H100 80GB.
-# Scientific go/no-go of the full gate: oracle held-out gain >= 0.10.
-# Fate contrasts are logged and do not gate. See launch_h100.sh.
-mode: null
-
-# ---------------------------------------------------------------- dry run (Mac)
-audit:
-  task: {type: chain_sum, min_terms: 2, max_terms: 3, min_digits: 1, max_digits: 3,
-         min_decimal_places: 1, max_decimal_places: 2}
-  pools: {train: 24, heldout: 12, seed: 0}
-  generator:
-    backend: hf
-    model_id: Qwen/Qwen2.5-0.5B-Instruct
-    kwargs: {dtype: float32, batch_size: 16}
-  # P1's audit shape. At 96 tokens 46 of 48 completions hit the cap and no
-  # train row was correct, so no FN arm could be calibrated.
-  sampling: {n: 4, max_tokens: 256, temperature: 1.0, seed: 0, chunk_prompts: 12}
-  # P1's toy arm list, one per calibration family that 96 completions can fit.
-  # The full arm file needs a real-size audit: the decoy needs parsable wrong
-  # answers and the phrase arms need a fit and a validation split. The full gate
-  # below calibrates the whole file.
-  arms:
-    targets: {fpr: 0.15, fnr: 0.30}
-    n_boot: 20
-    seed: 0
-    arms:
-      - {name: oracle, type: oracle}
-      - {name: fp_hash, type: hash_fp, salt: chain_sum/fp_hash}
-      - {name: fp_tolerance, type: tolerance_fp}
-      - {name: noise_fp, type: resampled, match: fp_tolerance, seed: 0}
-      - {name: fn_prompt_subset, type: prompt_subset_fn, salt: chain_sum/fn_prompt_subset}
-  features: {kind: lora_grad, model_id: Qwen/Qwen2.5-0.5B-Instruct, sketch_dim: 256,
-             load: {dtype: float32}}
-  forecast: {n_boot: 10, reliability_splits: 4, loss_agg: seq_mean}
-  lock: true
-
-train_arm: fp_tolerance
-train:
-  model_id: Qwen/Qwen2.5-0.5B-Instruct
-  steps: 2
-  prompts_per_step: 4
-  group_size: 4
-  max_tokens: 256
-  micro_batch_size: 4
-  eval_every: 1
-  eval_heldout_n: 4
-  eval_train_n: 4
-  eval_samples_per_prompt: 2
-  eval_max_tokens: 256
-  save_every: 1
-  use_vllm: false
-  lora: {rank: 16, alpha: 32, dropout: 0.0, keys: [q, k, v, o, gate, up, down], num_layers: -1}
-eval_generator: {backend: hf, kwargs: {dtype: float32, batch_size: 16}}
-
-# Token-rate cost of the full gate. mean_completion_len is replaced by P4's
-# measurement when pilots/p4_micro_grpo/results/report.json exists.
-# audit_prompts is 512 + 384 = 896. Eval tokens are included.
-p4_report: pilots/p4_micro_grpo/results/report.json
-cost_model:
-  arms: 10
-  seeds: 2
-  steps: 300
-  prompts_per_step: 64
-  group_size: 8
-  eval_every: 25
-  eval_prompts: 384
-  eval_train_prompts: 128
-  eval_samples: 4
-  audit_prompts: 896
-  audit_samples: 16
-  mean_completion_len: 350
-  h100_gen_tok_s: 20000
-  h100_train_tok_s: 40000
-  overhead: 1.25
-  usd_per_h100_hour: 2.5
-
-# Development pool, disjoint from E1. Held-out dataset seed is 60000000.
-# ------------------------------------------------------------- full gate (H100)
-full:
-  audit:
-    task: {type: chain_sum}
-    pools: {train: 512, heldout: 384, seed: 50000000}
-    generator:
-      backend: vllm
-      model_id: Qwen/Qwen2.5-1.5B-Instruct
-      kwargs: {gpu_memory_utilization: 0.85, seed: 0, max_model_len: 2048}
-    sampling: {n: 16, max_tokens: 1024, temperature: 1.0, seed: 0, chunk_prompts: 256}
-    arms: {file: configs/arms/chain_sum.yaml, n_boot: 1000, seed: 0}
-    features:
-      kind: lora_grad
-      model_id: Qwen/Qwen2.5-1.5B-Instruct
-      sketch_dim: 8192
-      lora_r: 16
-      lora_alpha: 32
-      load: {dtype: float32, device: cuda}
-    forecast: {n_boot: 1000, reliability_splits: 20, loss_agg: seq_mean}
-    lock: true
-  gate:
-    seeds: [0, 1]
-    arms: [oracle, noise_fp, fp_tolerance, fp_tolerance_decoy, fp_hash, fp_trigger,
-           noise_fp_trigger, noise_fn, fn_behavior, fn_prompt_subset]
-    families:
-      - {control: noise_fp, kind: fp, shared: [fp_tolerance, fp_tolerance_decoy], local: [fp_hash]}
-      - {control: noise_fp_trigger, kind: fp, shared: [fp_trigger], local: []}
-      - {control: noise_fn, kind: fn, shared: [fn_behavior], local: [fn_prompt_subset]}
-    n_boot: 2000
-    eval_generator:
-      backend: vllm
-      kwargs: {gpu_memory_utilization: 0.85, seed: 0, max_model_len: 2048}
-    train:
-      model_id: Qwen/Qwen2.5-1.5B-Instruct
-      steps: 300
-      prompts_per_step: 64
-      group_size: 8
-      max_tokens: 1024
-      eval_max_tokens: 1024
-      lr: 2.0e-5
-      warmup_steps: 10
-      beta_kl: 0.0
-      loss_agg: seq_mean
-      adv_mode: std
-      micro_batch_size: 32
-      gradient_checkpointing: true
-      data_regime: multi_epoch
-      eval_every: 25
-      save_every: 25
-      eval_heldout_n: 384
-      eval_train_n: 128
-      eval_samples_per_prompt: 4
-      use_vllm: true
-      vllm_mode: colocate
-      vllm_gpu_memory_utilization: 0.35
-      lora_seed: 0
-      lora: {rank: 16, alpha: 32, dropout: 0.0, keys: [q, k, v, o, gate, up, down],
-             num_layers: -1}
-    gates:
-      oracle_gain: 0.10
-      seed_sd_threshold: 0.03
-
-# E1 projection from the measured arm-seed. 39 full runs at 3 seeds, 57 if the
-# H1/H2 arms take 5 seeds (9 x 5 + 4 x 3). Early baselines are 13 x 25 steps.
-e1_cost:
-  steps: 300
-  full_runs: 39
-  full_runs_if_extra_seeds: 57
-  early_runs: 13
-  early_steps: 25
-  eval_every: 25
-  eval_prompts: 384
-  eval_train_prompts: 128
-  eval_samples: 4
-  audit_prompts: 1408
-  audit_samples: 16
-  # Audit pricing falls back to these E1 placeholder rates only when the gate
-  # has neither a fresh audit clock nor a measured generation rate.
-  h100_gen_tok_s: 10000
-  mean_completion_len: 350
-  usd_per_h100_hour: 2.5
+schema: vfates.p5_pilot/1
+title: P5 GPU gate
+# path, preempt, gain, seeds, throughput, or collect.
+# smoke=true with stage collect (or stage omitted) runs path, preempt, then collect.
+stage: collect
+smoke: false
+plan: true
+budget_usd: 9000
+path_steps: 10
+gain_steps: 150
+gain_min: 0.05
+seed_steps: 300
+seed_sd_threshold: 0.03
+# Optional filters for one machine: model and hardware_class.
+model: null
+hardware_class: null
+cell: null

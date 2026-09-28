@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("torch")
@@ -245,3 +247,57 @@ def test_generate_left_truncates_prompts():
     assert full > 8
     gen.generate([prompt], n=1, max_tokens=1, temperature=0.0, seed=0)
     assert seen == [8]
+
+
+class _KwTokenizer:
+    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=True, **kwargs):
+        self.kwargs = dict(kwargs)
+        return [1, 2, 3]
+
+    def encode(self, text, add_special_tokens=False):
+        assert add_special_tokens is False
+        return [7]
+
+
+def test_encode_prompt_forwards_chat_template_kwargs():
+    from vfates.gen.chat import encode_prompt_completion, prompt_completion_ids
+
+    tokenizer = _KwTokenizer()
+    kwargs = {"enable_thinking": False}
+    assert encode_prompt(tokenizer, "hi", chat_template_kwargs=kwargs) == [1, 2, 3]
+    assert tokenizer.kwargs == kwargs
+    ids, start = encode_prompt_completion(tokenizer, "hi", "there", chat_template_kwargs=kwargs)
+    assert start == 3
+    assert ids == [1, 2, 3, 7]
+    again, start_ids = prompt_completion_ids(tokenizer, "hi", [4], chat_template_kwargs=kwargs)
+    assert start_ids == 3
+    assert again == [1, 2, 3, 4]
+
+
+def test_hf_describe_reports_chat_template_kwargs():
+    model, tokenizer = build_tiny_qwen()
+    gen = HFGenerator(
+        "tiny-qwen",
+        device="cpu",
+        dtype="float32",
+        model=model,
+        tokenizer=tokenizer,
+        chat_template_kwargs={"enable_thinking": False},
+    )
+    described = gen.describe()
+    assert described["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_hf_load_full_checkpoint_swaps_and_restores_weights(tmp_path: Path) -> None:
+    base, tokenizer = build_tiny_qwen(seed=0)
+    other, _ = build_tiny_qwen(seed=1)
+    other.save_pretrained(tmp_path / "checkpoint-1")
+    gen = _generator(base, tokenizer)
+    probe = gen.model.model.layers[0].self_attn.q_proj.weight
+    original = probe.detach().clone()
+    gen.load_full_checkpoint(str(tmp_path / "checkpoint-1"))
+    reference = other.model.layers[0].self_attn.q_proj.weight
+    assert torch.allclose(probe, reference.to(dtype=probe.dtype))
+    assert not torch.allclose(probe, original)
+    gen.load_full_checkpoint(None)
+    assert torch.allclose(probe, original)

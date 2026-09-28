@@ -8,7 +8,7 @@ success; hypothesis outcomes live in this report.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -61,14 +61,25 @@ H3_PAIRS: tuple[tuple[str, str], ...] = (
     ("fn_form", "noise_fn_form"),
 )
 FP_RULES = frozenset(
-    {"fp_tolerance", "fp_tolerance_decoy", "fp_hash", "fp_trigger", "noise_fp", "noise_fp_trigger"}
+    {
+        "fp_tolerance",
+        "fp_tolerance_decoy",
+        "fp_hash",
+        "fp_trigger",
+        "fp_trigger_enriched",
+        "noise_fp",
+        "noise_fp_trigger",
+        "noise_fp_trigger_enriched",
+    }
 )
 FN_RULES = frozenset(
     {
         "fn_behavior",
+        "fn_behavior_depleted",
         "fn_prompt_subset",
         "fn_form",
         "noise_fn",
+        "noise_fn_depleted",
         "noise_fn_form",
         "combo_fnform_fphash",
     }
@@ -77,7 +88,9 @@ H4_SHARED = (
     "fp_tolerance",
     "fp_tolerance_decoy",
     "fp_trigger",
+    "fp_trigger_enriched",
     "fn_behavior",
+    "fn_behavior_depleted",
     "fn_form",
 )
 H4_PROMPT_SPECIFIC = ("fp_hash", "fn_prompt_subset")
@@ -105,6 +118,14 @@ H3_RULE = (
 H3_NOT_TESTED = (
     "analysis.h3.tested is false: H3 is not a hypothesis of this study. The "
     "statistics above are descriptive and carry no decision."
+)
+H10_RULE = (
+    "Per cell. For each pair (a, b) the contrast is acc(a) - acc(b), with the "
+    "crossed seed-by-prompt bootstrap used by the other contrasts. "
+    "dtau = tau_pool(a) - tau_pool(b) from the lock. "
+    "signed = sign(dtau) * (acc(a) - acc(b)), and its interval is that "
+    "bootstrap multiplied by sign(dtau). A pair is withdrawn when either arm "
+    "is withdrawn."
 )
 ORACLE_RULE = (
     "Oracle held-out gain is the mean over seeds of (final prompt-mean accuracy "
@@ -175,19 +196,55 @@ def decide_audit_withdrawals(
     validity: Mapping[str, Mapping[str, Any]],
     *,
     rate_miss_max: float = 0.02,
+    forecasts: Mapping[str, Any] | None = None,
+    menu: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    """Withdrawal record decided from :func:`arm_validity` before any training."""
+    """Withdrawal record decided from :func:`arm_validity` before any training.
+
+    ``forecasts`` is the ``forecasts.json`` document. When it carries
+    ``patch_selection.same_selection`` true, ``patch_rate`` is withdrawn with
+    reason ``same_selection``. A missing ``patch_selection`` block leaves the
+    rate rules unchanged.
+
+    ``menu`` is the cell's trained arms. The audit calibrates every arm in the
+    arms file, so a core cell also fits full-menu arms it never trains; those
+    are listed under ``outside_menu`` and never withdrawn, so they cannot
+    appear as withdrawals of that cell.
+    """
     audit: dict[str, Any] = {}
     for arm, info in validity.items():
         reasons = audit_withdrawal_reasons(info, rate_miss_max=rate_miss_max)
         if reasons:
             audit[str(arm)] = {"reasons": reasons, "validity": dict(info)}
-    return {
-        "schema": "vfates.withdrawals/1",
-        "audit": audit,
-        "training": {},
-        "withdrawn": sorted(audit),
-    }
+    _apply_same_selection(audit, validity, forecasts)
+    record: dict[str, Any] = {"schema": "vfates.withdrawals/1"}
+    if menu is not None:
+        trained = {str(arm) for arm in menu}
+        record["outside_menu"] = sorted(str(arm) for arm in validity if str(arm) not in trained)
+        audit = {arm: entry for arm, entry in audit.items() if arm in trained}
+    record.update({"audit": audit, "training": {}, "withdrawn": sorted(audit)})
+    return record
+
+
+def _apply_same_selection(
+    audit: dict[str, Any],
+    validity: Mapping[str, Mapping[str, Any]],
+    forecasts: Mapping[str, Any] | None,
+) -> None:
+    if not isinstance(forecasts, Mapping):
+        return
+    patch = forecasts.get("patch_selection")
+    if not isinstance(patch, Mapping) or patch.get("same_selection") is not True:
+        return
+    entry = audit.get("patch_rate")
+    if entry is None:
+        info = validity.get("patch_rate", {})
+        entry = {"reasons": [], "validity": dict(info) if isinstance(info, Mapping) else {}}
+        audit["patch_rate"] = entry
+    reasons = list(entry.get("reasons") or [])
+    if "same_selection" not in reasons:
+        reasons.append("same_selection")
+    entry["reasons"] = reasons
 
 
 def _pairs(
@@ -206,6 +263,13 @@ def _h3_pairs(block: Mapping[str, Any] | None) -> list[tuple[str, str]]:
     if not block or "pairs" not in block:
         return list(H3_PAIRS)
     return [(str(row["arm"]), str(row["control"])) for row in block["pairs"]]
+
+
+def _h10_pairs(block: Mapping[str, Any] | None) -> list[tuple[str, str]]:
+    """Return ``(a, b)`` pairs. The contrast is ``acc(a) - acc(b)``."""
+    if not block or "pairs" not in block:
+        return []
+    return [(str(row["a"]), str(row["b"])) for row in block["pairs"]]
 
 
 def _contrast_name(control: str, arm: str) -> str:
@@ -499,6 +563,63 @@ def _natural_block(
     return block
 
 
+def _natural_configs(cfg: Mapping[str, Any] | Sequence[Any]) -> list[Mapping[str, Any]]:
+    """One mapping, or a list of ``{natural, control, oracle}`` mappings."""
+    if isinstance(cfg, Mapping):
+        return [cfg]
+    if isinstance(cfg, Sequence) and not isinstance(cfg, (str, bytes)):
+        items: list[Mapping[str, Any]] = []
+        for item in cfg:
+            if not isinstance(item, Mapping):
+                raise ValueError("analysis.natural entries must be mappings")
+            items.append(item)
+        if not items:
+            raise ValueError("analysis.natural list is empty")
+        return items
+    raise ValueError("analysis.natural must be a mapping or a list of mappings")
+
+
+def natural_pair_blocks(
+    cfg: Mapping[str, Any] | Sequence[Mapping[str, Any]],
+    *,
+    forecasts: Mapping[str, Any],
+    runs: Mapping[str, Mapping[int, Path]],
+    planned: Mapping[str, Sequence[int]],
+    withdrawn: set[str],
+    allow_partial: bool,
+    final_step: int,
+    n_boot: int,
+    level: float,
+    margin: float,
+    boot_seed: int,
+    alpha: float,
+    inconclusive: bool,
+) -> list[dict[str, Any]]:
+    """One natural-verifier block per configured pair.
+
+    A mapping config is the single pair used by the original E2 block. A list
+    is one block each (math has ``natural`` and ``natural_strict``).
+    """
+    return [
+        _natural_block(
+            item,
+            forecasts=forecasts,
+            runs=runs,
+            planned=planned,
+            withdrawn=withdrawn,
+            allow_partial=allow_partial,
+            final_step=final_step,
+            n_boot=n_boot,
+            level=level,
+            margin=margin,
+            boot_seed=boot_seed,
+            alpha=alpha,
+            inconclusive=inconclusive,
+        )
+        for item in _natural_configs(cfg)
+    ]
+
+
 def _j_of(row: Mapping[str, Any]) -> float | None:
     if row.get("J") is not None and math.isfinite(float(row["J"])):
         return float(row["J"])
@@ -544,7 +665,7 @@ def confirmatory_report(
     withdrawals: Mapping[str, Any],
     planned_seeds: Mapping[str, Sequence[int]],
 ) -> dict[str, Any]:
-    """H1 to H6, withdrawals, sensitivities and labels for a finished study directory.
+    """H1 to H6, H10 when configured, withdrawals, sensitivities, and labels.
 
     Every planned seed of a non-withdrawn arm must be present and must have an
     eval at the preregistered final step. Hypothesis fields are omitted when
@@ -628,7 +749,7 @@ def confirmatory_report(
             forecasts, float(analysis.get("reliability_min", 0.8))
         )
     if natural_cfg:
-        report["natural"] = _natural_block(
+        blocks = natural_pair_blocks(
             natural_cfg,
             forecasts=forecasts,
             runs=run_map,
@@ -643,6 +764,7 @@ def confirmatory_report(
             alpha=alpha,
             inconclusive=inconclusive,
         )
+        report["natural"] = blocks[0] if isinstance(natural_cfg, Mapping) else blocks
     if not hypotheses:
         report["rule"] = (
             "E2: H1 to H6 are not tested; the natural-verifier tests are under 'natural'."
@@ -731,7 +853,17 @@ def confirmatory_report(
         active_arms=active_arms,
     )
     h4 = _h4_block(forecasts, analysis.get("h4") or {}, active_arms, withdrawn)
-    h5 = _h5_block(run_map, planned, _h3_pairs(h3_cfg), withdrawn, allow_partial, final_step)
+    describes, calibration_loaded = _arm_describes(audit_dir)
+    h5 = _h5_block(
+        run_map,
+        planned,
+        _h3_pairs(h3_cfg),
+        withdrawn,
+        allow_partial,
+        final_step,
+        describes,
+        calibration_loaded,
+    )
     h6 = _h6_block(forecasts, endpoints, active_arms)
     report.update(
         {
@@ -770,7 +902,63 @@ def confirmatory_report(
             },
         }
     )
+    h10_cfg = analysis.get("h10")
+    if isinstance(h10_cfg, Mapping):
+        report["h10"] = _h10_block(
+            pairs=_h10_pairs(h10_cfg),
+            forecasts=forecasts,
+            runs=run_map,
+            planned=planned,
+            withdrawn=withdrawn,
+            allow_partial=allow_partial,
+            final_step=final_step,
+            n_boot=n_boot,
+            level=level,
+            margin=margin,
+            boot_seed=boot_seed,
+        )
     return _jsonify(report)
+
+
+def _arm_describes(audit_dir: Path) -> tuple[dict[str, dict[str, Any]], bool]:
+    """Calibration ``describe()`` dicts, merged with report details.
+
+    Returns ``({}, False)`` when ``calibration.json`` is absent, which keeps a
+    chain-sum report that never wrote one on the name-list path.
+    """
+    path = audit_dir / "calibration.json"
+    if not path.exists():
+        return {}, False
+    doc = read_json(path)
+    if not isinstance(doc, Mapping):
+        raise ValueError(f"calibration.json is not a mapping: {path}")
+    described = doc.get("arms")
+    report = doc.get("report")
+    reported: Mapping[str, Any] = {}
+    if isinstance(report, Mapping) and isinstance(report.get("arms"), Mapping):
+        reported = report["arms"]
+    names: set[str] = set()
+    if isinstance(described, Mapping):
+        names.update(str(key) for key in described)
+    names.update(str(key) for key in reported)
+    out: dict[str, dict[str, Any]] = {}
+    for name in names:
+        merged: dict[str, Any] = {}
+        raw_report = reported.get(name)
+        if isinstance(raw_report, Mapping):
+            merged.update(raw_report)
+            details = raw_report.get("details")
+            if isinstance(details, Mapping):
+                for key in ("matched_arm", "match", "base"):
+                    if key in details and key not in merged:
+                        merged[key] = details[key]
+        raw_desc = described.get(name) if isinstance(described, Mapping) else None
+        if isinstance(raw_desc, Mapping) and ("kind" in raw_desc or "type" in raw_desc):
+            merged.update(dict(raw_desc))
+        if merged:
+            merged.setdefault("name", name)
+            out[name] = merged
+    return out, True
 
 
 def _locked_forecasts(audit_dir: Path) -> dict[str, Any]:
@@ -813,10 +1001,31 @@ def _endpoints(
     return out
 
 
+def _forecast_arm_items(
+    forecasts: Mapping[str, Any],
+) -> Iterator[tuple[str, Mapping[str, Any]]]:
+    """Arm records in a forecasts document.
+
+    Uses ``vfates.audit.iter_forecast_arms`` when that function is importable
+    (it skips the non-arm key ``patch_selection``). If the import is missing,
+    skips any key whose value is not a mapping or does not carry ``transfer``.
+    """
+    try:
+        from vfates.audit import iter_forecast_arms
+    except (ImportError, AttributeError):
+        for name, entry in forecasts.items():
+            if isinstance(entry, Mapping) and "transfer" in entry:
+                yield str(name), entry
+        return
+    yield from iter_forecast_arms(forecasts)
+
+
 def _reliability_block(forecasts: Mapping[str, Any], threshold: float) -> dict[str, Any]:
     arms = {}
-    for arm, forecast in forecasts.items():
-        value = _finite((forecast.get("transfer") or {}).get("reliability"))
+    for arm, forecast in _forecast_arm_items(forecasts):
+        transfer = forecast.get("transfer")
+        raw = transfer.get("reliability") if isinstance(transfer, Mapping) else None
+        value = _finite(raw)
         arms[arm] = {"value": value, "below": value is not None and value < threshold}
     return {
         "rule": RELIABILITY_RULE,
@@ -1356,6 +1565,170 @@ def _probe_auc(value: Any) -> float | None:
     return _finite(value)
 
 
+_FP_TYPES = frozenset({"hash_fp", "tolerance_fp", "tolerance_band_fp", "trigger_fp"})
+_FN_TYPES = frozenset({"form_fn", "behavior_fn", "prompt_subset_fn"})
+_NATURAL_FN_TYPES = frozenset({"string_match"})
+
+
+def arm_error_channel(
+    describe: Mapping[str, Any],
+    arms: Mapping[str, Mapping[str, Any]] | None = None,
+) -> str:
+    """``fp``, ``fn`` or ``oracle`` from a calibration ``describe()`` dict.
+
+    ``arms`` is the calibration arm map, used when a resampled or patched arm
+    points at another arm. The chain-sum name lists are not consulted.
+    """
+    return _arm_error_channel(describe, arms or {}, set())
+
+
+def _arm_error_channel(
+    describe: Mapping[str, Any],
+    arms: Mapping[str, Mapping[str, Any]],
+    seen: set[str],
+) -> str:
+    name = str(describe.get("name") or "")
+    if name:
+        if name in seen:
+            return "fp"
+        seen.add(name)
+    kind = str(describe.get("kind") or "").lower()
+    typ = str(describe.get("type") or "").lower()
+    if kind in {"fp", "fn"}:
+        return kind
+    if typ in _FP_TYPES or typ.endswith("_fp"):
+        return "fp"
+    if typ in _FN_TYPES or typ.endswith("_fn"):
+        return "fn"
+    if kind in {"resampled", "noise"} or typ == "resampled":
+        return _resampled_channel(describe, arms, seen)
+    if kind == "composite" or typ == "composite":
+        return _composite_channel(describe, arms, seen)
+    if kind == "patched" or typ in {"patched", "patch_select"}:
+        return _patched_channel(describe, arms, seen)
+    if kind == "natural" or typ in {"natural", "string_match", "ifeval_checker"}:
+        return _natural_channel(describe)
+    if kind == "oracle" or typ == "oracle":
+        return "oracle"
+    rated = _rate_channel(describe)
+    return rated if rated is not None else "fp"
+
+
+def _resampled_channel(
+    describe: Mapping[str, Any],
+    arms: Mapping[str, Mapping[str, Any]],
+    seen: set[str],
+) -> str:
+    matched = describe.get("matched_arm")
+    if matched is None:
+        matched = describe.get("match")
+    if isinstance(matched, str) and matched in arms and matched not in seen:
+        return _arm_error_channel(arms[matched], arms, seen)
+    rho0 = _finite(describe.get("rho0"))
+    rho1 = _finite(describe.get("rho1"))
+    if rho1 is not None and (rho0 is None or rho1 > rho0):
+        return "fn"
+    rated = _rate_channel(describe)
+    return rated if rated is not None else "fp"
+
+
+def _composite_channel(
+    describe: Mapping[str, Any],
+    arms: Mapping[str, Mapping[str, Any]],
+    seen: set[str],
+) -> str:
+    # A composite that carries both rules is reported on the FN monitor.
+    # That matches combo_fnform_fphash, which the chain-sum menu treats as FN.
+    found: set[str] = set()
+    for slot in ("fn", "fp"):
+        items = describe.get(slot) or []
+        if isinstance(items, str) or not isinstance(items, Sequence):
+            continue
+        for item in items:
+            if isinstance(item, Mapping):
+                found.add(_arm_error_channel(item, arms, seen))
+            elif isinstance(item, str) and item in arms:
+                found.add(_arm_error_channel(arms[item], arms, seen))
+    if "fn" in found:
+        return "fn"
+    if "fp" in found:
+        return "fp"
+    return "fp"
+
+
+def _patched_channel(
+    describe: Mapping[str, Any],
+    arms: Mapping[str, Mapping[str, Any]],
+    seen: set[str],
+) -> str:
+    base = describe.get("base")
+    if isinstance(base, Mapping):
+        return _arm_error_channel(base, arms, seen)
+    if isinstance(base, str) and base in arms and base not in seen:
+        return _arm_error_channel(arms[base], arms, seen)
+    if isinstance(base, str) and "strict" in base:
+        return "fn"
+    rated = _rate_channel(describe)
+    return rated if rated is not None else "fp"
+
+
+def _natural_channel(describe: Mapping[str, Any]) -> str:
+    name = str(describe.get("name") or "")
+    typ = str(describe.get("type") or "").lower()
+    if "strict" in name or "strict" in typ or typ in _NATURAL_FN_TYPES:
+        return "fn"
+    rated = _rate_channel(describe)
+    return rated if rated is not None else "fp"
+
+
+def _rate_channel(describe: Mapping[str, Any]) -> str | None:
+    fpr = _finite(describe.get("achieved_fpr"))
+    fnr = _finite(describe.get("achieved_fnr"))
+    channel = describe.get("channel")
+    if isinstance(channel, Mapping):
+        if fpr is None:
+            fpr = _finite(channel.get("fpr"))
+        if fnr is None:
+            fnr = _finite(channel.get("fnr"))
+    if fpr is None and fnr is None:
+        return None
+    if fnr is not None and (fpr is None or fnr > fpr):
+        return "fn"
+    return "fp"
+
+
+def _name_channel(arm: str) -> str | None:
+    if arm in FP_RULES:
+        return "fp"
+    if arm in FN_RULES:
+        return "fn"
+    return None
+
+
+def _h5_channel(
+    arm: str,
+    describes: Mapping[str, Mapping[str, Any]],
+    calibration_loaded: bool,
+) -> str | None:
+    """Channel for one H5 arm.
+
+    Calibration ``describe()`` dicts win. Without a calibration file the
+    chain-sum name lists keep the previous report. With a calibration file an
+    arm that is not described still receives a channel, so it is never
+    ``no_channel``.
+    """
+    if calibration_loaded and arm in describes:
+        return arm_error_channel(describes[arm], describes)
+    named = _name_channel(arm)
+    if named is not None:
+        return named
+    if calibration_loaded:
+        if arm.startswith("fn") or arm.endswith("_fn"):
+            return "fn"
+        return "fp"
+    return None
+
+
 def _h5_block(
     runs: Mapping[str, Mapping[int, Path]],
     planned: Mapping[str, Sequence[int]],
@@ -1363,8 +1736,11 @@ def _h5_block(
     withdrawn: set[str],
     allow_partial: bool,
     final_step: int,
+    describes: Mapping[str, Mapping[str, Any]] | None = None,
+    calibration_loaded: bool = False,
 ) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
+    arm_describes = describes or {}
     for arm, control in pairs:
         if arm not in planned or control not in planned:
             if allow_partial:
@@ -1373,9 +1749,22 @@ def _h5_block(
         if arm in withdrawn or control in withdrawn:
             rows.append({"arm": arm, "control": control, "status": "withdrawn"})
             continue
-        channel = "fp" if arm in FP_RULES else "fn" if arm in FN_RULES else None
+        channel = _h5_channel(arm, arm_describes, calibration_loaded)
         if channel is None:
             rows.append({"arm": arm, "control": control, "status": "no_channel"})
+            continue
+        if channel == "oracle":
+            rows.append(
+                {
+                    "arm": arm,
+                    "control": control,
+                    "status": "reported",
+                    "channel": "oracle",
+                    "field": None,
+                    "per_seed": [],
+                    "mean": {},
+                }
+            )
             continue
         field = "monitors_wrong" if channel == "fp" else "monitors_correct"
         per_seed: list[dict[str, Any]] = []
@@ -1446,6 +1835,102 @@ def _h6_block(
     }
 
 
+def _h10_block(
+    *,
+    pairs: Sequence[tuple[str, str]],
+    forecasts: Mapping[str, Mapping[str, Any]],
+    runs: Mapping[str, Mapping[int, Path]],
+    planned: Mapping[str, Sequence[int]],
+    withdrawn: set[str],
+    allow_partial: bool,
+    final_step: int,
+    n_boot: int,
+    level: float,
+    margin: float,
+    boot_seed: int,
+) -> dict[str, Any]:
+    """``acc(a) - acc(b)`` for each configured pair, plus locked ``dtau`` and ``signed``."""
+    rows: list[dict[str, Any]] = []
+    for a, b in pairs:
+        status = _status(a, b, planned=planned, withdrawn=withdrawn, allow_partial=allow_partial)
+        record = _contrast_record(
+            a,
+            b,
+            status=status,
+            runs=runs,
+            planned=planned,
+            final_step=final_step,
+            n_boot=n_boot,
+            level=level,
+            margin=margin,
+            boot_seed=boot_seed,
+        )
+        record["a"] = a
+        record["b"] = b
+        if status != "tested":
+            rows.append(record)
+            continue
+        tau_a = _locked_tau(forecasts, a)
+        tau_b = _locked_tau(forecasts, b)
+        dtau = tau_a - tau_b
+        sign = _signum(dtau)
+        point = float(record["point"])
+        lo = float(record["lo"])
+        hi = float(record["hi"])
+        if sign < 0.0:
+            signed_lo, signed_hi = sign * hi, sign * lo
+        else:
+            signed_lo, signed_hi = sign * lo, sign * hi
+        record.update(
+            {
+                "dtau": dtau,
+                "tau_a": tau_a,
+                "tau_b": tau_b,
+                "signed": sign * point,
+                "signed_lo": signed_lo,
+                "signed_hi": signed_hi,
+            }
+        )
+        rows.append(record)
+    return {"rule": H10_RULE, "pairs": rows}
+
+
+def _locked_tau(forecasts: Mapping[str, Any], arm: str) -> float:
+    entry = forecasts.get(arm)
+    tau = None if not isinstance(entry, Mapping) else _finite(forecast_row(entry).get("tau_pool"))
+    if tau is None:
+        raise ValueError(f"H10 arm {arm} has no finite tau_pool in the lock")
+    return tau
+
+
+def _signum(value: float) -> float:
+    if value > 0.0:
+        return 1.0
+    if value < 0.0:
+        return -1.0
+    return 0.0
+
+
+def _append_natural_markdown(lines: list[str], natural: Mapping[str, Any]) -> None:
+    contrast = natural.get("contrast") or {}
+    scale = natural.get("scale") or {}
+    lines += [
+        f"## E2: {natural.get('control')} - {natural.get('natural')}",
+        "",
+        str(natural.get("rule", "")),
+        "",
+        f"- contrast: status={contrast.get('status')}, point={contrast.get('point')}, "
+        f"interval=[{contrast.get('lo')}, {contrast.get('hi')}]",
+        f"- differs: {(natural.get('differs') or {}).get('decision')}",
+        f"- locality: {(natural.get('locality') or {}).get('decision')}, "
+        f"p_tost={contrast.get('p_tost')}",
+        f"- screen direction: {(natural.get('screen_direction') or {}).get('decision')}, "
+        f"dtau={(natural.get('screen_direction') or {}).get('dtau')}",
+        f"- scale ({scale.get('name')}): point={scale.get('point')}",
+        "",
+    ]
+
+
 def render_markdown(report: Mapping[str, Any]) -> str:
     """A short reading of ``report`` for ``report.md``. The JSON is the record."""
     lines = [
@@ -1476,23 +1961,11 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         ]
     natural = report.get("natural")
     if isinstance(natural, dict):
-        contrast = natural.get("contrast") or {}
-        scale = natural.get("scale") or {}
-        lines += [
-            f"## E2: {natural.get('control')} - {natural.get('natural')}",
-            "",
-            str(natural.get("rule", "")),
-            "",
-            f"- contrast: status={contrast.get('status')}, point={contrast.get('point')}, "
-            f"interval=[{contrast.get('lo')}, {contrast.get('hi')}]",
-            f"- differs: {(natural.get('differs') or {}).get('decision')}",
-            f"- locality: {(natural.get('locality') or {}).get('decision')}, "
-            f"p_tost={contrast.get('p_tost')}",
-            f"- screen direction: {(natural.get('screen_direction') or {}).get('decision')}, "
-            f"dtau={(natural.get('screen_direction') or {}).get('dtau')}",
-            f"- scale ({scale.get('name')}): point={scale.get('point')}",
-            "",
-        ]
+        _append_natural_markdown(lines, natural)
+    elif isinstance(natural, list):
+        for block in natural:
+            if isinstance(block, dict):
+                _append_natural_markdown(lines, block)
     for key in ("h1", "h2", "h3"):
         block = report.get(key)
         if not isinstance(block, dict):
@@ -1517,6 +1990,20 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             lines.append(
                 f"- {name}: status={row.get('status')}, point={row.get('point', row.get('dacc'))}, "
                 f"rejects={row.get('rejects')}, p_sup={row.get('p_sup')}, p_tost={row.get('p_tost')}"
+            )
+        lines.append("")
+    h10 = report.get("h10")
+    if isinstance(h10, dict):
+        lines += ["## H10", "", str(h10.get("rule", "")), ""]
+        for row in h10.get("pairs") or []:
+            if not isinstance(row, dict):
+                continue
+            name = row.get("name") or f"{row.get('a')} - {row.get('b')}"
+            lines.append(
+                f"- {name}: status={row.get('status')}, point={row.get('point')}, "
+                f"interval=[{row.get('lo')}, {row.get('hi')}], dtau={row.get('dtau')}, "
+                f"signed={row.get('signed')}, "
+                f"signed_interval=[{row.get('signed_lo')}, {row.get('signed_hi')}]"
             )
         lines.append("")
     n_knife = sum(

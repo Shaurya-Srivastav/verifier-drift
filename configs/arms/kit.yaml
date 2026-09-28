@@ -1,0 +1,76 @@
+# Task-agnostic verifier kit. A domain arms file may `include: kit.yaml` and
+# then list only its extra arms (natural, structural, patch). Kit arms come
+# first. `{domain}` is replaced when the file is loaded, from an explicit
+# domain key, the task name, or the task type, so each domain gets its own salts.
+
+targets:
+  fpr: 0.15
+  fnr: 0.30
+
+arms:
+  - name: oracle
+    type: oracle
+
+  - name: fp_hash
+    type: hash_fp
+    salt: "{domain}/fp_hash"
+
+  - name: fp_trigger
+    type: trigger_fp
+    prefer: not_enriched
+    tolerance: 0.02
+    ngram_range: [1, 3]
+    min_chars: 4
+
+  - name: fp_trigger_enriched
+    type: trigger_fp
+    prefer: enriched
+    tolerance: 0.02
+    ngram_range: [1, 3]
+    min_chars: 4
+
+  - name: noise_fp
+    type: resampled
+    match: fp_hash
+    support: answered
+    seed: 0
+
+  - name: noise_fp_trigger
+    type: resampled
+    match: fp_trigger
+    support: all
+    seed: 0
+
+  - name: noise_fp_trigger_enriched
+    type: resampled
+    match: fp_trigger_enriched
+    support: all
+    seed: 0
+
+  - name: fn_behavior
+    type: behavior_fn
+    prefer: enriched
+    tolerance: 0.02
+    ngram_range: [1, 3]
+    min_chars: 4
+
+  - name: fn_behavior_depleted
+    type: behavior_fn
+    prefer: depleted
+    tolerance: 0.02
+    ngram_range: [1, 3]
+    min_chars: 4
+
+  - name: fn_prompt_subset
+    type: prompt_subset_fn
+    salt: "{domain}/fn_prompt_subset"
+
+  - name: noise_fn
+    type: resampled
+    match: fn_behavior
+    seed: 0
+
+  - name: noise_fn_depleted
+    type: resampled
+    match: fn_behavior_depleted
+    seed: 0

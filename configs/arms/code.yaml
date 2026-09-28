@@ -1,0 +1,33 @@
+# Code arms. Kit arms come from the include (salts use {domain}).
+# natural is the public examples only (code_public_tests).
+# noise_natural is resampled noise matched to that arm. Support answered
+# means a code block was found (CodeTask.support_answered), including an
+# empty block. patch arms keep the k=2 categories chosen after the audit.
+include: kit.yaml
+domain: code
+
+targets:
+  fpr: 0.15
+  fnr: 0.30
+
+arms:
+  - name: natural
+    type: code_public_tests
+
+  - name: noise_natural
+    type: resampled
+    match: natural
+    support: answered
+    seed: 0
+
+  - name: patch_tau
+    type: patch_select
+    base: natural
+    k: 2
+    by: tau
+
+  - name: patch_rate
+    type: patch_select
+    base: natural
+    k: 2
+    by: rate

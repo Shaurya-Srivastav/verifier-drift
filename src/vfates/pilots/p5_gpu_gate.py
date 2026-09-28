@@ -1,13 +1,8 @@
-"""P5: the GPU gate. Dry run on the Mac, the full gate on one H100.
+"""P5: the GPU gate, one stage at a time.
 
-``mode: dry_run`` (default without CUDA) exercises the torch path end to end on
-the local device. ``mode: full`` (default with CUDA) trains the development
-pool. Its only scientific go/no-go is the oracle held-out gain. Fate contrasts
-are logged and do not decide whether E1 runs.
-
-``mode: replication_screen`` scores Llama-3.2-3B-Instruct and
-Qwen2.5-3B-Instruct at 1,024 tokens on 128 development prompts and applies the
-pre-written 3B model rule. It is a separate config, not part of the full gate.
+``stage`` is ``path`` (P5.1), ``preempt`` (P5.2), ``gain`` (P5.3), ``seeds``
+(P5.4), ``throughput`` (P5.5) or ``collect``. ``--set smoke=true`` runs path
+and preempt for Qwen3-0.6B on MLX or HF.
 """
 
 from __future__ import annotations
@@ -16,58 +11,12 @@ import math
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any
 
 import numpy as np
 
-from vfates.analysis.power import (
-    minimum_detectable_difference,
-    project_measured_cost,
-    token_projection,
-)
 from vfates.pilots.common import Checks, markdown_table, write_report
 from vfates.utils.io import read_json, read_jsonl, write_json
-
-AUDIT_TIMING_NAME = "audit_timing.json"
-LLAMA_3B = "meta-llama/Llama-3.2-3B-Instruct"
-QWEN_3B = "Qwen/Qwen2.5-3B-Instruct"
-REPLICATION_RULE = (
-    "Use Llama-3.2-3B-Instruct when its base held-out accuracy at 1,024 tokens "
-    "on 128 development prompts is in [0.10, 0.60] and truncation is <= 0.05. "
-    "Otherwise use Qwen2.5-3B-Instruct."
-)
-
-
-def choose_replication_model(
-    base_accuracy: float,
-    truncation: float,
-    *,
-    acc_low: float = 0.10,
-    acc_high: float = 0.60,
-    truncation_max: float = 0.05,
-) -> dict[str, Any]:
-    """Apply the pre-written 3B replication model rule to the Llama screen."""
-    preferred_ok = acc_low <= base_accuracy <= acc_high and truncation <= truncation_max
-    return {
-        "model_id": LLAMA_3B if preferred_ok else QWEN_3B,
-        "preferred": LLAMA_3B,
-        "fallback": QWEN_3B,
-        "preferred_ok": preferred_ok,
-        "base_accuracy": base_accuracy,
-        "truncation": truncation,
-        "rule": REPLICATION_RULE,
-    }
-
-
-def base_screen_summary(correct: Sequence[int], truncated: Sequence[bool]) -> dict[str, Any]:
-    """Mean oracle bit and truncation rate on one base-model screen."""
-    if len(correct) != len(truncated) or not correct:
-        raise ValueError("correct and truncated must be non-empty and the same length")
-    return {
-        "accuracy": float(np.mean(np.asarray(correct, dtype=float))),
-        "truncation": float(np.mean(np.asarray(truncated, dtype=float))),
-        "n": len(correct),
-    }
 
 
 def arm_seed_timing(run_dir: str | Path) -> dict[str, Any]:
@@ -75,8 +24,8 @@ def arm_seed_timing(run_dir: str | Path) -> dict[str, Any]:
 
     ``wall_s`` is the per-step training wall clock. MLX and TRL both exclude
     evaluation. ``gen_seconds + train_seconds`` is the fallback when ``wall_s``
-    is absent. The full gate writes ``timing.json`` with the whole ``train_arm``
-    clock of every fresh run, which includes the checkpoint evaluation.
+    is absent. ``timing.json``, when a run wrote one, holds the train_arm
+    clock, which includes the checkpoint evaluation.
 
     Training seconds are the step clock when it exists, else ``timing.json``
     (and ``eval_seconds`` is then 0, so eval is not priced twice). Eval seconds
@@ -162,577 +111,1385 @@ def arm_seed_timing(run_dir: str | Path) -> dict[str, Any]:
     }
 
 
-def _cuda() -> dict[str, Any]:
-    info: dict[str, Any] = {"cuda": False}
-    try:
-        import torch
-
-        info["cuda"] = bool(torch.cuda.is_available())
-        if info["cuda"]:
-            props = torch.cuda.get_device_properties(0)
-            info.update(
-                gpu=props.name,
-                gpu_mem_gb=props.total_memory / 1e9,
-                n_gpus=torch.cuda.device_count(),
-            )
-    except ImportError:
-        pass
-    try:
-        import vllm
-
-        info["vllm"] = vllm.__version__
-    except ImportError:
-        info["vllm"] = None
-    return info
-
-
-def _projection(config: dict[str, Any]) -> dict[str, Any]:
-    """Token-rate cost of the full gate. Eval tokens are included. P5's measurement replaces it."""
-    study = dict(config["cost_model"])
-    p4 = Path(config.get("p4_report", "pilots/p4_micro_grpo/results/report.json"))
-    measured = None
-    if p4.exists():
-        measured = read_json(p4).get("tables", {}).get("cost", {}).get("mean_completion_len")
-    length = float(measured or study["mean_completion_len"])
-    runs = int(study["arms"]) * int(study["seeds"])
-    spec = {
-        "mean_completion_len": length,
-        "steps": study["steps"],
-        "prompts_per_step": study["prompts_per_step"],
-        "group_size": study["group_size"],
-        "full_runs": runs,
-        "early_runs": 0,
-        "early_steps": 0,
-        "eval_every": study["eval_every"],
-        "eval_prompts": study["eval_prompts"],
-        "eval_train_prompts": study.get("eval_train_prompts", 0),
-        "eval_samples": study["eval_samples"],
-        "audit_prompts": study["audit_prompts"],
-        "audit_samples": study["audit_samples"],
-        "h100_gen_tok_s": study["h100_gen_tok_s"],
-        "h100_train_tok_s": study["h100_train_tok_s"],
-        "overhead": study.get("overhead", 1.0),
-        "usd_per_h100_hour": study["usd_per_h100_hour"],
-    }
-    projected = token_projection(spec)
-    return {
-        "mean_completion_len": length,
-        "length_source": "P4" if measured else "config",
-        "runs": runs,
-        **projected,
-    }
-
-
-def _dry_run(config: dict[str, Any], out: Path, checks: Checks) -> list[tuple[str, str]]:
-    import copy
-
-    from vfates.audit import load_audit, run_audit
-    from vfates.experiment import train_arm
-    from vfates.gen.factory import make_generator
-    from vfates.train.checkpoint_eval import evaluate_checkpoints, peft_checkpoints
-    from vfates.train.config import GRPOConfig
-
-    audit_dir = out / "audit"
-    run_audit(copy.deepcopy(config["audit"]), audit_dir)
-    checks.add(
-        "P5.2",
-        "torch audit (HF sampling, LoRA-B features, lock) completes",
-        None,
-        (audit_dir / "lock.json").exists(),
-        metric="lock.json written",
-    )
-
-    train_cfg = {"seed": 0, **config["train"]}
-    arm = str(config.get("train_arm", "fp_tolerance"))
-    run_dir = out / "trl_run"
-    summary = read_json(run_dir / "summary.json") if (run_dir / "summary.json").exists() else None
-    if summary is None or summary.get("steps_completed") != train_cfg["steps"]:
-        summary = train_arm(
-            audit_dir,
-            arm,
-            train_cfg,
-            run_dir,
-            backend="trl",
-            eval_generator=config.get("eval_generator"),
-        )
-    ckpts = [s for s, _ in peft_checkpoints(run_dir)]
-    metrics = read_jsonl(run_dir / "metrics.jsonl") if (run_dir / "metrics.jsonl").exists() else []
-    checks.add(
-        "P5.3",
-        "TRL GRPO + PEFT trains and saves every adapter",
-        len(metrics),
-        summary["steps_completed"] == train_cfg["steps"]
-        and len(metrics) == train_cfg["steps"]
-        and ckpts[-1:] == [train_cfg["steps"]],
-        metric=f"metric rows (checkpoints {ckpts})",
-    )
-
-    evals = [(r["step"], r["split"]) for r in read_jsonl(run_dir / "eval.jsonl")]
-    want = {(s, "heldout") for s in [0, *ckpts]}
-    checks.add(
-        "P5.4",
-        "checkpoint evaluator writes the shared per-prompt schema",
-        len(evals),
-        want <= set(evals) and (run_dir / "eval_prompts.jsonl").exists(),
-        metric="eval rows (steps 0 and every checkpoint)",
-    )
-
-    audit = load_audit(audit_dir)
-    cfg = GRPOConfig.from_dict({**train_cfg, "out_dir": str(run_dir)})
-    spec = dict(config.get("eval_generator") or {"backend": "hf"})
-    gen = make_generator(spec.get("backend", "hf"), cfg.model_id, **dict(spec.get("kwargs", {})))
-    train = [p for p in audit.problems.values() if p.split == "train"]
-    held = [p for p in audit.problems.values() if p.split == "heldout"]
-    again = evaluate_checkpoints(run_dir, audit.task, cfg, gen, train, held)
-    checks.add(
-        "P5.5",
-        "re-evaluation is idempotent (resumable)",
-        len(again),
-        not again,
-        metric="rows rewritten",
-    )
-    return [
-        (
-            "Dry-run eval curve",
-            markdown_table(
-                ["step", "split", "oracle_acc"],
-                [
-                    [r["step"], r["split"], r["oracle_acc"]]
-                    for r in read_jsonl(run_dir / "eval.jsonl")
-                ],
-            ),
-        )
-    ]
-
-
 def _run_dir(out: Path, arm: str, seed: int) -> Path:
     return out / "runs" / f"{arm}__s{seed}"
 
 
-def _complete(run_dir: Path, steps: int) -> bool:
-    path = run_dir / "summary.json"
-    return path.exists() and read_json(path).get("steps_completed") == steps
+P5_PILOT_SCHEMA = "vfates.p5_pilot/1"
+P5_DECISIONS_SCHEMA = "vfates.p5_decisions/1"
+THROUGHPUT_SCHEMA = "vfates.throughput/1"
+PATH_STEPS = 10
+GAIN_STEPS = 150
+GAIN_MIN = 0.05
+SEED_STEPS = 300
+SEED_SD_MAX = 0.03
+REFERENCE_STEPS = 300
+BASE_SEEDS = (0, 1, 2)
+ORACLE_SEED_PAIR = (0, 1)
+EXTRA_SEEDS = (3, 4)
 
 
-def _families(config: Mapping[str, Any]) -> list[dict[str, Any]]:
-    return [
-        {
-            "control": f["control"],
-            "kind": f.get("kind", "fp"),
-            "shared": list(f.get("shared", [])),
-            "local": list(f.get("local", [])),
-        }
-        for f in config.get("families", [])
-    ]
+def sample_sd(values: Sequence[float]) -> float | None:
+    """Sample standard deviation (ddof=1). None when fewer than two values."""
+    if len(values) < 2:
+        return None
+    return float(np.std(np.asarray(list(values), dtype=float), ddof=1))
 
 
-def full_gate(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
-    """Full H100 gate. The only scientific gate is the oracle held-out gain."""
-    import copy
+def seed_lists(
+    *,
+    arms: Sequence[str],
+    rule_arms: Sequence[str],
+    base_seeds: Sequence[int] = BASE_SEEDS,
+    extra_seeds: Sequence[int] = EXTRA_SEEDS,
+    sd: float | None,
+    threshold: float = SEED_SD_MAX,
+) -> dict[str, list[int]]:
+    """E1 seed list. H1 and H2 arms gain seeds 3 and 4 when ``sd`` exceeds the threshold."""
+    extra = sd is not None and float(sd) > float(threshold)
+    ruled = {str(arm) for arm in rule_arms}
+    planned: dict[str, list[int]] = {}
+    for arm in arms:
+        seeds = [int(item) for item in base_seeds]
+        if extra and str(arm) in ruled:
+            for item in extra_seeds:
+                if int(item) not in seeds:
+                    seeds.append(int(item))
+        planned[str(arm)] = seeds
+    return planned
 
-    from vfates.analysis.outcomes import (
-        paired_contrast_seeds,
-        require_final_step,
-        run_outcome,
-    )
-    from vfates.audit import run_audit
-    from vfates.experiment import train_arm
 
-    started = time.perf_counter()
-    out = Path(out_dir)
-    full = config["full"]
-    gate = full["gate"]
-    audit_dir = out / "audit"
-    # A resumed audit clock is only the remainder, so only a fresh audit is timed.
-    audit_fresh = not audit_dir.exists()
-    t_audit = time.perf_counter()
-    run_audit(copy.deepcopy(full["audit"]), audit_dir)
-    if audit_fresh:
-        pools = full["audit"]["pools"]
-        write_json(
-            out / AUDIT_TIMING_NAME,
+def gain_ok(gain: float | None, threshold: float = GAIN_MIN) -> bool:
+    """P5.3: held-out oracle gain at least ``threshold``."""
+    return gain is not None and float(gain) >= float(threshold)
+
+
+def preempt_ok(first: Mapping[str, Any], second: Mapping[str, Any], steps: int) -> bool:
+    """P5.2: preempted summary, then a completed run at the same planned step."""
+    if str(first.get("status")) != "preempted":
+        return False
+    if str(second.get("status")) != "complete":
+        return False
+    if int(second.get("steps_completed", -1)) != int(steps):
+        return False
+    mid = first.get("steps_completed")
+    return not (mid is not None and int(mid) >= int(steps))
+
+
+def path_ok(
+    *,
+    steps_completed: int,
+    steps: int,
+    status: str | None,
+    checkpoint: bool,
+    eval_steps: Sequence[int],
+    peak: Mapping[str, Any] | None,
+) -> bool:
+    """P5.1: finished step, saved adapter, held-out eval at 0 and the last step, peak memory."""
+    if int(steps_completed) != int(steps):
+        return False
+    if status not in (None, "complete"):
+        return False
+    if not checkpoint:
+        return False
+    seen = {int(item) for item in eval_steps}
+    if 0 not in seen or int(steps) not in seen:
+        return False
+    return bool(peak)
+
+
+def placement_pairs(cells: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """One row per (model, hardware class) that has a cell. Prefer a math cell."""
+    grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for cell in cells:
+        grouped.setdefault((str(cell["model"]), str(cell["hardware_class"])), []).append(cell)
+    rows: list[dict[str, str]] = []
+    for model, hardware in sorted(grouped):
+        group = grouped[(model, hardware)]
+        chosen = sorted(group, key=lambda item: (str(item["domain"]) != "math", str(item["id"])))[0]
+        rows.append(
             {
-                "audit_wall_s": time.perf_counter() - t_audit,
-                "completions": (int(pools["train"]) + int(pools["heldout"]))
-                * int(full["audit"]["sampling"]["n"]),
-            },
+                "model": model,
+                "hardware_class": hardware,
+                "cell_id": str(chosen["id"]),
+                "domain": str(chosen["domain"]),
+            }
         )
-    train_cfg = dict(gate["train"])
-    steps = int(train_cfg["steps"])
-    seeds = [int(s) for s in gate["seeds"]]
-    arms = list(gate["arms"])
-    for seed in seeds:
-        for arm in arms:
-            run_dir = _run_dir(out, arm, seed)
-            if _complete(run_dir, steps):
-                continue
-            resume = (run_dir / "checkpoints").exists() or any(run_dir.glob("checkpoint-*"))
-            t0 = time.perf_counter()
-            train_arm(
-                audit_dir,
-                arm,
-                {**train_cfg, "seed": seed},
-                run_dir,
-                backend="trl",
-                resume=resume,
-                eval_generator=gate.get("eval_generator"),
+    return rows
+
+
+def class_representatives(cells: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """One cell per hardware class. Prefer chain_sum, then qwen3-1.7b, then math."""
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for cell in cells:
+        grouped.setdefault(str(cell["hardware_class"]), []).append(cell)
+    rows: list[dict[str, str]] = []
+    for hardware in sorted(grouped):
+        chosen = sorted(
+            grouped[hardware],
+            key=lambda item: (
+                str(item["domain"]) != "chain_sum",
+                str(item["model"]) != "qwen3-1.7b",
+                str(item["domain"]) != "math",
+                str(item["id"]),
+            ),
+        )[0]
+        rows.append(
+            {
+                "model": str(chosen["model"]),
+                "hardware_class": hardware,
+                "cell_id": str(chosen["id"]),
+                "domain": str(chosen["domain"]),
+            }
+        )
+    return rows
+
+
+def gain_targets(cells: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Every model, on its math cell when it has one."""
+    by_model: dict[str, list[Mapping[str, Any]]] = {}
+    for cell in cells:
+        by_model.setdefault(str(cell["model"]), []).append(cell)
+    rows: list[dict[str, Any]] = []
+    for model in sorted(by_model):
+        group = by_model[model]
+        math = [item for item in group if str(item["domain"]) == "math"]
+        if math:
+            chosen = sorted(math, key=lambda item: str(item["id"]))[0]
+            rows.append(
+                {
+                    "model": model,
+                    "cell_id": str(chosen["id"]),
+                    "hardware_class": str(chosen["hardware_class"]),
+                    "retarget": False,
+                }
             )
-            # The whole train_arm clock: training, the checkpoint evaluation that
-            # follows it, and model loading. A resume is only the remainder, so it
-            # is not stored as the arm-seed cost.
-            if not resume:
-                write_json(
-                    run_dir / "timing.json",
-                    {"train_arm_wall_s": time.perf_counter() - t0, "includes_eval": True},
-                )
+        else:
+            host = sorted(group, key=lambda item: str(item["id"]))[0]
+            rows.append(
+                {
+                    "model": model,
+                    "cell_id": "e1-math-qwen3-1.7b",
+                    "hardware_class": str(host["hardware_class"]),
+                    "retarget": True,
+                }
+            )
+    return rows
 
-    run_dirs = [_run_dir(out, arm, seed) for arm in arms for seed in seeds]
-    checks = Checks()
-    incomplete = [str(path) for path in run_dirs if not _complete(path, steps)]
-    checks.add(
-        "P5.0",
-        "every planned arm-seed finished",
-        float(len(run_dirs) - len(incomplete)),
-        not incomplete,
-        threshold=str(len(run_dirs)),
-        metric="completed runs",
-    )
-    oracle_threshold = float(gate["gates"]["oracle_gain"])
-    if "oracle" not in arms and not incomplete:
-        checks.add(
-            "P5.7",
-            "oracle held-out gain on the development pool (the only scientific go/no-go)",
-            None,
-            False,
-            threshold=oracle_threshold,
-            metric="oracle arm missing",
-        )
-        return write_report(
-            out,
-            "P5 GPU gate (full)",
-            checks,
-            config=config,
-            started=started,
-            tables={"incomplete": incomplete},
-            sections=[],
-        )
-    if incomplete:
-        checks.add(
-            "P5.7",
-            "oracle held-out gain on the development pool (the only scientific go/no-go)",
-            None,
-            False,
-            threshold=oracle_threshold,
-            metric="runs incomplete",
-        )
-        return write_report(
-            out,
-            "P5 GPU gate (full)",
-            checks,
-            config=config,
-            started=started,
-            tables={"incomplete": incomplete},
-            sections=[],
-        )
 
-    require_final_step(run_dirs, steps)
-    per_seed: dict[str, list[dict[str, Any]]] = {
-        arm: [run_outcome(_run_dir(out, arm, seed), final_step=steps) for seed in seeds]
-        for arm in arms
+def e1_rows(cells: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(cell) for cell in cells if str(cell.get("experiment")) == "E1"]
+
+
+def study_command(
+    config_path: str | Path,
+    out_dir: str | Path,
+    *,
+    arm: str | None,
+    seed: int | None,
+    gpus: int,
+    only: str = "train",
+) -> list[str]:
+    """Argv for one study job. Two or more GPUs go through ``accelerate launch``."""
+    import sys
+
+    from vfates.schedule import build_worker_command
+
+    kind = "audit" if only == "audit" else "train"
+    job: dict[str, Any] = {
+        "kind": kind,
+        "config": str(config_path),
+        "out_dir": str(out_dir),
+        "arm": arm,
+        "seed": 0 if seed is None else int(seed),
+        "gpus": int(gpus),
+        "program": "configs/program.yaml",
     }
-    gain = float(np.mean([row["heldout_delta"] for row in per_seed["oracle"]]))
-    checks.add(
-        "P5.7",
-        "oracle held-out gain on the development pool (the only scientific go/no-go)",
-        gain,
-        gain >= oracle_threshold,
-        threshold=oracle_threshold,
-        metric="mean over seeds of held-out final - step 0",
-    )
+    return build_worker_command(job, python=sys.executable)
 
-    n_boot = int(gate.get("n_boot", 2000))
-    contrast_rows: list[list[Any]] = []
-    for fam in _families(gate):
-        control = fam["control"]
-        if control not in per_seed:
+
+def read_peak(summary: Mapping[str, Any]) -> dict[str, float] | None:
+    """Per-GPU peak GiB from a train summary, if the trainer recorded it."""
+    per = summary.get("peak_memory_gb_per_gpu")
+    if isinstance(per, Mapping) and per:
+        return {str(key): float(value) for key, value in per.items()}
+    value = summary.get("peak_memory_gb")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return {"0": float(value)}
+
+
+def read_eval_steps(run_dir: str | Path) -> list[int]:
+    path = Path(run_dir) / "eval.jsonl"
+    if not path.is_file():
+        return []
+    found: list[int] = []
+    for row in read_jsonl(path):
+        if row.get("split") != "heldout":
             continue
-        for arm in [*fam["shared"], *fam["local"]]:
-            if arm not in per_seed:
-                continue
-            res = paired_contrast_seeds(
-                [(_run_dir(out, control, seed), _run_dir(out, arm, seed)) for seed in seeds],
-                step=steps,
-                n_boot=n_boot,
-                seed=0,
-                margin=0.05,
-            )
-            contrast_rows.append(
-                [
-                    f"{control} - {arm}",
-                    res["diff"],
-                    res["p_le_0"],
-                    res.get("p_tost"),
-                    res["n_prompts"],
-                ]
-            )
-            checks.add(
-                f"P5.8.{arm}",
-                f"fate contrast {control} - {arm} (logged, not a gate)",
-                res["diff"],
-                True,
-                metric=f"prompt-bootstrap p={res['p_le_0']:.4f}, p_tost={res.get('p_tost')}",
-                documented=True,
-            )
+        step = row.get("step")
+        if isinstance(step, bool) or not isinstance(step, int):
+            continue
+        if step not in found:
+            found.append(step)
+    return found
 
-    oracle_finals = [float(row["heldout_final"]) for row in per_seed["oracle"]]
-    sd = float(np.std(oracle_finals, ddof=1)) if len(oracle_finals) >= 2 else None
-    threshold = float(gate["gates"].get("seed_sd_threshold", 0.03))
-    extra = sd is not None and sd > threshold
-    h1_h2_seeds = 5 if extra else 3
-    checks.add(
-        "P5.9",
-        "E1 seed rule from the oracle seeds' final held-out accuracies",
-        sd,
-        True,
-        threshold=threshold,
-        metric=(
-            f"sample SD {sd}; H1/H2 arms use {h1_h2_seeds} seeds (5 when SD > 0.03, otherwise 3)"
-        ),
-        documented=True,
+
+def has_checkpoint(run_dir: str | Path, steps: int) -> bool:
+    root = Path(run_dir)
+    if (root / f"checkpoint-{int(steps)}").exists():
+        return True
+    if any(root.glob("checkpoint-*")):
+        return True
+    return (root / "checkpoints").exists()
+
+
+def execute_study(
+    config: Mapping[str, Any],
+    out_dir: str | Path,
+    *,
+    only: str,
+    arm: str | None = None,
+    seed: int | None = None,
+) -> dict[str, Any]:
+    """In-process study job. Audits stay one process. Single-GPU training does too."""
+    from vfates.study import run_study
+
+    return run_study(config, out_dir, only=only, arm=arm, seed=seed)
+
+
+def _audit_ready(out: Path) -> bool:
+    audit = out / "audit"
+    return (audit / "lock.json").is_file() or (audit / "forecasts.json").is_file()
+
+
+def _cell_gpus(cell: Mapping[str, Any]) -> int:
+    value = cell.get("study", {})
+    if isinstance(value, Mapping) and value.get("gpus") is not None:
+        return int(value["gpus"])
+    return 1
+
+
+def _write_cell(cell: Mapping[str, Any], out: Path) -> Path:
+    from vfates.utils.io import write_yaml
+
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "cell.yaml"
+    write_yaml(path, dict(cell))
+    return path
+
+
+def _subprocess_train(
+    cell: Mapping[str, Any], out: Path, *, arm: str, seed: int, gpus: int
+) -> dict[str, Any]:
+    import subprocess
+
+    config_path = _write_cell(cell, out)
+    argv = study_command(config_path, out, arm=arm, seed=seed, gpus=gpus, only="train")
+    completed = subprocess.run(argv, check=False)
+    summary_path = out / "runs" / f"{arm}__s{seed}" / "summary.json"
+    if completed.returncode != 0:
+        raise RuntimeError(f"study exited {completed.returncode}: {' '.join(argv)}")
+    if not summary_path.is_file():
+        raise RuntimeError(f"study wrote no summary: {summary_path}")
+    return read_json(summary_path)
+
+
+def run_arm(
+    cell: Mapping[str, Any],
+    out_dir: str | Path,
+    *,
+    arm: str,
+    seed: int,
+    gpus: int | None = None,
+) -> dict[str, Any]:
+    """Audit if needed, then train one arm. Multi-GPU training uses accelerate."""
+    import os
+
+    out = Path(out_dir)
+    _write_cell(cell, out)
+    if not _audit_ready(out):
+        execute_study(cell, out, only="audit")
+    width = _cell_gpus(cell) if gpus is None else int(gpus)
+    if width > 1 and os.environ.get("VFATES_P5_INPROCESS") != "1":
+        return _subprocess_train(cell, out, arm=arm, seed=seed, gpus=width)
+    return execute_study(cell, out, only="train", arm=arm, seed=seed)
+
+
+def execute_preempt(
+    cell: Mapping[str, Any],
+    out_dir: str | Path,
+    *,
+    arm: str,
+    seed: int,
+    steps: int,
+    gpus: int = 1,
+    signal_at: int | None = None,
+    timeout_s: float = 7200.0,
+) -> dict[str, Any]:
+    """SIGUSR1 at a mid step, then resume the same study command to ``steps``."""
+    import os
+    import signal
+    import subprocess
+    import time as time_mod
+
+    out = Path(out_dir)
+    _write_cell(cell, out)
+    if not _audit_ready(out):
+        execute_study(cell, out, only="audit")
+    config_path = out / "cell.yaml"
+    argv = study_command(config_path, out, arm=arm, seed=seed, gpus=gpus, only="train")
+    run_dir = out / "runs" / f"{arm}__s{seed}"
+    mid = max(1, int(steps) // 2) if signal_at is None else int(signal_at)
+    first = _signal_and_wait(
+        argv,
+        run_dir,
+        mid=mid,
+        timeout_s=timeout_s,
+        os=os,
+        signal=signal,
+        subprocess=subprocess,
+        time_mod=time_mod,
     )
-    power = {
-        str(n): minimum_detectable_difference(0.0 if sd is None else sd, n_seeds=n, margin=0.05)
-        for n in (3, 5)
-    }
+    second_proc = subprocess.run(argv, check=False)
+    summary_path = run_dir / "summary.json"
+    second = read_json(summary_path) if summary_path.is_file() else {}
+    if second_proc.returncode != 0:
+        second = {**second, "returncode": second_proc.returncode}
+    return {"first": first, "second": second}
 
-    timings = [arm_seed_timing(path) for path in run_dirs]
-    train_secs = [row["train_seconds"] for row in timings if row["train_seconds"] is not None]
-    eval_secs = [row["eval_seconds"] for row in timings if row["eval_seconds"] is not None]
-    rates = [row["gen_tok_s"] for row in timings if row["gen_tok_s"] is not None]
-    lengths = [
-        row["mean_completion_len"] for row in timings if row["mean_completion_len"] is not None
-    ]
-    audit_timing = read_json(out / AUDIT_TIMING_NAME) if (out / AUDIT_TIMING_NAME).exists() else {}
-    measured: dict[str, Any] = {
-        "n_runs": len(train_secs),
-        "train_seconds_per_arm_seed": float(np.mean(train_secs)) if train_secs else None,
-        "eval_seconds_per_arm_seed": float(np.mean(eval_secs)) if eval_secs else None,
-        "gen_tok_s": float(np.mean(rates)) if rates else None,
-        "mean_completion_len": float(np.mean(lengths)) if lengths else None,
-        "audit_wall_s": audit_timing.get("audit_wall_s"),
-        "audit_completions": audit_timing.get("completions"),
-        "source": next((row["source"] for row in timings if row["source"]), None),
-        "eval_sources": sorted({str(row["eval_source"]) for row in timings if row["eval_source"]}),
-    }
-    e1_spec = dict(config.get("e1_cost") or {})
-    projections: dict[str, Any] = {}
-    if measured["train_seconds_per_arm_seed"] is not None and e1_spec:
-        for label, runs in (
-            ("seeds_3", int(e1_spec.get("full_runs", 39))),
-            ("seeds_5_on_h1_h2", int(e1_spec.get("full_runs_if_extra_seeds", 57))),
+
+def _signal_and_wait(
+    argv: Sequence[str],
+    run_dir: Path,
+    *,
+    mid: int,
+    timeout_s: float,
+    os: Any,
+    signal: Any,
+    subprocess: Any,
+    time_mod: Any,
+) -> dict[str, Any]:
+    import contextlib
+
+    proc = subprocess.Popen(list(argv), start_new_session=True)
+    deadline = time_mod.perf_counter() + timeout_s
+    signaled = False
+    while time_mod.perf_counter() < deadline:
+        if _metric_step(run_dir) >= mid and not signaled:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGUSR1)
+            signaled = True
+        if proc.poll() is not None:
+            break
+        time_mod.sleep(2.0)
+    else:
+        proc.kill()
+        raise TimeoutError(f"preempt wait exceeded {timeout_s}s")
+    summary_path = run_dir / "summary.json"
+    summary = read_json(summary_path) if summary_path.is_file() else {}
+    summary = dict(summary)
+    summary["returncode"] = proc.returncode
+    summary["signaled"] = signaled
+    return summary
+
+
+def _metric_step(run_dir: Path) -> int:
+    path = run_dir / "metrics.jsonl"
+    if not path.is_file():
+        return -1
+    step = -1
+    for row in read_jsonl(path):
+        value = row.get("step")
+        if isinstance(value, int) and not isinstance(value, bool):
+            step = max(step, value)
+    return step
+
+
+def measure_run(
+    run_dir: str | Path,
+    *,
+    model: str,
+    hardware_class: str,
+    gpus: int,
+    steps: int,
+    smoke: bool = False,
+) -> dict[str, Any]:
+    """Generation and training tokens per second per GPU, and scaled arm-seed hours."""
+    timing = arm_seed_timing(run_dir)
+    path = Path(run_dir) / "metrics.jsonl"
+    rows = read_jsonl(path) if path.is_file() else []
+    width = max(int(gpus), 1)
+    gen_rates: list[float] = []
+    train_rates: list[float] = []
+    for row in rows:
+        tokens = row.get("tokens_generated")
+        gen_s = row.get("gen_seconds")
+        train_s = row.get("train_seconds")
+        if (
+            isinstance(tokens, (int, float))
+            and isinstance(gen_s, (int, float))
+            and float(gen_s) > 0
         ):
-            spec = {**e1_spec, "full_runs": runs}
-            try:
-                projections[label] = project_measured_cost(
-                    train_seconds_per_arm_seed=measured["train_seconds_per_arm_seed"],
-                    reference_steps=steps,
-                    spec=spec,
-                    eval_seconds_per_arm_seed=measured["eval_seconds_per_arm_seed"],
-                    gen_tok_s=measured["gen_tok_s"],
-                    mean_completion_len=measured["mean_completion_len"],
-                    audit_seconds=measured["audit_wall_s"],
-                    audit_completions=measured["audit_completions"],
-                )
-            except ValueError as exc:
-                projections[label] = {"error": str(exc), "eval_tokens_included": False}
-    planned_key = "seeds_5_on_h1_h2" if extra else "seeds_3"
-    planned_cost = projections.get(planned_key) or {}
-    checks.add(
-        "P5.10",
-        "measured H100 hours per arm-seed and projected E1 cost (eval tokens included)",
-        None
-        if measured["train_seconds_per_arm_seed"] is None
-        else measured["train_seconds_per_arm_seed"] / 3600.0,
-        True,
-        metric=(
-            f"source={measured['source']}; audit_source={planned_cost.get('audit_source')}; "
-            f"planned E1 hours {planned_cost.get('h100_hours')}"
-        ),
-        documented=True,
-    )
-    sections = [
-        (
-            "Fate contrasts (not a gate)",
-            markdown_table(
-                ["contrast", "diff", "p (diff <= 0)", "p TOST", "prompts"],
-                contrast_rows,
-            ),
-        ),
-        (
-            "E1 seed rule and minimum detectable difference",
-            markdown_table(
-                ["seeds", "SE", "MDD at margin 0.05", "power at 0.05"],
-                [[n, row["se"], row["mdd"], row["power_at_0.05"]] for n, row in power.items()],
-            ),
-        ),
-    ]
-    return write_report(
-        out,
-        "P5 GPU gate (full)",
-        checks,
-        config=config,
-        started=started,
-        tables={
-            "oracle_finals": oracle_finals,
-            "oracle_sd": sd,
-            "h1_h2_seeds": h1_h2_seeds,
-            "power": power,
-            "timing": measured,
-            "e1_projection": projections,
-            "e1_projection_planned": planned_key,
-            "contrasts": contrast_rows,
-        },
-        sections=sections,
-    )
+            gen_rates.append(float(tokens) / float(gen_s) / width)
+        if (
+            isinstance(tokens, (int, float))
+            and isinstance(train_s, (int, float))
+            and float(train_s) > 0
+        ):
+            train_rates.append(float(tokens) / float(train_s) / width)
+    wall = timing.get("train_seconds")
+    if (
+        isinstance(wall, (int, float))
+        and not timing.get("eval_included_in_wall")
+        and isinstance(timing.get("eval_seconds"), (int, float))
+    ):
+        wall = float(wall) + float(timing["eval_seconds"])
+    hours = None
+    if isinstance(wall, (int, float)) and int(steps) > 0:
+        hours = float(wall) / float(steps) * REFERENCE_STEPS / 3600.0
+    return {
+        "model": model,
+        "hardware_class": hardware_class,
+        "gpus": width,
+        "steps": int(steps),
+        "smoke": bool(smoke),
+        "gen_tok_s_per_gpu": None if not gen_rates else float(np.mean(gen_rates)),
+        "train_tok_s_per_gpu": None if not train_rates else float(np.mean(train_rates)),
+        "hours_per_arm_seed": hours,
+        "run_dir": str(run_dir),
+    }
 
 
-def run_replication_screen(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
-    """Base accuracy and truncation of the two 3B candidates on 128 development prompts."""
-    from vfates.gen.factory import make_generator
-    from vfates.tasks.chain_sum import ChainSumConfig, ChainSumTask
-    from vfates.types import GenOut
+def aggregate_measurements(rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Mean rates per (model, hardware class). Smoke rows and incomplete rows are dropped."""
+    grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        if row.get("smoke"):
+            continue
+        if row.get("gen_tok_s_per_gpu") is None or row.get("train_tok_s_per_gpu") is None:
+            continue
+        if row.get("hours_per_arm_seed") is None:
+            continue
+        key = (str(row["model"]), str(row["hardware_class"]))
+        grouped.setdefault(key, []).append(row)
+    out: dict[str, dict[str, Any]] = {}
+    for (model, hardware), items in sorted(grouped.items()):
+        out.setdefault(model, {})[hardware] = {
+            "gen_tok_s_per_gpu": float(
+                np.mean([float(item["gen_tok_s_per_gpu"]) for item in items])
+            ),
+            "train_tok_s_per_gpu": float(
+                np.mean([float(item["train_tok_s_per_gpu"]) for item in items])
+            ),
+            "hours_per_arm_seed": float(
+                np.mean([float(item["hours_per_arm_seed"]) for item in items])
+            ),
+        }
+    return out
+
+
+def git_commit(root: Path | None = None) -> str:
+    import subprocess
+
+    from vfates.program import repo_root
+
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root or repo_root(),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def write_throughput(
+    path: str | Path,
+    rates: Mapping[str, Mapping[str, Any]],
+    *,
+    measured_at: str,
+    commit: str,
+) -> None:
+    """Write ``configs/throughput.yaml`` in schema ``vfates.throughput/1``."""
+    from vfates.utils.io import write_yaml
+
+    body: dict[str, Any] = {"schema": THROUGHPUT_SCHEMA, "rates": {}}
+    for model in sorted(rates):
+        body["rates"][model] = {}
+        for hardware in sorted(rates[model]):
+            row = rates[model][hardware]
+            body["rates"][model][hardware] = {
+                "gen_tok_s_per_gpu": float(row["gen_tok_s_per_gpu"]),
+                "train_tok_s_per_gpu": float(row["train_tok_s_per_gpu"]),
+                "hours_per_arm_seed": float(row["hours_per_arm_seed"]),
+                "measured_at": measured_at,
+                "commit": commit,
+            }
+    write_yaml(path, body)
+
+
+def _stage_file(out: Path, stage: str) -> Path:
+    return out / "stages" / f"{stage}.json"
+
+
+def _load_stage(out: Path, stage: str) -> dict[str, Any]:
+    path = _stage_file(out, stage)
+    if not path.is_file():
+        return {"stage": stage, "rows": [], "measurements": []}
+    loaded = read_json(path)
+    loaded.setdefault("rows", [])
+    loaded.setdefault("measurements", [])
+    return loaded
+
+
+def _save_stage(out: Path, stage: str, payload: Mapping[str, Any]) -> None:
+    path = _stage_file(out, stage)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, dict(payload))
+
+
+def _upsert(rows: Sequence[Mapping[str, Any]], row: Mapping[str, Any], keys: Sequence[str]) -> list:
+    fresh = dict(row)
+    identity = tuple(fresh.get(key) for key in keys)
+    kept = [dict(item) for item in rows if tuple(item.get(key) for key in keys) != identity]
+    kept.append(fresh)
+    return kept
+
+
+def _selected(row: Mapping[str, Any], config: Mapping[str, Any]) -> bool:
+    model = config.get("model")
+    hardware = config.get("hardware_class")
+    model_ok = not model or str(row.get("model")) == str(model)
+    hardware_ok = not hardware or str(row.get("hardware_class")) == str(hardware)
+    return model_ok and hardware_ok
+
+
+def _program_cells(config: Mapping[str, Any]) -> list[dict[str, Any]]:
+    if config.get("cells"):
+        return [dict(cell) for cell in config["cells"]]
+    from vfates.program import load_program, repo_root
+
+    root = Path(config["root"]) if config.get("root") else repo_root()
+    program_path = Path(config.get("program") or (root / "configs" / "program.yaml"))
+    program = load_program(program_path, root=root)
+    return [dict(cell) for cell in program["cells"]]
+
+
+def _prepare_cell(
+    cell_id: str,
+    *,
+    steps: int,
+    arms: Sequence[str],
+    seeds: Sequence[int],
+    smoke: bool,
+    hardware: str,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    from vfates.pilots.p4_micro_grpo import load_pilot_cell, protocol_overrides
+
+    if smoke:
+        overrides = protocol_overrides(
+            steps=steps, seed=int(seeds[0]), arms=arms, smoke=True, hardware=hardware
+        )
+    else:
+        overrides = {
+            "audit.pools.from": "dev",
+            "study.train.steps": int(steps),
+            "analysis.final_step": int(steps),
+            "analysis.early.enabled": False,
+            "study.seeds": [int(item) for item in seeds],
+            "study.arms": list(arms),
+            "study.train.eval_every": max(1, min(25, int(steps))),
+            "study.train.save_every": max(1, min(25, int(steps))),
+            "study.train.use_vllm": True,
+            "study.train.vllm_mode": "colocate",
+        }
+    if extra:
+        overrides.update(dict(extra))
+    return load_pilot_cell(cell_id, dev=True, overrides=overrides)
+
+
+def _model_retarget(model: str, hardware: str) -> dict[str, Any]:
+    from vfates.models import load_model_spec
+
+    spec = load_model_spec(model)
+    kwargs = dict(spec.chat_template_kwargs or {})
+    overrides: dict[str, Any] = {
+        "audit.generator.model_id": spec.model_id,
+        "audit.generator.revision": spec.revision,
+        "audit.generator.chat_template_kwargs": kwargs,
+        "audit.features.model_id": spec.model_id,
+        "audit.features.chat_template_kwargs": kwargs,
+        "study.train.model_id": spec.model_id,
+        "study.train.model_revision": spec.revision,
+        "study.train.chat_template_kwargs": kwargs,
+        "study.train.lr": float(spec.lr),
+        "study.hardware_class": hardware,
+        "study.eval_generator.kwargs.chat_template_kwargs": kwargs,
+    }
+    try:
+        place = spec.placement_for(hardware)
+    except ValueError:
+        return overrides
+    overrides["study.gpus"] = place.gpus
+    overrides["study.train.micro_batch_size"] = place.micro_batch_size
+    overrides["audit.generator.kwargs.tensor_parallel_size"] = place.tp
+    overrides["audit.generator.kwargs.gpu_memory_utilization"] = place.vllm_gpu_memory_utilization
+    overrides["study.eval_generator.kwargs.tensor_parallel_size"] = place.tp
+    overrides["study.eval_generator.kwargs.gpu_memory_utilization"] = (
+        place.vllm_gpu_memory_utilization
+    )
+    return overrides
+
+
+def _score_path(out: Path, *, steps: int) -> dict[str, Any]:
+    run_dir = _run_dir(out, "oracle", 0)
+    summary: dict[str, Any] = {}
+    path = run_dir / "summary.json"
+    if path.is_file():
+        summary = read_json(path)
+    peak = read_peak(summary)
+    eval_steps = read_eval_steps(run_dir)
+    checkpoint = has_checkpoint(run_dir, steps)
+    status = summary.get("status")
+    completed = int(summary.get("steps_completed", -1))
+    passed = path_ok(
+        steps_completed=completed,
+        steps=steps,
+        status=None if status is None else str(status),
+        checkpoint=checkpoint,
+        eval_steps=eval_steps,
+        peak=peak,
+    )
+    endpoint = None
+    if passed or eval_steps:
+        from vfates.pilots.p4_micro_grpo import heldout_accuracy
+
+        endpoint = heldout_accuracy(run_dir, steps)
+    return {
+        "pass": passed,
+        "steps_completed": completed,
+        "status": status,
+        "checkpoint": checkpoint,
+        "eval_steps": eval_steps,
+        "peak_memory_gb_per_gpu": peak,
+        "endpoint_acc": endpoint,
+        "run_dir": str(run_dir),
+    }
+
+
+def run_path(config: Mapping[str, Any], out_dir: str | Path) -> dict[str, Any]:
+    """P5.1, one (model, hardware class) pair, or every pair."""
+    from vfates.utils.env import hardware_class
 
     started = time.perf_counter()
     out = Path(out_dir)
-    pool_seed = int(config.get("pool_seed", 50_000_000))
-    n_prompts = int(config.get("n_prompts", 128))
-    max_tokens = int(config.get("max_tokens", 1024))
-    samples = int(config.get("samples", 1))
-    temperature = float(config.get("temperature", 1.0))
-    task = ChainSumTask(ChainSumConfig())
-    problems = task.problems("heldout", n_prompts, pool_seed)
-    prompts = [task.prompt(problem) for problem in problems]
-    models = list(config.get("models") or [LLAMA_3B, QWEN_3B])
-    gen_cfg = dict(config.get("generator") or {"backend": "vllm"})
-    backend = str(gen_cfg.get("backend", "vllm"))
-    if backend not in ("mlx", "hf", "vllm"):
-        raise ValueError(f"unknown generation backend {backend!r}")
-    kwargs = dict(gen_cfg.get("kwargs") or {})
-    scored: dict[str, Any] = {}
+    smoke = bool(config.get("smoke", False))
+    steps = int(config.get("smoke_steps", 2) if smoke else config.get("path_steps", PATH_STEPS))
+    detected = hardware_class()
     checks = Checks()
-    for model_id in models:
-        generator = make_generator(cast(Literal["mlx", "hf", "vllm"], backend), model_id, **kwargs)
-        batches = generator.generate(
-            prompts,
-            samples,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=1.0,
-            seed=0,
+    stage = _load_stage(out, "path")
+    targets = _path_targets(config, smoke=smoke, hardware=detected)
+    for target in targets:
+        cell = _prepare_cell(
+            target["cell_id"],
+            steps=steps,
+            arms=["oracle"],
+            seeds=[0],
+            smoke=smoke,
+            hardware=detected if smoke else str(target["hardware_class"]),
+            extra=target.get("extra"),
         )
-        correct: list[int] = []
-        truncated: list[bool] = []
-        for problem, outs in zip(problems, batches, strict=True):
-            for out_row in outs:
-                if not isinstance(out_row, GenOut):
-                    raise TypeError(f"generator returned {type(out_row).__name__}, expected GenOut")
-                parsed = task.parse(problem, out_row.text)
-                correct.append(int(task.oracle(problem, parsed, out_row.text)))
-                truncated.append(out_row.finish_reason == "length")
-        scored[model_id] = base_screen_summary(correct, truncated)
-        del generator
-    llama = scored.get(LLAMA_3B)
-    if llama is None:
-        choice = {
-            "model_id": None,
-            "preferred_ok": False,
-            "rule": REPLICATION_RULE,
-            "reason": "Llama screen was not run",
+        dest = out / "path" / f"{target['model']}__{target['hardware_class']}"
+        try:
+            run_arm(cell, dest, arm="oracle", seed=0, gpus=int(target.get("gpus") or 1))
+            scored = _score_path(dest, steps=steps)
+            error = None
+        except Exception as exc:
+            scored = {
+                "pass": False,
+                "steps_completed": None,
+                "status": None,
+                "checkpoint": False,
+                "eval_steps": [],
+                "peak_memory_gb_per_gpu": None,
+                "endpoint_acc": None,
+                "run_dir": str(_run_dir(dest, "oracle", 0)),
+            }
+            error = f"{type(exc).__name__}: {exc}"
+        row = {
+            "model": target["record_model"],
+            "hardware_class": target["record_hardware"],
+            "cell_id": target["cell_id"],
+            **scored,
         }
-    else:
-        choice = choose_replication_model(llama["accuracy"], llama["truncation"])
-    checks.add(
-        "P5.S",
-        "3B replication model rule (documented; not an E1 gate)",
-        None if not llama else llama["accuracy"],
-        choice.get("model_id") is not None,
-        metric=f"chosen {choice.get('model_id')}; truncation {None if not llama else llama['truncation']}",
-        documented=True,
+        stage["rows"] = _upsert(stage["rows"], row, ("model", "hardware_class"))
+        if error is None and scored["run_dir"]:
+            stage["measurements"] = _upsert(
+                stage["measurements"],
+                measure_run(
+                    scored["run_dir"],
+                    model=row["model"],
+                    hardware_class=row["hardware_class"],
+                    gpus=int(target.get("gpus") or 1),
+                    steps=steps,
+                    smoke=smoke,
+                ),
+                ("model", "hardware_class", "run_dir"),
+            )
+        checks.add(
+            f"P5.1.{row['model']}.{row['hardware_class']}",
+            f"path {row['model']} on {row['hardware_class']}",
+            None if scored["endpoint_acc"] is None else float(scored["endpoint_acc"]),
+            bool(scored["pass"]),
+            threshold=f"{steps} steps, adapter reload eval, peak memory",
+            metric=error or f"peak={scored['peak_memory_gb_per_gpu']}",
+        )
+    stage["stage"] = "path"
+    _save_stage(out, "path", stage)
+    return write_report(
+        out,
+        "P5 path",
+        checks,
+        config=dict(config),
+        started=started,
+        tables={"path": stage["rows"]},
+        sections=[],
+        intro=f"Hardware class {detected}. P5.1 is gated.",
     )
+
+
+def _path_targets(config: Mapping[str, Any], *, smoke: bool, hardware: str) -> list[dict[str, Any]]:
+    if smoke:
+        return [
+            {
+                "model": "qwen3-1.7b",
+                "hardware_class": hardware,
+                "cell_id": "e1-chain_sum-qwen3-1.7b",
+                "record_model": "qwen3-0.6b",
+                "record_hardware": hardware,
+                "gpus": 1,
+                "extra": None,
+            }
+        ]
+    rows = []
+    for pair in placement_pairs(_program_cells(config)):
+        if not _selected(pair, config):
+            continue
+        gpus = 1
+        try:
+            from vfates.models import load_model_spec
+
+            gpus = int(load_model_spec(pair["model"]).placement_for(pair["hardware_class"]).gpus)
+        except (OSError, ValueError):
+            gpus = 1
+        rows.append(
+            {
+                **pair,
+                "record_model": pair["model"],
+                "record_hardware": pair["hardware_class"],
+                "gpus": gpus,
+                "extra": None,
+            }
+        )
+    return rows
+
+
+def run_preempt(config: Mapping[str, Any], out_dir: str | Path) -> dict[str, Any]:
+    """P5.2, one run per hardware class."""
+    from vfates.utils.env import hardware_class
+
+    started = time.perf_counter()
+    out = Path(out_dir)
+    smoke = bool(config.get("smoke", False))
+    steps = int(config.get("smoke_steps", 2) if smoke else config.get("preempt_steps", PATH_STEPS))
+    detected = hardware_class()
+    checks = Checks()
+    stage = _load_stage(out, "preempt")
+    targets = _preempt_targets(config, smoke=smoke, hardware=detected)
+    for target in targets:
+        cell = _prepare_cell(
+            target["cell_id"],
+            steps=steps,
+            arms=["oracle"],
+            seeds=[0],
+            smoke=smoke,
+            hardware=detected if smoke else str(target["hardware_class"]),
+        )
+        dest = out / "preempt" / str(target["hardware_class"])
+        try:
+            outcome = execute_preempt(
+                cell,
+                dest,
+                arm="oracle",
+                seed=0,
+                steps=steps,
+                gpus=int(target.get("gpus") or 1),
+            )
+            passed = preempt_ok(outcome["first"], outcome["second"], steps)
+            error = None
+        except Exception as exc:
+            outcome = {"first": {}, "second": {}}
+            passed = False
+            error = f"{type(exc).__name__}: {exc}"
+        row = {
+            "model": target["record_model"],
+            "hardware_class": target["record_hardware"],
+            "cell_id": target["cell_id"],
+            "pass": passed,
+            "first_status": outcome["first"].get("status"),
+            "second_status": outcome["second"].get("status"),
+            "steps": steps,
+        }
+        stage["rows"] = _upsert(stage["rows"], row, ("hardware_class",))
+        checks.add(
+            f"P5.2.{row['hardware_class']}",
+            f"preempt and resume on {row['hardware_class']}",
+            None,
+            passed,
+            threshold="status preempted, then complete at the same step",
+            metric=error or f"first={row['first_status']}, second={row['second_status']}",
+        )
+    stage["stage"] = "preempt"
+    _save_stage(out, "preempt", stage)
+    return write_report(
+        out,
+        "P5 preempt",
+        checks,
+        config=dict(config),
+        started=started,
+        tables={"preempt": stage["rows"]},
+        sections=[],
+        intro=f"Hardware class {detected}. P5.2 is gated.",
+    )
+
+
+def _preempt_targets(
+    config: Mapping[str, Any], *, smoke: bool, hardware: str
+) -> list[dict[str, Any]]:
+    if smoke:
+        return [
+            {
+                "model": "qwen3-1.7b",
+                "hardware_class": hardware,
+                "cell_id": "e1-chain_sum-qwen3-1.7b",
+                "record_model": "qwen3-0.6b",
+                "record_hardware": hardware,
+                "gpus": 1,
+            }
+        ]
+    rows = []
+    for pair in class_representatives(_program_cells(config)):
+        if config.get("hardware_class") and pair["hardware_class"] != str(config["hardware_class"]):
+            continue
+        gpus = 1
+        try:
+            from vfates.models import load_model_spec
+
+            gpus = int(load_model_spec(pair["model"]).placement_for(pair["hardware_class"]).gpus)
+        except (OSError, ValueError):
+            gpus = 1
+        rows.append(
+            {
+                **pair,
+                "record_model": pair["model"],
+                "record_hardware": pair["hardware_class"],
+                "gpus": gpus,
+            }
+        )
+    return rows
+
+
+def run_gain(config: Mapping[str, Any], out_dir: str | Path) -> dict[str, Any]:
+    """P5.3: oracle on the math dev pool, 150 steps, the spec learning rate."""
+    from vfates.pilots.p4_micro_grpo import heldout_gain
+    from vfates.utils.env import hardware_class
+
+    started = time.perf_counter()
+    out = Path(out_dir)
+    steps = int(config.get("gain_steps", GAIN_STEPS))
+    threshold = float(config.get("gain_threshold", GAIN_MIN))
+    detected = hardware_class()
+    checks = Checks()
+    stage = _load_stage(out, "gain")
+    for target in gain_targets(_program_cells(config)):
+        if config.get("model") and target["model"] != str(config["model"]):
+            continue
+        extra = None
+        if target["retarget"]:
+            extra = _model_retarget(target["model"], target["hardware_class"])
+        cell = _prepare_cell(
+            target["cell_id"],
+            steps=steps,
+            arms=["oracle"],
+            seeds=[0],
+            smoke=False,
+            hardware=str(target["hardware_class"]),
+            extra=extra,
+        )
+        dest = out / "gain" / str(target["model"])
+        try:
+            run_arm(cell, dest, arm="oracle", seed=0)
+            gain = heldout_gain(_run_dir(dest, "oracle", 0), steps)
+            error = None
+        except Exception as exc:
+            gain = None
+            error = f"{type(exc).__name__}: {exc}"
+        passed = gain_ok(gain, threshold)
+        row = {
+            "model": target["model"],
+            "hardware_class": target["hardware_class"],
+            "cell_id": target["cell_id"],
+            "pass": passed,
+            "gain": gain,
+        }
+        stage["rows"] = _upsert(stage["rows"], row, ("model",))
+        stage["measurements"] = _upsert(
+            stage["measurements"],
+            measure_run(
+                _run_dir(dest, "oracle", 0),
+                model=target["model"],
+                hardware_class=target["hardware_class"],
+                gpus=_cell_gpus(cell),
+                steps=steps,
+            ),
+            ("model", "hardware_class", "run_dir"),
+        )
+        checks.add(
+            f"P5.3.{target['model']}",
+            f"{target['model']} oracle held-out gain on the math dev pool",
+            gain,
+            passed,
+            threshold=threshold,
+            metric=error or "held-out last step minus step 0",
+        )
+    stage["stage"] = "gain"
+    _save_stage(out, "gain", stage)
+    return write_report(
+        out,
+        "P5 gain",
+        checks,
+        config=dict(config),
+        started=started,
+        tables={"gain": stage["rows"]},
+        sections=[],
+        intro=f"Hardware class {detected}. P5.3 is gated.",
+    )
+
+
+def run_seeds(config: Mapping[str, Any], out_dir: str | Path) -> dict[str, Any]:
+    """P5.4: oracle seeds 0 and 1, then H1/H2 seeds 3 and 4 when the SD exceeds 0.03."""
+    from vfates.pilots.p4_micro_grpo import apply_dotted, heldout_accuracy, load_pilot_cell
+    from vfates.utils.env import hardware_class
+
+    started = time.perf_counter()
+    out = Path(out_dir)
+    steps = int(config.get("seed_steps", SEED_STEPS))
+    threshold = float(config.get("seed_sd_threshold", SEED_SD_MAX))
+    detected = hardware_class()
+    checks = Checks()
+    stage = _load_stage(out, "seeds")
+    for cell_row in e1_rows(_program_cells(config)):
+        cell_id = str(cell_row["id"])
+        if config.get("cell") and cell_id != str(config["cell"]):
+            continue
+        dest = out / "seeds" / cell_id
+        try:
+            cell = load_pilot_cell(
+                cell_id,
+                dev=True,
+                overrides={
+                    "audit.pools.from": "dev",
+                    "study.train.steps": steps,
+                    "analysis.final_step": steps,
+                    "analysis.early.enabled": False,
+                },
+            )
+            menu = [str(arm) for arm in cell["study"]["arms"]]
+            base_seeds = [int(item) for item in cell["study"]["seeds"]]
+            rule_arms = [
+                str(arm) for arm in ((cell["study"].get("seed_rule") or {}).get("arms") or [])
+            ]
+            apply_dotted(
+                cell,
+                {"study.arms": ["oracle"], "study.seeds": list(ORACLE_SEED_PAIR)},
+            )
+            finals = []
+            for seed in ORACLE_SEED_PAIR:
+                run_arm(cell, dest, arm="oracle", seed=seed)
+                finals.append(heldout_accuracy(_run_dir(dest, "oracle", seed), steps))
+            known = [float(value) for value in finals if value is not None]
+            sd = sample_sd(known)
+            planned = seed_lists(
+                arms=menu,
+                rule_arms=rule_arms,
+                base_seeds=base_seeds,
+                sd=sd,
+                threshold=threshold,
+            )
+            error = None
+            if sd is not None and sd > threshold:
+                try:
+                    _train_extra_seeds(cell, dest, rule_arms, steps)
+                except Exception as exc:
+                    error = f"extra seeds: {type(exc).__name__}: {exc}"
+        except Exception as exc:
+            sd = None
+            planned = {}
+            error = f"{type(exc).__name__}: {exc}"
+        row = {
+            "cell_id": cell_id,
+            "domain": cell_row.get("domain"),
+            "model": cell_row.get("model"),
+            "hardware_class": cell_row.get("hardware_class"),
+            "sd": sd,
+            "seeds": planned,
+            "pass": sd is not None,
+        }
+        stage["rows"] = _upsert(stage["rows"], row, ("cell_id",))
+        for seed in ORACLE_SEED_PAIR:
+            stage["measurements"] = _upsert(
+                stage["measurements"],
+                measure_run(
+                    _run_dir(dest, "oracle", seed),
+                    model=str(cell_row.get("model")),
+                    hardware_class=str(cell_row.get("hardware_class")),
+                    gpus=1,
+                    steps=steps,
+                ),
+                ("model", "hardware_class", "run_dir"),
+            )
+        checks.add(
+            f"P5.4.{cell_id}",
+            f"seed rule for {cell_id}",
+            sd,
+            sd is not None,
+            threshold=threshold,
+            metric=error or "sample SD of oracle seeds 0 and 1; documented decision",
+            documented=True,
+        )
+    stage["stage"] = "seeds"
+    _save_stage(out, "seeds", stage)
+    return write_report(
+        out,
+        "P5 seeds",
+        checks,
+        config=dict(config),
+        started=started,
+        tables={"seeds": stage["rows"]},
+        sections=[],
+        intro=(
+            f"Hardware class {detected}. P5.4 decides the seed list. It does not gate the pilot."
+        ),
+    )
+
+
+def _train_extra_seeds(
+    cell: dict[str, Any], out: Path, rule_arms: Sequence[str], steps: int
+) -> None:
+    from vfates.pilots.p4_micro_grpo import apply_dotted
+
+    if not rule_arms:
+        return
+    apply_dotted(
+        cell,
+        {
+            "study.arms": list(rule_arms),
+            "study.seeds": [0, 1, 2, 3, 4],
+            "study.train.steps": steps,
+            "analysis.final_step": steps,
+        },
+    )
+    for arm in rule_arms:
+        for seed in EXTRA_SEEDS:
+            run_arm(cell, out, arm=str(arm), seed=int(seed))
+
+
+def run_throughput(config: Mapping[str, Any], out_dir: str | Path) -> dict[str, Any]:
+    """P5.5: write ``configs/throughput.yaml`` from stage measurements. Documented."""
+    started = time.perf_counter()
+    out = Path(out_dir)
+    return _write_throughput_report(config, out, started)
+
+
+def _measurement_rows(out: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for stage in ("path", "preempt", "gain", "seeds"):
+        rows.extend(_load_stage(out, stage).get("measurements") or [])
+    return rows
+
+
+def _throughput_path(config: Mapping[str, Any]) -> Path:
+    if config.get("throughput_path"):
+        return Path(str(config["throughput_path"]))
+    from vfates.program import repo_root
+
+    return repo_root() / "configs" / "throughput.yaml"
+
+
+def _write_throughput_report(
+    config: Mapping[str, Any], out: Path, started: float
+) -> dict[str, Any]:
+    import datetime as datetime_mod
+
+    from vfates.utils.env import hardware_class
+
+    checks = Checks()
+    rates = aggregate_measurements(_measurement_rows(out))
+    path = _throughput_path(config)
+    measured_at = datetime_mod.datetime.now(datetime_mod.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    commit = git_commit()
+    if rates:
+        write_throughput(path, rates, measured_at=measured_at, commit=commit)
+    n_pairs = sum(len(by_hw) for by_hw in rates.values())
     checks.add(
-        "P5.S.scored",
-        "both candidate models were scored on the development prompts",
-        float(len(scored)),
-        len(scored) == len(models)
-        and all(row["n"] == n_prompts * samples for row in scored.values()),
-        threshold=str(len(models)),
-        metric=f"{n_prompts} prompts, {samples} sample(s), {max_tokens} tokens",
+        "P5.5",
+        "measured tokens per second per GPU and hours per arm-seed",
+        float(n_pairs),
+        True,
+        threshold=THROUGHPUT_SCHEMA,
+        metric=f"pairs={n_pairs}; file={path if rates else 'not written'}",
+        documented=True,
     )
     return write_report(
         out,
-        "P5 3B replication screen",
+        "P5 throughput",
         checks,
-        config=config,
+        config=dict(config),
         started=started,
-        tables={"models": scored, "choice": choice, "pool_seed": pool_seed},
-        sections=[
-            (
-                "Model rule",
-                REPLICATION_RULE,
-            )
-        ],
+        tables={"rates": rates, "throughput_path": str(path), "commit": commit},
+        sections=[],
+        intro=f"Hardware class {hardware_class()}. P5.5 is documented.",
+    )
+
+
+def _decisions_from_stages(out: Path) -> dict[str, Any]:
+    path_rows = _load_stage(out, "path").get("rows") or []
+    gain_rows = _load_stage(out, "gain").get("rows") or []
+    preempt_rows = _load_stage(out, "preempt").get("rows") or []
+    seed_rows = _load_stage(out, "seeds").get("rows") or []
+    return {
+        "schema": P5_DECISIONS_SCHEMA,
+        "seeds": {str(row["cell_id"]): row.get("seeds") or {} for row in seed_rows},
+        "gain": {
+            str(row["model"]): {"pass": bool(row.get("pass")), "gain": row.get("gain")}
+            for row in gain_rows
+        },
+        "path": {
+            f"{row['model']}/{row['hardware_class']}": {"pass": bool(row.get("pass"))}
+            for row in path_rows
+        },
+        "preempt": {
+            str(row["hardware_class"]): {"pass": bool(row.get("pass"))} for row in preempt_rows
+        },
+    }
+
+
+def run_collect(config: Mapping[str, Any], out_dir: str | Path) -> dict[str, Any]:
+    """Merge stage files into the report and ``decisions.json``."""
+    from vfates.utils.env import hardware_class
+
+    started = time.perf_counter()
+    out = Path(out_dir)
+    smoke = bool(config.get("smoke", False))
+    decisions = _decisions_from_stages(out)
+    write_json(out / "decisions.json", decisions)
+    throughput = _write_throughput_report(config, out, started)
+    checks = Checks()
+    for row in throughput["checks"]:
+        checks.rows.append(row)
+    _collect_checks(checks, decisions, smoke=smoke)
+    plan = ""
+    if config.get("plan", not smoke):
+        plan = _plan_text(float(config.get("budget_usd", 9000)))
+    sections = [("Decisions", _decision_section(decisions))]
+    if plan:
+        sections.append(("Program plan", plan))
+    edits = _seed_edits(decisions)
+    sections.append(("Config edits", edits))
+    return write_report(
+        out,
+        "P5 GPU gate",
+        checks,
+        config=dict(config),
+        started=started,
+        tables={"decisions": decisions, "hardware_class": hardware_class()},
+        sections=sections,
         intro=(
-            "Development held-out prompts use the P5 pool seed plus the chain-sum "
-            "held-out offset. This screen does not train."
+            f"Hardware class {hardware_class()}. "
+            "P5.1, P5.2 and P5.3 are gated. P5.4 decides seeds. P5.5 is documented."
         ),
+    )
+
+
+def _collect_checks(checks: Checks, decisions: Mapping[str, Any], *, smoke: bool) -> None:
+    path = decisions.get("path") or {}
+    preempt = decisions.get("preempt") or {}
+    gain = decisions.get("gain") or {}
+    seeds = decisions.get("seeds") or {}
+    if not path:
+        checks.add(
+            "P5.1",
+            "path stage",
+            None,
+            False,
+            threshold="one row per (model, hardware class)",
+            metric="no path rows",
+            documented=smoke,
+        )
+    for key, row in path.items():
+        checks.add(
+            f"P5.1.{key}",
+            f"path {key}",
+            None,
+            bool(row.get("pass")),
+            threshold="10-step train, adapter eval, peak memory",
+            metric="pass" if row.get("pass") else "fail",
+        )
+    if not preempt:
+        checks.add(
+            "P5.2",
+            "preempt stage",
+            None,
+            False,
+            threshold="one row per hardware class",
+            metric="no preempt rows",
+            documented=smoke,
+        )
+    for key, row in preempt.items():
+        checks.add(
+            f"P5.2.{key}",
+            f"preempt {key}",
+            None,
+            bool(row.get("pass")),
+            threshold="preempted, then complete at the same step",
+            metric="pass" if row.get("pass") else "fail",
+        )
+    if not gain:
+        checks.add(
+            "P5.3",
+            "oracle gain on the math dev pool",
+            None,
+            False,
+            threshold=GAIN_MIN,
+            metric="not part of the Mac smoke run" if smoke else "no gain rows",
+            documented=smoke,
+        )
+    for model, row in gain.items():
+        checks.add(
+            f"P5.3.{model}",
+            f"{model} oracle gain",
+            row.get("gain"),
+            bool(row.get("pass")),
+            threshold=GAIN_MIN,
+            metric="held-out last step minus step 0",
+        )
+    if not seeds:
+        checks.add(
+            "P5.4",
+            "E1 seed rule",
+            None,
+            True,
+            threshold=SEED_SD_MAX,
+            metric="not part of the Mac smoke run" if smoke else "no seed rows",
+            documented=True,
+        )
+    for cell_id, planned in seeds.items():
+        checks.add(
+            f"P5.4.{cell_id}",
+            f"seeds for {cell_id}",
+            float(len(planned)),
+            True,
+            threshold=SEED_SD_MAX,
+            metric="documented seed list",
+            documented=True,
+        )
+
+
+def _decision_section(decisions: Mapping[str, Any]) -> str:
+    lines = [
+        markdown_table(
+            ["pair", "path pass"],
+            [[key, row.get("pass")] for key, row in (decisions.get("path") or {}).items()]
+            or [["(none)", None]],
+        ),
+        "",
+        markdown_table(
+            ["hardware_class", "preempt pass"],
+            [[key, row.get("pass")] for key, row in (decisions.get("preempt") or {}).items()]
+            or [["(none)", None]],
+        ),
+        "",
+        markdown_table(
+            ["model", "gain pass", "gain"],
+            [
+                [key, row.get("pass"), row.get("gain")]
+                for key, row in (decisions.get("gain") or {}).items()
+            ]
+            or [["(none)", None, None]],
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def _seed_edits(decisions: Mapping[str, Any]) -> str:
+    lines = []
+    for cell_id, planned in (decisions.get("seeds") or {}).items():
+        extra = [
+            arm for arm, seeds in planned.items() if any(int(seed) in EXTRA_SEEDS for seed in seeds)
+        ]
+        if extra:
+            lines.append(
+                f"Set study.seed_rule.apply to true on {cell_id}. "
+                f"Arms that take seeds 3 and 4: {', '.join(extra)}."
+            )
+    if not lines:
+        return "No seed-rule edit. Leave study.seed_rule.apply false unless a cell's oracle SD exceeded 0.03."
+    return "\n".join(f"- {line}" for line in lines)
+
+
+def _plan_text(budget: float) -> str:
+    try:
+        from vfates.program import format_budget, load_program, plan_jobs, repo_root
+
+        root = repo_root()
+        program = load_program(root / "configs" / "program.yaml", root=root)
+        jobs = plan_jobs(program, root=root)
+        return format_budget(jobs, program=program, by_cell=True, budget_usd=budget)
+    except Exception as exc:
+        return f"Plan was not printed ({type(exc).__name__}: {exc})."
+
+
+def run_program(config: Mapping[str, Any], out_dir: str | Path) -> dict[str, Any]:
+    """Dispatch one P5 stage. ``smoke`` runs path and preempt, then collect."""
+    out = Path(out_dir)
+    stage_name = config.get("stage")
+    if config.get("smoke") and stage_name in (None, "smoke", "collect"):
+        run_path(config, out)
+        run_preempt(config, out)
+        return run_collect(config, out)
+    stage = str(config.get("stage") or "collect")
+    if stage == "path":
+        return run_path(config, out)
+    if stage == "preempt":
+        return run_preempt(config, out)
+    if stage == "gain":
+        return run_gain(config, out)
+    if stage == "seeds":
+        return run_seeds(config, out)
+    if stage == "throughput":
+        return run_throughput(config, out)
+    if stage == "collect":
+        return run_collect(config, out)
+    raise ValueError(
+        f"unknown P5 stage {stage!r}. Use path, preempt, gain, seeds, throughput, or collect."
     )
 
 
 def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
-    """P5 GPU gate (dry run, full gate, or the 3B replication screen)."""
-    started = time.perf_counter()
-    out = Path(out_dir)
-    env = _cuda()
-    mode = config.get("mode") or ("full" if env["cuda"] else "dry_run")
-    if mode == "replication_screen":
-        return run_replication_screen(config, out)
-    checks = Checks()
-    checks.add(
-        "P5.1",
-        "accelerator environment",
-        None,
-        True,
-        metric=f"gpu={env.get('gpu', 'none')}, mode={mode}, vllm={env.get('vllm')}",
-        documented=True,
-    )
-    sections: list[tuple[str, str]] = []
-    cost = _projection(config) if "cost_model" in config else {}
-    if cost:
-        checks.add(
-            "P5.6",
-            "projected token-rate cost of the full gate (eval tokens included)",
-            cost["usd"],
-            True,
-            metric=f"USD ({cost['h100_hours']:.1f} H100 h), audit_prompts in the cost model",
-            documented=True,
-        )
-        sections.append(("Cost projection", markdown_table(list(cost), [list(cost.values())])))
-
-    if mode == "dry_run":
-        sections += _dry_run(config, out, checks)
-        return write_report(
-            out,
-            "P5 GPU gate (dry run)",
-            checks,
-            config=config,
-            started=started,
-            tables={"env": env, "cost": cost},
-            sections=sections,
-        )
-    if mode != "full":
-        raise ValueError(f"unknown P5 mode {mode!r}")
-    if not env["cuda"]:
-        raise RuntimeError("mode=full needs CUDA; run it on the rented GPU")
-    report = full_gate(config, out / "gate")
-    report["dry_run_checks"] = checks.rows
-    return report
+    """P5 GPU gate. ``stage`` selects one stage, or collect."""
+    return run_program(config, out_dir)

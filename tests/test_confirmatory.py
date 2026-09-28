@@ -9,15 +9,17 @@ import pytest
 from vfates.analysis.confirmatory import (
     H3_PAIRS,
     _h4_block,
+    _h5_channel,
     _probe_auc,
     _reliability_block,
+    arm_error_channel,
     audit_withdrawal_reasons,
     confirmatory_report,
     decide_audit_withdrawals,
     render_markdown,
 )
 from vfates.forecast.lockbox import lock_forecasts
-from vfates.utils.io import append_jsonl, write_json
+from vfates.utils.io import append_jsonl, read_json, write_json
 from vfates.verifiers.calibrate import arm_validity
 
 PROMPTS = ["p0", "p1", "p2", "p3"]
@@ -207,6 +209,36 @@ def _report(built: dict) -> dict:
     )
 
 
+def test_direction_phrase_arms_use_the_same_withdrawal_rules() -> None:
+    enriched = {
+        "targeted": True,
+        "rate_miss": 0.0,
+        "type": "trigger_fp",
+        "fell_back": True,
+        "validated": True,
+    }
+    depleted = {
+        "targeted": True,
+        "rate_miss": 0.0,
+        "type": "behavior_fn",
+        "fell_back": False,
+        "validated": False,
+    }
+    assert audit_withdrawal_reasons(enriched) == ["fell_back"]
+    assert audit_withdrawal_reasons(depleted) == ["validated"]
+    assert audit_withdrawal_reasons({**enriched, "fell_back": False, "rate_miss": 0.03}) == [
+        "rate_miss"
+    ]
+    record = decide_audit_withdrawals(
+        {
+            "fp_trigger_enriched": enriched,
+            "fn_behavior_depleted": depleted,
+            "oracle": {"type": "oracle"},
+        }
+    )
+    assert record["withdrawn"] == ["fn_behavior_depleted", "fp_trigger_enriched"]
+
+
 def test_audit_withdrawal_rules() -> None:
     assert audit_withdrawal_reasons({"targeted": True, "rate_miss": 0.03, "type": "hash_fp"}) == [
         "rate_miss"
@@ -355,6 +387,72 @@ def test_two_channel_probe_keeps_both_channels() -> None:
     assert _probe_auc(0.6) == 0.6
 
 
+def test_h10_signed_contrast_and_withdrawal(tmp_path: Path) -> None:
+    built = _build(tmp_path)
+    extra = {
+        "fp_trigger_enriched": (0.55, 0.70),
+        "fn_behavior_depleted": (0.25, 0.20),
+    }
+    audit = Path(built["audit_dir"])
+    payload = read_json(audit / "forecasts.json")
+    for name, (final, tau) in extra.items():
+        payload[name] = _forecast(name, tau)
+        built["runs"][name] = {}
+        for seed in SEEDS:
+            path = tmp_path / "runs" / f"{name}__s{seed}"
+            _write_run(path, name=name, step0=0.20, final=final, final_step=FINAL)
+            built["runs"][name][seed] = path
+        early = tmp_path / "early" / f"{name}__s99"
+        _write_run(early, name=name, step0=0.20, final=0.40, final_step=EARLY)
+        built["early_runs"][name] = early
+        built["planned_seeds"][name] = list(SEEDS)
+    write_json(audit / "forecasts.json", payload)
+    lock_forecasts(payload, audit / "lock.json", note="synthetic", overwrite=True)
+    built["analysis"]["h10"] = {
+        "pairs": [
+            {"a": "fp_trigger_enriched", "b": "fp_trigger"},
+            {"a": "fn_behavior_depleted", "b": "fn_behavior"},
+        ]
+    }
+    built["analysis"]["h3"] = {
+        "min_pairs": 2,
+        "pairs": [
+            {"arm": "fp_trigger_enriched", "control": "noise_fp_trigger"},
+            {"arm": "fn_behavior_depleted", "control": "noise_fn"},
+            {"arm": "fp_hash", "control": "noise_fp"},
+        ],
+    }
+    report = _report(built)
+    by_name = {row["name"]: row for row in report["h10"]["pairs"]}
+    forward = by_name["fp_trigger_enriched - fp_trigger"]
+    assert forward["status"] == "tested"
+    assert forward["point"] == pytest.approx(0.15)
+    assert forward["lo"] == pytest.approx(forward["point"])
+    assert forward["hi"] == pytest.approx(forward["point"])
+    assert forward["dtau"] == pytest.approx(0.30)
+    assert forward["signed"] == pytest.approx(0.15)
+    assert forward["signed_lo"] == pytest.approx(0.15)
+    assert forward["signed_hi"] == pytest.approx(0.15)
+    reverse = by_name["fn_behavior_depleted - fn_behavior"]
+    assert reverse["point"] == pytest.approx(-0.15)
+    assert reverse["dtau"] == pytest.approx(-0.20)
+    assert reverse["signed"] == pytest.approx(0.15)
+    assert reverse["signed_lo"] == pytest.approx(0.15)
+    assert reverse["signed_hi"] == pytest.approx(0.15)
+    assert "dtau" in render_markdown(report)
+    assert "fp_trigger_enriched - fp_trigger" in render_markdown(report)
+
+    built["withdrawals"]["withdrawn"] = ["fp_trigger_enriched"]
+    withdrawn = _report(built)
+    h10 = {row["name"]: row for row in withdrawn["h10"]["pairs"]}
+    assert h10["fp_trigger_enriched - fp_trigger"]["status"] == "withdrawn"
+    assert "point" not in h10["fp_trigger_enriched - fp_trigger"]
+    assert h10["fn_behavior_depleted - fn_behavior"]["status"] == "tested"
+    h3 = {(row["arm"], row["control"]): row["status"] for row in withdrawn["h3"]["pairs"]}
+    assert h3[("fp_trigger_enriched", "noise_fp_trigger")] == "withdrawn"
+    assert h3[("fn_behavior_depleted", "noise_fn")] == "tested"
+
+
 def test_h3_needs_five_pairs(tmp_path: Path) -> None:
     report = _report(_build(tmp_path, h3_pairs=list(H3_PAIRS[:4])))
     assert report["h3"]["n_pairs"] == 4
@@ -483,8 +581,287 @@ def test_reliability_block_lists_arms_below_the_gate() -> None:
             "a": {"transfer": {"reliability": 0.79}},
             "b": {"transfer": {"reliability": 0.85}},
             "c": {"transfer": {"reliability": float("nan")}},
+            "patch_selection": {"same_selection": True, "patch_tau": {}},
+            "note": {"hello": 1},
         },
         0.8,
     )
     assert block["below"] == ["a"]
     assert block["arms"]["c"] == {"value": None, "below": False}
+    assert "patch_selection" not in block["arms"]
+    assert "note" not in block["arms"]
+
+
+def test_same_selection_withdraws_patch_rate() -> None:
+    validity = {"patch_rate": {"targeted": True, "rate_miss": 0.05, "type": "hash_fp"}}
+    both = decide_audit_withdrawals(
+        validity, forecasts={"patch_selection": {"same_selection": True, "patch_tau": {}}}
+    )
+    assert both["withdrawn"] == ["patch_rate"]
+    assert both["audit"]["patch_rate"]["reasons"] == ["rate_miss", "same_selection"]
+
+    flagged_only = decide_audit_withdrawals(
+        {}, forecasts={"patch_selection": {"patch_rate": {}, "same_selection": True}}
+    )
+    assert flagged_only["withdrawn"] == ["patch_rate"]
+    assert flagged_only["audit"]["patch_rate"]["reasons"] == ["same_selection"]
+
+    unchanged = decide_audit_withdrawals(
+        validity, forecasts={"patch_selection": {"same_selection": False}}
+    )
+    assert unchanged["audit"]["patch_rate"]["reasons"] == ["rate_miss"]
+    absent = decide_audit_withdrawals(validity)
+    assert "same_selection" not in absent["audit"]["patch_rate"]["reasons"]
+    missing_block = decide_audit_withdrawals({}, forecasts={"oracle": {}})
+    assert missing_block["withdrawn"] == []
+
+
+def test_withdrawals_cover_only_the_cell_menu() -> None:
+    validity = {
+        "fp_trigger": {"targeted": True, "rate_miss": 0.05, "type": "trigger_fp"},
+        "fp_trigger_enriched": {"targeted": True, "rate_miss": 0.05, "type": "trigger_fp"},
+        "noise_fp_trigger": {"targeted": False, "type": "resampled"},
+    }
+    record = decide_audit_withdrawals(validity, menu=["oracle", "fp_trigger", "noise_fp_trigger"])
+    assert record["withdrawn"] == ["fp_trigger"]
+    assert set(record["audit"]) == {"fp_trigger"}
+    assert record["outside_menu"] == ["fp_trigger_enriched"]
+    assert "outside_menu" not in decide_audit_withdrawals(validity)
+    assert decide_audit_withdrawals(validity)["withdrawn"] == ["fp_trigger", "fp_trigger_enriched"]
+
+
+def test_arm_channel_comes_from_calibration_kind() -> None:
+    fn = {"name": "fn_brand", "kind": "fn", "type": "behavior_fn"}
+    arms = {
+        "fn_brand": fn,
+        "natural": {"name": "natural", "kind": "natural", "type": "contains_gold"},
+    }
+    assert arm_error_channel({"name": "fp_brand", "kind": "fp", "type": "hash_fp"}) == "fp"
+    assert arm_error_channel(fn) == "fn"
+    assert (
+        arm_error_channel(
+            {"name": "noise", "kind": "resampled", "type": "resampled", "match": "fn_brand"},
+            arms,
+        )
+        == "fn"
+    )
+    assert (
+        arm_error_channel(
+            {"name": "noise", "kind": "noise", "type": "resampled", "rho0": 0.0, "rho1": 0.4}
+        )
+        == "fn"
+    )
+    assert (
+        arm_error_channel(
+            {
+                "name": "combo",
+                "kind": "composite",
+                "type": "composite",
+                "fn": [{"name": "inner", "kind": "fn"}],
+                "fp": [{"name": "inner_fp", "kind": "fp"}],
+            }
+        )
+        == "fn"
+    )
+    assert (
+        arm_error_channel(
+            {"name": "patch_tau", "kind": "patched", "type": "patched", "base": "natural"},
+            arms,
+        )
+        == "fp"
+    )
+    assert (
+        arm_error_channel({"name": "natural_strict", "kind": "natural", "type": "string_match"})
+        == "fn"
+    )
+    assert arm_error_channel({"name": "oracle", "kind": "oracle", "type": "oracle"}) == "oracle"
+    assert arm_error_channel({"name": "brand_new", "kind": "custom", "type": "custom"}) == "fp"
+    assert _h5_channel("fp_brand", {}, False) is None
+    assert _h5_channel("fp_brand", {}, True) == "fp"
+    assert _h5_channel("fn_unlisted", {}, True) == "fn"
+
+
+def _brand_run(path: Path, *, name: str, step0: float, final: float) -> None:
+    wrong = {"fp_brand": 0.77}
+    correct = {"fn_brand": 0.66}
+
+    def held(step: int, oracle: float) -> dict:
+        return {
+            "step": step,
+            "split": "heldout",
+            "oracle_acc": oracle,
+            "J": final,
+            "fpr": 0.1,
+            "fnr": 0.2,
+            "monitors_wrong": wrong,
+            "monitors_correct": correct,
+        }
+
+    append_jsonl(path / "eval.jsonl", held(0, step0))
+    append_jsonl(path / "eval.jsonl", held(FINAL, final))
+    append_jsonl(
+        path / "eval.jsonl", {"step": 0, "split": "train", "oracle_acc": step0, "J": final}
+    )
+    append_jsonl(
+        path / "eval.jsonl", {"step": FINAL, "split": "train", "oracle_acc": final, "J": final}
+    )
+    append_jsonl(
+        path / "eval_prompts.jsonl",
+        {"step": 0, "split": "heldout", "acc": {pid: step0 for pid in PROMPTS}},
+    )
+    append_jsonl(
+        path / "eval_prompts.jsonl",
+        {"step": FINAL, "split": "heldout", "acc": {pid: final for pid in PROMPTS}},
+    )
+
+
+def test_h5_uses_calibration_for_an_arm_outside_the_name_lists(tmp_path: Path) -> None:
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    names = ["oracle", "fp_brand", "noise_fp", "fn_brand", "noise_fn"]
+    finals = {
+        "oracle": 0.70,
+        "fp_brand": 0.40,
+        "noise_fp": 0.80,
+        "fn_brand": 0.35,
+        "noise_fn": 0.60,
+    }
+    payload = {name: _forecast(name, finals[name]) for name in names}
+    write_json(audit / "forecasts.json", payload)
+    lock_forecasts(payload, audit / "lock.json", note="synthetic")
+    write_json(
+        audit / "calibration.json",
+        {
+            "arms": {
+                "fp_brand": {
+                    "name": "fp_brand",
+                    "type": "hash_fp",
+                    "kind": "fp",
+                    "stochastic": False,
+                },
+                "fn_brand": {
+                    "name": "fn_brand",
+                    "type": "behavior_fn",
+                    "kind": "fn",
+                    "stochastic": False,
+                },
+                "noise_fp": {
+                    "name": "noise_fp",
+                    "type": "resampled",
+                    "kind": "noise",
+                    "stochastic": True,
+                    "rho0": 0.15,
+                    "rho1": 0.0,
+                },
+                "noise_fn": {
+                    "name": "noise_fn",
+                    "type": "resampled",
+                    "kind": "noise",
+                    "stochastic": True,
+                    "rho0": 0.0,
+                    "rho1": 0.3,
+                },
+                "oracle": {
+                    "name": "oracle",
+                    "type": "oracle",
+                    "kind": "oracle",
+                    "stochastic": False,
+                },
+            }
+        },
+    )
+    runs: dict[str, dict[int, Path]] = {}
+    for name, final in finals.items():
+        runs[name] = {}
+        for seed in SEEDS:
+            path = tmp_path / "runs" / f"{name}__s{seed}"
+            step0 = 0.20
+            _brand_run(path, name=name, step0=step0, final=final)
+            runs[name][seed] = path
+    report = confirmatory_report(
+        audit_dir=audit,
+        runs=runs,
+        early_runs={},
+        analysis={
+            "final_step": FINAL,
+            "n_boot": 20,
+            "early": {"enabled": False},
+            "h1": {"contrasts": [{"control": "noise_fp", "arm": "fp_brand"}], "beside": []},
+            "h2": {"contrasts": []},
+            "h3": {
+                "min_pairs": 5,
+                "pairs": [
+                    {"arm": "fp_brand", "control": "noise_fp"},
+                    {"arm": "fn_brand", "control": "noise_fn"},
+                ],
+            },
+        },
+        withdrawals={"withdrawn": []},
+        planned_seeds={name: list(SEEDS) for name in names},
+    )
+    rows = {row["arm"]: row for row in report["h5"]["rows"]}
+    assert rows["fp_brand"]["status"] == "reported"
+    assert rows["fp_brand"]["channel"] == "fp"
+    assert rows["fp_brand"]["field"] == "monitors_wrong"
+    assert rows["fp_brand"]["mean"]["arm_final"] == pytest.approx(0.77)
+    assert rows["fn_brand"]["status"] == "reported"
+    assert rows["fn_brand"]["channel"] == "fn"
+    assert rows["fn_brand"]["field"] == "monitors_correct"
+    assert rows["fn_brand"]["mean"]["arm_final"] == pytest.approx(0.66)
+    assert all(row["status"] != "no_channel" for row in report["h5"]["rows"])
+
+
+def test_natural_list_reports_one_block_per_pair(tmp_path: Path) -> None:
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    taus = {
+        "oracle": 0.70,
+        "base_tests": 0.30,
+        "resampled": 0.60,
+        "strict_tests": 0.20,
+        "resampled_strict": 0.55,
+    }
+    finals = {
+        "oracle": 0.70,
+        "base_tests": 0.30,
+        "resampled": 0.60,
+        "strict_tests": 0.25,
+        "resampled_strict": 0.55,
+    }
+    payload = {name: _forecast(name, tau) for name, tau in taus.items()}
+    write_json(audit / "forecasts.json", payload)
+    lock_forecasts(payload, audit / "lock.json", note="synthetic")
+    runs: dict[str, dict[int, Path]] = {}
+    for name, final in finals.items():
+        runs[name] = {}
+        for seed in SEEDS:
+            path = tmp_path / "runs" / f"{name}__s{seed}"
+            _write_run(path, name=name, step0=0.20, final=final, final_step=FINAL)
+            runs[name][seed] = path
+    report = confirmatory_report(
+        audit_dir=audit,
+        runs=runs,
+        early_runs={},
+        analysis={
+            "hypotheses": False,
+            "final_step": FINAL,
+            "n_boot": 30,
+            "early": {"enabled": False},
+            "natural": [
+                {"natural": "base_tests", "control": "resampled", "oracle": "oracle"},
+                {"natural": "strict_tests", "control": "resampled_strict", "oracle": "oracle"},
+            ],
+        },
+        withdrawals={"withdrawn": []},
+        planned_seeds={name: list(SEEDS) for name in finals},
+    )
+    assert isinstance(report["natural"], list)
+    assert [block["natural"] for block in report["natural"]] == ["base_tests", "strict_tests"]
+    assert report["natural"][0]["contrast"]["point"] == pytest.approx(0.30)
+    assert report["natural"][1]["contrast"]["point"] == pytest.approx(0.30)
+    assert report["natural"][0]["control"] == "resampled"
+    assert report["natural"][1]["control"] == "resampled_strict"
+    text = render_markdown(report)
+    assert "resampled - base_tests" in text
+    assert "resampled_strict - strict_tests" in text
+    assert "natural-verifier tests" in report["rule"]

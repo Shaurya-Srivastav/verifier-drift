@@ -1,0 +1,389 @@
+# Preregistered program. Cell id: <experiment>-<domain>-<model>, lower case.
+# E4 is not a separate cell: patch_tau and patch_rate are full-menu arms on the
+# E1 cells of math, code, ifeval, and qa (same audit and lock, seeds 0, 1, 2).
+# Exploratory X1 is cross-domain transfer. X2, X3, X5, and X7 are
+# study.variants on E1 cells. X4 and X6 are experiment X cells.
+# Stage A (discovery) is the five E1 cells and the five E2 cells at qwen3-4b.
+# Stage B (replication) is every other confirmatory cell. X cells are in no
+# stage. compute.cut_order is stage B only, so a budget cut cannot drop stage A.
+# Render writes configs/cells/<id>.yaml when configs/templates/<domain>.yaml exists.
+schema: vfates.program/1
+
+experiments:
+  # oracle_gain_min is the conclusive-cell rule: the oracle arm's final
+  # held-out accuracy must exceed step 0 by this much. Larger models start
+  # closer to their ceiling. Render writes it into each cell's analysis block.
+  E1:
+    name: fates
+    confirmatory: true
+    menu: full
+    seeds: [0, 1, 2]
+    oracle_gain_min: 0.10
+  E2:
+    name: scale
+    confirmatory: true
+    menu: core
+    seeds: [0, 1]
+    oracle_gain_min: 0.05
+  E3:
+    name: families
+    confirmatory: true
+    menu: core
+    seeds: [0, 1]
+    oracle_gain_min: 0.05
+  X:
+    name: exploratory
+    confirmatory: false
+
+# Prospectively fixed analyses. A cell id appears in exactly one stage.
+# Exploratory cells are listed under cells and are absent here.
+stages:
+  A:
+    name: discovery
+    cells:
+      - e1-chain_sum-qwen3-1.7b
+      - e1-math-qwen3-1.7b
+      - e1-code-qwen3-1.7b
+      - e1-ifeval-qwen3-1.7b
+      - e1-qa-qwen3-1.7b
+      - e2-chain_sum-qwen3-4b
+      - e2-math-qwen3-4b
+      - e2-code-qwen3-4b
+      - e2-ifeval-qwen3-4b
+      - e2-qa-qwen3-4b
+  B:
+    name: replication
+    cells:
+      - e2-math-qwen3-8b
+      - e2-code-qwen3-8b
+      - e2-qa-qwen3-8b
+      - e2-math-qwen3-14b
+      - e2-code-qwen3-14b
+      - e2-math-qwen3-32b
+      - e3-math-olmo3-7b
+      - e3-code-olmo3-7b
+      - e3-math-llama3.1-8b
+      - e3-code-llama3.1-8b
+
+e4:
+  lives_in: E1
+  domains: [math, code, ifeval, qa]
+  arms: [patch_tau, patch_rate]
+  seeds: [0, 1, 2]
+  note: >
+    Patch arms are part of the E1 full menu for these domains. They share the
+    cell audit and lock. They are not separate cells.
+
+exploratory:
+  X1:
+    kind: transfer_eval
+    source_experiment: E1
+    description: >
+      Cross-domain transfer of each finished E1 adapter onto the other
+      domains' held-out pools. Jobs depend on the source train job.
+  # X2 (kl), X3 (streaming), X5 (full), and X7 (long) are study.variants
+  # on the E1 cells below. X4 and X6 are cells at the end of this file.
+
+# hardware_policy.by says whether the class is keyed by domain or by model.
+hardware_policy:
+  E1:
+    by: domain
+    chain_sum: rtx-a6000-48gb
+    math: rtx-a6000-48gb
+    code: rtx-5000-ada-32gb
+    ifeval: rtx-5000-ada-32gb
+    qa: rtx-5000-ada-32gb
+  E2:
+    by: model
+    qwen3-4b: a100-80gb
+    qwen3-8b: h100-80gb
+    qwen3-14b: h100-80gb
+    qwen3-32b: h100-80gb
+  E3:
+    by: model
+    olmo3-7b: h100-80gb
+    llama3.1-8b: h100-80gb
+  # Class GPU-hours = H100-equivalent hours / speed_vs_h100.
+  # These speeds are placeholders until a measured throughput file exists.
+  speed_vs_h100:
+    h100-80gb: 1.0
+    a100-80gb: 0.55
+    a100-40gb: 0.5
+    rtx-a6000-48gb: 0.35
+    rtx-5000-ada-32gb: 0.3
+  # Rented classes have a positive price. Lab classes are 0. a100-80gb is
+  # configurable and defaults to lab (0).
+  usd_per_gpu_hour:
+    h100-80gb: 2.5
+    a100-80gb: 0
+    a100-40gb: 0
+    rtx-a6000-48gb: 0
+    rtx-5000-ada-32gb: 0
+
+# Used only for domains whose template is not written yet. mean_completion_len
+# below replaces the default for that domain. Template cost models win.
+default_cost_model:
+  reference_params_b: 1.7
+  mean_completion_len: 350
+  steps: 300
+  prompts_per_step: 64
+  group_size: 8
+  early_steps: 25
+  eval_every: 25
+  eval_prompts: 384
+  eval_train_prompts: 128
+  eval_samples: 4
+  transfer_prompts: 384
+  audit_prompts: 1408
+  audit_samples: 16
+  h100_gen_tok_s: 10000
+  h100_train_tok_s: 30000
+  overhead: 1.25
+  usd_per_h100_hour: 2.5
+
+domain_mean_completion_len:
+  chain_sum: 350
+  math: 500
+  code: 400
+  ifeval: 250
+  qa: 250
+
+compute:
+  cut_order:
+    - e2-math-qwen3-32b
+    - e3-code-olmo3-7b
+    - e3-code-llama3.1-8b
+    - e2-code-qwen3-14b
+    - e2-qa-qwen3-8b
+
+cells:
+  - id: e1-chain_sum-qwen3-1.7b
+    experiment: E1
+    domain: chain_sum
+    model: qwen3-1.7b
+    hardware_class: rtx-a6000-48gb
+    menu: full
+    seeds: [0, 1, 2]
+    config: configs/cells/e1-chain_sum-qwen3-1.7b.yaml
+    variants:
+      - name: streaming
+        arms: [oracle, fp_hash, noise_fp]
+        seeds: [0]
+        train_overrides:
+          data_regime: streaming
+  - id: e1-math-qwen3-1.7b
+    experiment: E1
+    domain: math
+    model: qwen3-1.7b
+    hardware_class: rtx-a6000-48gb
+    menu: full
+    seeds: [0, 1, 2]
+    config: configs/cells/e1-math-qwen3-1.7b.yaml
+    variants:
+      - name: kl
+        arms: [oracle, fp_trigger]
+        seeds: [0]
+        train_overrides:
+          beta_kl: 0.01
+      - name: full
+        arms: [oracle, fp_trigger, noise_fp_trigger]
+        seeds: [0]
+        placement: full
+        accelerate_config: configs/accelerate/fsdp_2gpu_full.yaml
+        train_overrides:
+          full_finetune: true
+          lora: null
+          lora_init: null
+          gradient_checkpointing: true
+      - name: long
+        arms: [oracle, fp_trigger, noise_fp_trigger]
+        seeds: [0]
+        train_overrides:
+          steps: 600
+  - id: e1-code-qwen3-1.7b
+    experiment: E1
+    domain: code
+    model: qwen3-1.7b
+    hardware_class: rtx-5000-ada-32gb
+    menu: full
+    seeds: [0, 1, 2]
+    config: configs/cells/e1-code-qwen3-1.7b.yaml
+  - id: e1-ifeval-qwen3-1.7b
+    experiment: E1
+    domain: ifeval
+    model: qwen3-1.7b
+    hardware_class: rtx-5000-ada-32gb
+    menu: full
+    seeds: [0, 1, 2]
+    config: configs/cells/e1-ifeval-qwen3-1.7b.yaml
+  - id: e1-qa-qwen3-1.7b
+    experiment: E1
+    domain: qa
+    model: qwen3-1.7b
+    hardware_class: rtx-5000-ada-32gb
+    menu: full
+    seeds: [0, 1, 2]
+    config: configs/cells/e1-qa-qwen3-1.7b.yaml
+
+  - id: e2-chain_sum-qwen3-4b
+    experiment: E2
+    domain: chain_sum
+    model: qwen3-4b
+    hardware_class: a100-80gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/e2-chain_sum-qwen3-4b.yaml
+  - id: e2-math-qwen3-4b
+    experiment: E2
+    domain: math
+    model: qwen3-4b
+    hardware_class: a100-80gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/e2-math-qwen3-4b.yaml
+  - id: e2-code-qwen3-4b
+    experiment: E2
+    domain: code
+    model: qwen3-4b
+    hardware_class: a100-80gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/e2-code-qwen3-4b.yaml
+  - id: e2-ifeval-qwen3-4b
+    experiment: E2
+    domain: ifeval
+    model: qwen3-4b
+    hardware_class: a100-80gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/e2-ifeval-qwen3-4b.yaml
+  - id: e2-qa-qwen3-4b
+    experiment: E2
+    domain: qa
+    model: qwen3-4b
+    hardware_class: a100-80gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/e2-qa-qwen3-4b.yaml
+  - id: e2-math-qwen3-8b
+    experiment: E2
+    domain: math
+    model: qwen3-8b
+    hardware_class: h100-80gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/e2-math-qwen3-8b.yaml
+  - id: e2-code-qwen3-8b
+    experiment: E2
+    domain: code
+    model: qwen3-8b
+    hardware_class: h100-80gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/e2-code-qwen3-8b.yaml
+  - id: e2-qa-qwen3-8b
+    experiment: E2
+    domain: qa
+    model: qwen3-8b
+    hardware_class: h100-80gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/e2-qa-qwen3-8b.yaml
+  - id: e2-math-qwen3-14b
+    experiment: E2
+    domain: math
+    model: qwen3-14b
+    hardware_class: h100-80gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/e2-math-qwen3-14b.yaml
+  - id: e2-code-qwen3-14b
+    experiment: E2
+    domain: code
+    model: qwen3-14b
+    hardware_class: h100-80gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/e2-code-qwen3-14b.yaml
+  - id: e2-math-qwen3-32b
+    experiment: E2
+    domain: math
+    model: qwen3-32b
+    hardware_class: h100-80gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/e2-math-qwen3-32b.yaml
+
+  - id: e3-math-olmo3-7b
+    experiment: E3
+    domain: math
+    model: olmo3-7b
+    hardware_class: h100-80gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/e3-math-olmo3-7b.yaml
+  - id: e3-code-olmo3-7b
+    experiment: E3
+    domain: code
+    model: olmo3-7b
+    hardware_class: h100-80gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/e3-code-olmo3-7b.yaml
+  - id: e3-math-llama3.1-8b
+    experiment: E3
+    domain: math
+    model: llama3.1-8b
+    hardware_class: h100-80gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/e3-math-llama3.1-8b.yaml
+  - id: e3-code-llama3.1-8b
+    experiment: E3
+    domain: code
+    model: llama3.1-8b
+    hardware_class: h100-80gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/e3-code-llama3.1-8b.yaml
+  - id: x4-math-qwen3-1.7b-drgrpo
+    experiment: X
+    domain: math
+    model: qwen3-1.7b
+    hardware_class: rtx-a6000-48gb
+    menu: core
+    seeds: [0]
+    arms: [oracle, fp_trigger, noise_fp_trigger]
+    hypotheses: false
+    early: false
+    train_overrides:
+      adv_mode: mean
+      loss_agg: dr_constant
+    audit_overrides:
+      forecast:
+        loss_agg: dr_constant
+    config: configs/cells/x4-math-qwen3-1.7b-drgrpo.yaml
+  - id: x4-math-qwen3-1.7b-tokenmean
+    experiment: X
+    domain: math
+    model: qwen3-1.7b
+    hardware_class: rtx-a6000-48gb
+    menu: core
+    seeds: [0]
+    arms: [oracle, fp_trigger, noise_fp_trigger]
+    hypotheses: false
+    early: false
+    train_overrides:
+      loss_agg: token_mean
+    audit_overrides:
+      forecast:
+        loss_agg: token_mean
+    config: configs/cells/x4-math-qwen3-1.7b-tokenmean.yaml
+  - id: x6-chain_sum-qwen3-1.7b-base
+    experiment: X
+    domain: chain_sum
+    model: qwen3-1.7b-base
+    hardware_class: rtx-a6000-48gb
+    menu: core
+    seeds: [0, 1]
+    config: configs/cells/x6-chain_sum-qwen3-1.7b-base.yaml

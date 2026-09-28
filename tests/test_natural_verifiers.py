@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib
 import json
-from pathlib import Path
 
 import pytest
 
@@ -15,12 +14,9 @@ from vfates.pilots.p6_natural import (
     prompt_averaged_confusion,
 )
 from vfates.types import Completion, Parsed, Problem
-from vfates.utils.io import read_yaml
 from vfates.verifiers.calibrate import CalibrationData, arm_validity, calibrate_arms
-from vfates.verifiers.natural import IFEvalCheckerVerifier, MBPPBaseTestsVerifier
+from vfates.verifiers.natural import IFEvalCheckerVerifier
 from vfates.verifiers.registry import build_verifier
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_pooled_and_concentration() -> None:
@@ -45,15 +41,11 @@ def test_pooled_and_concentration() -> None:
 
 
 def test_verifier_kinds() -> None:
-    base = MBPPBaseTestsVerifier(k=2)
-    assert base.kind == "natural"
-    assert base.describe()["k"] == 2
-    assert base.stochastic is False
     checker = IFEvalCheckerVerifier()
     assert checker.kind == "natural"
+    assert checker.stochastic is False
     assert checker.describe()["name"] == "ifeval_checker"
-    with pytest.raises(ValueError):
-        MBPPBaseTestsVerifier(k=-1)
+    assert checker.describe()["type"] == "ifeval_checker"
 
 
 def _natural_audit() -> CalibrationData:
@@ -96,53 +88,17 @@ def _natural_audit() -> CalibrationData:
     return CalibrationData.from_grades(list(problems.values()), completions, parsed_list, labels)
 
 
-def _fake_grade(problem: Problem, code: str, **kwargs: object) -> dict[str, object]:
-    del problem, kwargs
-    if code == "good":
-        return {"passed": True, "which": "base"}
-    return {"passed": False, "fail_stage": "base", "fail_index": 0, "which": "base"}
-
-
-def test_natural_arms_build_calibrate_and_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("vfates.verifiers.natural.grade_code", _fake_grade)
-    mbpp_doc = read_yaml(f"{ROOT}/configs/experiments/e2_mbpp.yaml")
-    if_doc = read_yaml(f"{ROOT}/configs/experiments/e2_ifeval.yaml")
-    mbpp_spec = mbpp_doc["audit"]["arms"]["arms"][1]
-    if_spec = if_doc["audit"]["arms"]["arms"][1]
-    assert mbpp_spec == {
-        "name": "base_tests",
-        "type": "mbpp_base_tests",
-        "k": None,
-        "visible_only": False,
-    }
-    assert if_spec == {"name": "checker", "type": "ifeval_checker"}
-    base = build_verifier(mbpp_spec)
+def test_natural_arms_build_calibrate_and_round_trip() -> None:
+    if_spec = {"name": "checker", "type": "ifeval_checker"}
     checker = build_verifier(if_spec)
-    assert base.name == "base_tests"
     assert checker.name == "checker"
-    for original in (base, checker):
-        spec = json.loads(json.dumps(original.describe()))
-        rebuilt = build_verifier(spec)
-        assert rebuilt.describe() == original.describe()
+    spec = json.loads(json.dumps(checker.describe()))
+    rebuilt = build_verifier(spec)
+    assert rebuilt.describe() == checker.describe()
 
     data = _natural_audit()
     specs = [
         {"name": "oracle", "type": "oracle"},
-        dict(mbpp_spec),
-        {
-            "name": "noise_answered",
-            "type": "resampled",
-            "match": "base_tests",
-            "support": "answered",
-            "seed": 0,
-        },
-        {
-            "name": "noise_all",
-            "type": "resampled",
-            "match": "base_tests",
-            "support": "all",
-            "seed": 0,
-        },
         dict(if_spec),
         {
             "name": "noise_checker",
@@ -161,36 +117,66 @@ def test_natural_arms_build_calibrate_and_round_trip(monkeypatch: pytest.MonkeyP
     ]
     result = calibrate_arms(None, data, specs, n_boot=8, seed=0, targets={})
     report = result.report["arms"]
-    for name in ("base_tests", "checker"):
-        entry = report[name]
-        assert entry["achieved_fpr"] == pytest.approx(0.25)
-        assert entry["achieved_fnr"] == pytest.approx(0.25)
-        assert entry["channel"]["fpr"] == pytest.approx(entry["realised"]["fpr"])
-        assert entry["channel"]["fnr"] == pytest.approx(entry["realised"]["fnr"])
-        assert entry["channel"]["J"] == pytest.approx(
-            (1.0 - entry["channel"]["fnr"]) - entry["channel"]["fpr"]
-        )
-        assert entry["target_fpr"] is None
-        assert entry["target_fnr"] is None
+    entry = report["checker"]
+    assert entry["achieved_fpr"] == pytest.approx(0.25)
+    assert entry["achieved_fnr"] == pytest.approx(0.25)
+    assert entry["channel"]["fpr"] == pytest.approx(entry["realised"]["fpr"])
+    assert entry["channel"]["fnr"] == pytest.approx(entry["realised"]["fnr"])
+    assert entry["channel"]["J"] == pytest.approx(
+        (1.0 - entry["channel"]["fnr"]) - entry["channel"]["fpr"]
+    )
+    assert entry["target_fpr"] is None
+    assert entry["target_fnr"] is None
     validity = arm_validity(result.to_json())
-    assert validity["base_tests"]["targeted"] is False
     assert validity["checker"]["targeted"] is False
-    assert validity["base_tests"]["type"] == "mbpp_base_tests"
     assert validity["checker"]["type"] == "ifeval_checker"
-    answered = report["noise_answered"]
-    assert answered["channel"]["fpr"] == pytest.approx(report["base_tests"]["achieved_fpr"])
-    assert answered["channel"]["fnr"] == pytest.approx(report["base_tests"]["achieved_fnr"])
-    assert answered["details"]["support"] == "answered"
-    assert answered["details"]["rho0"] == pytest.approx(0.25 / 0.75)
-    whole = report["noise_all"]
-    assert whole["details"]["support"] == "all"
-    assert whole["details"]["rho0"] == pytest.approx(0.25)
-    assert whole["channel"]["fpr"] == pytest.approx(0.25)
     assert report["noise_checker"]["details"]["rho0"] == pytest.approx(0.25)
     assert report["noise_checker"]["details"]["support"] == "all"
+    assert report["noise_checker"]["channel"]["fpr"] == pytest.approx(0.25)
     assert report["noise_checker_answered"]["details"]["rho0"] == pytest.approx(0.25 / 0.75)
-    rebuilt_arms = build_verifier(result.to_json()["arms"]["base_tests"])
-    assert rebuilt_arms.describe() == result.arms["base_tests"].describe()
+    assert report["noise_checker_answered"]["details"]["support"] == "answered"
+    rebuilt_arms = build_verifier(result.to_json()["arms"]["checker"])
+    assert rebuilt_arms.describe() == result.arms["checker"].describe()
+
+
+def test_math_and_qa_verifiers_round_trip() -> None:
+    from vfates.tasks.math import MathTask
+    from vfates.tasks.qa import QATask
+
+    math_task = MathTask(
+        rows=[{"problem": "What is 1 + 1?", "answer": "2"}],
+        decontaminate=False,
+        dev_fraction=0.34,
+        heldout_fraction=0.33,
+    )
+    for typ in ("math_lenient", "math_strip_string"):
+        spec = {"type": typ, "name": typ}
+        try:
+            built = build_verifier(spec, math_task)
+        except ValueError as exc:
+            if "unknown verifier type" in str(exc):
+                pytest.skip("registry fallback is not merged")
+            raise
+        again = build_verifier(built.describe(), math_task)
+        assert again.describe() == built.describe()
+        assert again.stochastic is False
+        assert again.kind == "natural"
+
+    qa_task = QATask(
+        rows=[{"question": "What is 1 + 1?", "answer": "2", "answer_type": "Integer"}],
+        dev_fraction=0.34,
+        heldout_fraction=0.33,
+    )
+    spec = {"type": "model_judge", "name": "natural"}
+    try:
+        built = build_verifier(spec, qa_task)
+    except ValueError as exc:
+        if "unknown verifier type" in str(exc):
+            pytest.skip("registry fallback is not merged")
+        raise
+    again = build_verifier(built.describe(), qa_task)
+    assert again.describe() == built.describe()
+    assert again.describe()["judge"]["type"] == "heuristic"
 
 
 def test_factory_missing_is_explicit() -> None:

@@ -1,0 +1,44 @@
+\section{Related work}
+\label{sec:related}
+
+\paragraph{Pattern and rate.}
+\citet{egashira2026delay} plant systematic verifier errors and conclude that the outcome is not determined by the overall error rate.
+Their arms are not calibrated to one rate.
+\citet{rad2026rate} analyse class-conditional noise as a replicator flow and find that, when $J > 0$, noise primarily rescales convergence time.
+The study's synthetic channel has $J = 0.55$, so that result predicts that the resampled arms still learn.
+It does not predict that a resampled arm matches a clean verifier, and this paper does not make that prediction.
+\citet{plesner2026noise} find symmetric noise up to 15 percent close to clean training and ask for fixed noise with the two rates varied separately.
+\citet{mitsuhashi2026scaling} find that an accuracy gap under controlled noise persists under compute scaling.
+\citet{zhu2026incorrect} report that incorrect annotations remain costly after a contamination check, against earlier results in which a large flip rate still learned \citep{lv2025flips}.
+\citet{shao2025spurious} show that random rewards can raise accuracy through clipping; the reported random arm in the math cell is that reference point and is outside every hypothesis.
+
+\paragraph{Natural errors and audits.}
+\citet{zhang2026leaky} compare original and hardened tests on MBPP and find that rewarded false-positive mass tracks a static leakiness audit.
+The comparison has no rate-matched random arm, and the audit predicts false-positive mass rather than accuracy.
+One reading, which is an interpretation and not that paper's claim, is that those natural false positives are the prompt-specific case of Theorem~\ref{thm:transfer}.
+H7 is the rate-matched test of natural verifiers.
+\citet{xin2026audit} audit math verifiers by category, and the two natural math verifiers here are the relative tolerance and the strip-string match that audit discusses.
+\citet{xin2026correlation} measure within-group error correlation.
+A prompt-specific rule is correlated within a group and is still predicted to stay local, and the prompt-centred statistics here remove the shared prompt-difficulty component.
+\citet{ray2026fuzz} and \citet{zhou2026language} document verifier failures and do not forecast a training outcome.
+
+\paragraph{Judges, probes, and corrections.}
+\citet{zhao2025token} show master-key false positives against model judges.
+\citet{huang2025hacking} find model-based math verifiers susceptible to reward hacking during reinforcement learning.
+The judged question-answering domain trains against a real judge \citep{ma2025reasoner}, with the robust judge of \citet{zhao2025token} as a reported second natural verifier, outside the hypotheses.
+A master key is a shared surface feature, the same role as the phrase trigger.
+Probes fit during training can forecast hacking before the visible rate is high \citep{beigi2026probes,wang2026grift,bergen2026means,karmakar2026judge}.
+Those methods act during or after training.
+The screen here is computed once, at step 0, and then locked.
+A correction that uses only the known rates is identical for an arm and its rate-matched control, so it cannot explain a difference between them \citep{cai2025correct,mansouri2025correct}.
+With group-standardised advantages, an affine reward correction also leaves the GRPO update unchanged.
+
+\paragraph{Geometry, features, and the training rule.}
+Lemma~\ref{lem:tilt} quotes the exponential-tilt geometry of \citet{mroueh2025tilt} and \citet{dorner2025tilt} and is not claimed as new.
+Proposition~\ref{prop:mode} is the Euclidean softmax flow.
+Theorem~\ref{thm:transfer} is the part about fixed errors and held-out prompts.
+\citet{stroebl2024limits} study imperfect verifiers at inference, as best-of-$n$ selection; the object here is training.
+\citet{xia2024less} and \citet{park2023trak} use random projections of gradients for data selection and influence.
+At LoRA initialisation the trainable step-0 feature is already such a projection \citep{hu2021lora}, and CountSketch keeps the inner product unbiased \citep{charikar2002frequent}.
+Work on updates that concentrate in a small part of the network is the regime in which one step-0 direction can summarise what training reinforces \citep{subnetworks2025rl,razor2025rl}.
+Reward hacks can generalise past the task that taught them \citep{macdiarmid2025hacks,taylor2025harmless,daniels2026preference}; the screen asks the narrower question of which fixed errors reach held-out prompts of the same task.

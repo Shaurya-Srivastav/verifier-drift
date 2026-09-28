@@ -1,0 +1,47 @@
+# Step-0 arms for the instruction-following task.
+# The kit (kit.yaml, same directory) is included first: oracle, fp_hash,
+# fp_trigger, fp_trigger_enriched and the fn rules, with their resampled
+# controls. Targets stay the kit's FPR 0.15 and FNR 0.30. {domain} salts
+# become ifeval/... when the loader sees domain: ifeval.
+# Thresholds and phrases are NOT stored here: calibrate_arms fits them.
+# Phrase arms do not list candidates. Free-text responses yield letter
+# n-grams. Auto candidates that contain a digit are already dropped, so a
+# span such as "route 66" is not a candidate. Phrases match whole WORD_RE
+# tokens. Order matters: resampled and patch arms refer to arms above them.
+include: kit.yaml
+domain: ifeval
+
+arms:
+  # Natural verifier: every constraint checker passes. It ignores the oracle
+  # bit. The oracle is the checker AND the content judge, so when the oracle
+  # is 1 the checker already passed and this arm's FNR is 0.
+  - name: natural
+    type: ifeval_checker
+
+  # Resampled noise matched to natural's achieved pooled rates. Support is
+  # every completion, including empty replies the checker can accept.
+  # Because the oracle implies the checker, the matched FNR is the checker's
+  # step-0 FNR, which is 0 when the oracle is checker AND judge.
+  - name: noise_natural
+    type: resampled
+    match: natural
+    support: all
+    seed: 0
+
+  # After features, before the lock. Keep the k categories with the highest
+  # locked tau_pool. Ties break by fewer errors fixed, then lexicographic
+  # category name. Selection and step-0 rates go into forecasts and the lock.
+  - name: patch_tau
+    type: patch_select
+    base: natural
+    k: 2
+    by: tau
+
+  # The k categories with the most step-0 train-pool errors of natural.
+  # Ties follow task.error_categories order. If the two selections are equal,
+  # patch_rate is withdrawn with reason same_selection.
+  - name: patch_rate
+    type: patch_select
+    base: natural
+    k: 2
+    by: rate

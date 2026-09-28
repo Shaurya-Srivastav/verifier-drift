@@ -30,7 +30,8 @@ when a stop finish did not already end on one, drop padding, and decode
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import contextlib
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from vfates.gen.base import Generator, truncate_prompt_ids
@@ -77,15 +78,22 @@ def token_prompts(
     prompts: list[str],
     system_prompt: str | None = None,
     max_prompt_tokens: int | None = None,
+    *,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
 ) -> list[dict[str, list[int]]]:
     """vLLM token-prompt dicts, one per user string, using :func:`encode_prompt`.
 
-    Prompts longer than ``max_prompt_tokens`` keep the suffix.
+    Prompts longer than ``max_prompt_tokens`` keep the suffix. The chat
+    template (including ``chat_template_kwargs``) is applied here, before
+    ``SamplingParams`` is built: vLLM receives ids, not raw user text.
     """
     return [
         {
             "prompt_token_ids": truncate_prompt_ids(
-                encode_prompt(tokenizer, prompt, system_prompt), max_prompt_tokens
+                encode_prompt(
+                    tokenizer, prompt, system_prompt, chat_template_kwargs=chat_template_kwargs
+                ),
+                max_prompt_tokens,
             )
         }
         for prompt in prompts
@@ -220,19 +228,50 @@ class VLLMGenerator(Generator):
     """
 
     def __init__(
-        self, model_id: str, max_prompt_tokens: int | None = None, **engine_kwargs: Any
+        self,
+        model_id: str,
+        max_prompt_tokens: int | None = None,
+        chat_template_kwargs: Mapping[str, Any] | None = None,
+        **engine_kwargs: Any,
     ) -> None:
         self.model_id = model_id
         self.max_prompt_tokens = max_prompt_tokens
+        self.chat_template_kwargs = None if not chat_template_kwargs else dict(chat_template_kwargs)
+        # Not an ``LLM`` argument. A caller that stuffed it into engine kwargs
+        # would make vLLM reject the constructor.
+        engine_kwargs.pop("chat_template_kwargs", None)
         self.engine_kwargs = dict(engine_kwargs)
         self.adapter: str | None = None
         self._lora: Any = None
         self._lora_ids: dict[str, int] = {}
+        self._weight_source = model_id
         try:
             from vllm import LLM
         except ImportError as exc:
             raise ImportError(_VLLM_MISSING) from exc
         self._llm = LLM(model=model_id, **self.engine_kwargs)
+
+    def load_full_checkpoint(self, path: str | None) -> None:
+        """Reload the engine on a full-model directory. ``None`` restores ``model_id``.
+
+        vLLM 0.10.2 has no weight-swap API for a non-LoRA checkpoint, so the
+        engine is shut down and constructed again on that directory.
+        """
+        target = self.model_id if path is None else str(path)
+        if target == self._weight_source:
+            self.adapter = None
+            self._lora = None
+            return
+        shutdown = getattr(self._llm, "shutdown", None)
+        if callable(shutdown):
+            with contextlib.suppress(Exception):
+                shutdown()
+        from vllm import LLM
+
+        self._llm = LLM(model=target, **self.engine_kwargs)
+        self._weight_source = target
+        self.adapter = None if path is None else str(path)
+        self._lora = None
 
     def set_adapter(self, path: str | None) -> None:
         """Generate with the LoRA adapter at ``path`` (``None``: the base model)."""
@@ -254,6 +293,9 @@ class VLLMGenerator(Generator):
             "engine_kwargs": dict(self.engine_kwargs),
             "adapter": self.adapter,
             "max_prompt_tokens": self.max_prompt_tokens,
+            "chat_template_kwargs": (
+                None if self.chat_template_kwargs is None else dict(self.chat_template_kwargs)
+            ),
         }
 
     def generate(
@@ -278,6 +320,15 @@ class VLLMGenerator(Generator):
         from vllm import SamplingParams
 
         tokenizer = self._llm.get_tokenizer()
+        # Template before SamplingParams: this backend feeds token ids, so the
+        # kwargs never reach vLLM's chat path.
+        prompts_as_ids = token_prompts(
+            tokenizer,
+            prompts,
+            system_prompt,
+            self.max_prompt_tokens,
+            chat_template_kwargs=self.chat_template_kwargs,
+        )
         generation_config = getattr(
             getattr(self._llm, "llm_engine", None), "generation_config", None
         )
@@ -293,7 +344,7 @@ class VLLMGenerator(Generator):
             )
         )
         outputs = self._llm.generate(
-            token_prompts(tokenizer, prompts, system_prompt, self.max_prompt_tokens),
+            prompts_as_ids,
             params,
             lora_request=self._lora,
         )

@@ -65,6 +65,38 @@ def assert_lora_a_equal(fresh: Mapping[str, np.ndarray], saved: Mapping[str, np.
             raise ValueError(f"LoRA A matrix {key} is not bitwise equal to the saved init")
 
 
+def apply_lora_a(model: Any, tensors: Mapping[str, np.ndarray]) -> None:
+    """Copy saved A matrices onto a PEFT model.
+
+    Keys are the base ``nn.Linear`` paths from :func:`lora_a_state`. Each matrix
+    is cast to that parameter's dtype and device. ``B`` is left untouched, so a
+    model that was just initialised stays at ``B = 0`` with the audit's ``A``.
+    """
+    import torch
+
+    assigned: set[str] = set()
+    for name, param in model.named_parameters():
+        if ".lora_A." not in name:
+            continue
+        module = name.split(".lora_A", 1)[0]
+        if module.startswith(_PEFT_PREFIX):
+            module = module[len(_PEFT_PREFIX) :]
+        if module not in tensors:
+            raise ValueError(f"saved LoRA init has no matrix for {module}")
+        value = np.asarray(tensors[module])
+        if tuple(value.shape) != tuple(param.shape):
+            raise ValueError(
+                f"LoRA A matrix {module} has shape {tuple(value.shape)}, expected {tuple(param.shape)}"
+            )
+        source = torch.from_numpy(np.ascontiguousarray(value, dtype=np.float32))
+        with torch.no_grad():
+            param.copy_(source.to(dtype=param.dtype, device=param.device))
+        assigned.add(module)
+    missing = sorted(set(tensors) - assigned)
+    if missing:
+        raise ValueError(f"saved LoRA init has matrices the model does not: {missing[:3]}")
+
+
 def save_lora_init(
     path: str | Path,
     tensors: Mapping[str, np.ndarray],

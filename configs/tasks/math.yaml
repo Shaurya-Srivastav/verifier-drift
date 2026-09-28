@@ -1,0 +1,30 @@
+# SynthLabsAI/Big-Math-RL-Verified, revision pinned to the Hub dataset sha.
+# Big-Math is gated. Loading it needs an HF account that accepted the dataset
+# terms and HF_TOKEN. Without that, set source: deepscaler
+# (agentica-org/DeepScaleR-Preview-Dataset). The dataset and revision below
+# are then replaced by the task defaults unless you override them. DeepScaleR
+# drops AIME by the same normalised-statement match. It has no
+# llama8b_solve_rate, so a difficulty bucket is not applied when that field
+# is absent.
+# Oracle (math-verify): float_rounding 6, numeric_precision 15, no relative
+# tolerance. math-verify's rounding accepts 1/3 versus 0.333333. It rejects
+# 10000 versus 10001.
+# P2 picks one difficulty_bucket. null keeps every rate, including unrated
+# rows and rates in [0.8, 1], which no preregistered bucket covers.
+# Buckets (half-open, on llama8b_solve_rate): [0.0, 0.2), [0.2, 0.4),
+# [0.4, 0.6), [0.6, 0.8).
+# Filters: empty answer, proofs, multiple choice, non-closed-form answers,
+# exact and normalised duplicates, then MATH-500, GSM8K test, and AIME 1983
+# to 2024. Counts are task.filter_counts.
+# Split: u01("math/split", problem_id). dev is [0, dev_fraction), heldout is
+# the next heldout_fraction, the rest is train.
+type: math
+source: big_math
+dataset: SynthLabsAI/Big-Math-RL-Verified
+revision: c75d2f117cddfecb6bd08756e61e508e59732b21
+difficulty_bucket: null
+split_salt: math/split
+dev_fraction: 0.02
+heldout_fraction: 0.04
+verify_timeout_s: 5
+instruction: "Please reason step by step, and put your final answer within \\boxed{}."

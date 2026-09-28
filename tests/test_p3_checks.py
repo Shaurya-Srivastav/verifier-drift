@@ -32,10 +32,15 @@ from vfates.utils.io import canonical_json, read_yaml, sha256_text, write_json
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_p3_config_matches_training_loss_and_keeps_512_tokens() -> None:
+def test_p3_config_is_a_smoke_path_with_the_preregistered_gates() -> None:
     doc = read_yaml(ROOT / "pilots" / "p3_estimator" / "config.yaml")
-    assert doc["audit"]["sampling"]["max_tokens"] == 512
-    assert doc["audit"]["forecast"]["loss_agg"] == "seq_mean"
+    assert doc["smoke"] is True
+    assert doc["gates"]["reliability"] == 0.8
+    assert doc["gates"]["sketch_corr"] == 0.95
+    assert doc["gates"]["bf16_cosine"] == 0.99
+    assert doc["gates"]["noise_model_gap"] == 0.05
+    assert doc["gates"]["hash_auc_max"] == 0.60
+    assert doc["gates"]["shared_auc_min"] == 0.65
 
 
 class _Table:

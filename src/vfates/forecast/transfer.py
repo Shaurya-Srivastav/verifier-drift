@@ -55,11 +55,16 @@ from typing import Any
 
 import numpy as np
 
+from vfates.utils.hashing import stable_seed
 from vfates.utils.stats import GroupIds, group_indices
 
 DEFAULT_KAPPAS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0)
 DEFAULT_QS: tuple[float, ...] = (1 / 64, 1 / 32, 1 / 16, 1 / 8)
 PRIMARY_Q: float = 1 / 32
+# Oracle labels drawn from the top-q set for the secondary H9 screen.
+ORACLE_LIGHT_BUDGETS: tuple[int, ...] = (32, 64, 128, 192)
+ORACLE_LIGHT_DRAWS: int = 2000
+ORACLE_LIGHT_STORED_DRAWS: int = 200
 # Matches ``vfates.train.grpo_core.group_advantages`` (TRL ``scale_rewards="group"``).
 _STD_EPS: float = 1e-4
 
@@ -236,6 +241,105 @@ def tau_pool(s: np.ndarray, pid: GroupIds, O: np.ndarray, q: float = PRIMARY_Q) 
     n_above = int(above.sum())
     share = (k - n_above) / int(tied.sum())
     return float((O[above].sum() + share * O[tied].sum()) / k)
+
+
+def _top_q_weights(scores: np.ndarray, pid: GroupIds, q: float) -> tuple[np.ndarray, int, int]:
+    """Weights of the top-q set, its size, and the slot count ``k``.
+
+    Weights are 1 on samples strictly above the threshold and
+    ``(k - n_above) / n_tied`` on the tied boundary. They sum to ``k``.
+    """
+    c = prompt_centered(np.asarray(scores, dtype=np.float64), pid)
+    n = int(c.size)
+    if n == 0:
+        return np.zeros(0, dtype=np.float64), 0, 0
+    k = max(1, round(q * n))
+    threshold = np.partition(c, n - k)[n - k]
+    above = c > threshold
+    tied = c == threshold
+    n_above = int(above.sum())
+    n_tied = int(tied.sum())
+    share = (k - n_above) / n_tied
+    weights = np.zeros(n, dtype=np.float64)
+    weights[above] = 1.0
+    weights[tied] = share
+    return weights, int(np.count_nonzero(weights)), k
+
+
+def tau_pool_budget(
+    scores: np.ndarray,
+    oracle: np.ndarray,
+    pid: GroupIds,
+    *,
+    q: float,
+    budget: int,
+    n_draws: int,
+    seed: int,
+    arm: str | None = None,
+) -> dict[str, Any]:
+    """``tau_pool`` when only ``budget`` oracle labels from the top-q set are seen.
+
+    Labels are drawn without replacement. The estimate is the Horvitz-Thompson
+    reweighting of the weighted top-q sum, so the mean over draws is unbiased
+    for :func:`tau_pool`. When ``budget`` covers the whole set the return is
+    that ``tau_pool`` exactly (``sd`` 0, both percentiles equal the mean) and
+    ``draws`` is omitted. Otherwise ``draws`` is every sample; mean, sd and
+    the percentiles are over all of them.
+
+    The stream is ``stable_seed(seed, "tau_pool_budget", arm, budget)`` when
+    ``arm`` is set, and ``stable_seed(seed, "tau_pool_budget", budget)``
+    otherwise, so budgets and arms do not share a random stream.
+    """
+    if not 0.0 < q <= 1.0:
+        raise ValueError("q must lie in (0, 1]")
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+        raise ValueError(f"budget must be an int >= 1, got {budget!r}")
+    if isinstance(n_draws, bool) or not isinstance(n_draws, int) or n_draws < 1:
+        raise ValueError(f"n_draws must be an int >= 1, got {n_draws!r}")
+    labels = np.asarray(oracle, dtype=np.float64)
+    weights, needed, k = _top_q_weights(scores, pid, q)
+    empty = {
+        "mean": float("nan"),
+        "sd": float("nan"),
+        "p05": float("nan"),
+        "p95": float("nan"),
+        "oracle_labels_needed": 0,
+        "budget": int(budget),
+    }
+    if needed == 0 or k == 0:
+        return empty
+    if budget >= needed:
+        full = tau_pool(scores, pid, labels, q)
+        return {
+            "mean": full,
+            "sd": 0.0,
+            "p05": full,
+            "p95": full,
+            "oracle_labels_needed": needed,
+            "budget": int(budget),
+        }
+    idx = np.flatnonzero(weights)
+    chosen_w = weights[idx]
+    chosen_o = labels[idx]
+    if arm is None:
+        rng = np.random.default_rng(stable_seed(seed, "tau_pool_budget", int(budget)))
+    else:
+        rng = np.random.default_rng(stable_seed(seed, "tau_pool_budget", arm, int(budget)))
+    draws = np.empty(n_draws, dtype=np.float64)
+    scale = needed / float(budget) / float(k)
+    for draw in range(n_draws):
+        pick = rng.choice(needed, size=budget, replace=False)
+        draws[draw] = scale * float((chosen_w[pick] * chosen_o[pick]).sum())
+    sd = float(draws.std(ddof=1))
+    return {
+        "mean": float(draws.mean()),
+        "sd": sd,
+        "p05": float(np.quantile(draws, 0.05)),
+        "p95": float(np.quantile(draws, 0.95)),
+        "oracle_labels_needed": needed,
+        "budget": int(budget),
+        "draws": [float(value) for value in draws],
+    }
 
 
 def tau_pool_interval(

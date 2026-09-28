@@ -1,0 +1,101 @@
+\section{Verifier errors as update directions}
+\label{sec:theory}
+
+The objects are a binary verifier $V$, a binary oracle $O$, and a policy trained against $V$.
+Rates are pooled on samples from the step-0 policy on the training prompts.
+Held-out prompts are never used to fit a verifier or a forecast.
+A prompt $x$ has a finite output set, with $\pi_0(\cdot \mid x) = \mathrm{softmax}(\mathrm{base}(x))$.
+A shared parameter $\theta$ enters through features $\phi(x,y)$,
+\begin{equation}
+\mathrm{logits}(x) = \mathrm{base}(x) + \phi(x)\,\theta + \mathrm{tab}(x),
+\end{equation}
+and held-out prompts are scored with $\theta$ only.
+With prompts weighted equally, the shared update at $\pi_0$ is
+\begin{equation}
+g_V = \mathbb{E}_x \,\mathrm{Cov}_{\pi_0(\cdot \mid x)}(\phi, V).
+\end{equation}
+One Euler step of the population flow on $\theta$ equals $\eta g_V$.
+On every sample, $\mathrm{FN} = O(1-V)$ and $\mathrm{FP} = (1-O)V$, so
+\begin{equation}
+\label{eq:split}
+V = O - \mathrm{FN} + \mathrm{FP}, \qquad g_V = g_O - g_{\mathrm{FN}} + g_{\mathrm{FP}}.
+\end{equation}
+The phrase trigger is a coordinate of $\phi$: $g_{\mathrm{FP}}$ loads on that coordinate wherever the phrase is accepted and the answer is wrong.
+
+\subsection{What is known about the rate}
+
+Two facts bound what a rate can explain.
+They are stated formally in Appendix~\ref{app:proofs}; the proofs there follow the derivations in the theory note, and the repository checks the finite-world case rather than re-proving the geometry those derivations quote.
+
+Lemma~\ref{lem:tilt} is tilt invariance \citep{mroueh2025tilt,dorner2025tilt}.
+An update that reweights outputs by a function of $V$ alone leaves the conditional law of the output given the verdict unchanged.
+On each prompt, accuracy then lies on the segment between the false-omission rate and mean precision.
+A common $J$ does not pick a point on that segment.
+
+Proposition~\ref{prop:mode} is the Euclidean softmax flow.
+With no KL penalty the flow is mode-seeking inside a level set of $V$, and its endpoint is modal precision, the oracle label of the most likely accepted output.
+With a KL penalty the equilibrium is the finite tilt $\pi_0 \exp(V/\beta)$, which sits between base accuracy and mean precision when $J > 0$.
+Modal precision is not an equilibrium of any positive penalty.
+A shared linear head cannot realise an arbitrary per-prompt tilt, so these endpoints are a repeated-prompt baseline, not a description of held-out prompts.
+
+\subsection{Which errors move held-out prompts}
+
+\begin{quote}
+\noindent\textbf{Lemma (Resampled noise).}
+Class-conditional noise with rates $\rho_0 = \mathbb{P}(V=1 \mid O=0)$ and $\rho_1 = \mathbb{P}(V=0 \mid O=1)$, redrawn independently of $\phi$ given $O$, satisfies $\mathbb{E}[g_V] = J g_O$ with $J = 1 - \rho_0 - \rho_1$.
+\end{quote}
+This is the resampled clause of Theorem~\ref{thm:transfer}.
+\citet{rad2026rate} obtain the same scale factor for a replicator flow: noise stretches time and does not add a direction.
+The identity is an expectation over the coins.
+A single fixed rule is not that expectation.
+
+\begin{quote}
+\noindent\textbf{Theorem (Transfer).}
+A held-out prompt $x'$ moves only through $\theta$.
+To first order, $s(y) = \langle \phi(x', y), g_V \rangle$ is the growth rate of $\log \pi(y \mid x')$.
+\end{quote}
+The formal statement is Theorem~\ref{thm:transfer}.
+Two cases of a fixed bit follow at once.
+If the bit is a function of a shared behaviour, and that behaviour has a coordinate in $\phi$ on held-out prompts, then $s(y)$ is large for held-out outputs that carry the coordinate.
+The phrase trigger is this case: the same phrase is a feature on every prompt, so a false positive that keys on it writes one direction everywhere.
+If the bit depends on the prompt and is independent of the shared coordinates, the prompt-averaged covariance is zero.
+There is then no feature of the completion that the error selects on every prompt, and the held-out growth rate does not see the error.
+
+The two clauses separate the running example from its controls.
+Resampled noise at the trigger's rate has the same $J$ and, in expectation, the oracle's direction.
+A hash of the prompt and the answer has the same false-positive rate and no shared coordinate.
+Only the fitted phrase adds $g_{\mathrm{FP}}$.
+
+\subsection{Transfer precision}
+
+Exact transfer precision scores every held-out output.
+With $s = \phi g_V$, each held-out prompt contributes the $\pi_0$-weighted oracle accuracy of the outputs that attain the maximum of $s$.
+That is the oracle accuracy of the output whose log-probability grows fastest.
+The oracle is required on those favoured outputs, not on the outputs the direction ranks last.
+
+The finite-sample statistic used in the study is $\tau_{\mathrm{pool}}$ at $q = 1/32$.
+Prompt-centre the velocities, pool them across held-out prompts, and take the oracle accuracy of the top fraction $q$.
+Pooling is the reason to prefer this over a per-prompt argmax.
+A behaviour carried by a shared feature is favoured on every prompt, including prompts whose samples happened to miss it, and the global tail can still be filled by the prompts that did sample it.
+$q = 1/32$ was fixed on the toy worlds before any language-model run.
+On that 28-cell grid, Spearman correlation of $\tau_{\mathrm{pool}}$ with trained held-out accuracy is $\PZeroTauPoolRho{}$, against $\PZeroJRho{}$ for step-0 $J$ and $\PZeroPrecRho{}$ for step-0 mean precision.
+Exact $\tau$ correlates at $\PZeroExactRho{}$.
+Most cells lie near 0 or near 1, so this is not an untouched test of $q$.
+The knife-edge world is outside the grid.
+
+The estimator in the study is the same tail on language-model features.
+The features are LoRA-$B$ gradients of the summed completion-token log-likelihood at initialisation, on the sampled token ids.
+Standard LoRA sets $B = 0$, so the first optimiser step moves only $B$, and $\partial L / \partial B$ is a random projection of the full weight gradient through the fixed $A$ \citep{hu2021lora}.
+Those gradients are CountSketched to 8,192 dimensions \citep{charikar2002frequent}.
+The primary direction is the prompt-centred covariance, prompts weighted equally.
+The audit uses 192 oracle labels for the primary screen.
+Appendix~\ref{app:proofs} records the sketch identity, the GRPO advantage calculation, and the length normalisation.
+Group-standardised advantages are stored as a secondary direction and are not the preregistered statistic.
+
+\subsection{Scope}
+
+The screen freezes $g_V$ at $\pi_0$.
+It does not follow the update after the policy has moved.
+The documented failure is the knife-edge world in Appendix~\ref{app:proofs}: transfer precision on the committed seeds runs from $\PZeroKnifeTauMin{}$ to $\PZeroKnifeTauMax{}$, and mean terminal held-out accuracy is $\PZeroKnifeTerminal{}$.
+The linearisation is valid in a neighbourhood the shared flow then leaves.
+Every later claim in this paper is a claim about that first-order screen, tested at the preregistered horizon of 300 steps, not a claim about the infinite-horizon flow.

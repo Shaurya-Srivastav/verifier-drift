@@ -7,7 +7,7 @@ endif
 
 .DEFAULT_GOAL := help
 .PHONY: help install install-mac install-gpu lint format typecheck test test-all \
-	p0 p1 p2 p3 p4 p5 p6 pilots-mac clean
+	p0 p1 p2 p3 p4 p5 p6 pilots-mac paper clean
 
 help:
 	@echo "make install        pip install -e '.[dev,tasks]' (CPU tests)"
@@ -19,7 +19,8 @@ help:
 	@echo "make test           pytest, excluding slow and network"
 	@echo "make test-all       pytest, every marker"
 	@echo "make p0 ... p6      python pilots/pN_<name>/run.py"
-	@echo "make pilots-mac     p0 p1 p2 p3 p4"
+	@echo "make pilots-mac     p0, p1 live, then smoke runs of p2 to p6 into runs/smoke/"
+	@echo "make paper          generate assets, then latexmk -pdf in paper/"
 	@echo "make clean          caches, bytecode, build artifacts"
 
 install:
@@ -67,7 +68,15 @@ p5:
 p6:
 	$(PY) pilots/p6_natural/run.py
 
-pilots-mac: p0 p1 p2 p3 p4
+pilots-mac: p0
+	$(PY) pilots/p1_harness/run.py --set live=true
+	for p in p2_base_audit p3_estimator p4_micro_grpo p5_gpu_gate p6_natural; do \
+		$(PY) pilots/$$p/run.py --set smoke=true --out runs/smoke/$$p || exit 1; \
+	done
+
+paper:
+	$(PY) -m vfates.paper assets
+	cd paper && latexmk -pdf main.tex
 
 clean:
 	rm -rf .pytest_cache .mypy_cache .ruff_cache build dist src/*.egg-info

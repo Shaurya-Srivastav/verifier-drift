@@ -1,0 +1,29 @@
+\begin{tabular}{p{0.24\textwidth}p{0.42\textwidth}rl}
+\toprule
+Check & Name & Value & Status \\
+\midrule
+P0.1 & tilt invariance & \ensuremath{7.22 \times 10^{-16}} & pass \\
+P0.2 & pathwise covariance decomposition & \ensuremath{4.86 \times 10^{-17}} & pass \\
+P0.3a & resampled noise scales the oracle update & 1.0000 & pass \\
+P0.3b & J-\allowbreak{}scaling least-\allowbreak{}squares multiplier & 0.0017 & pass \\
+P0.3c & group-\allowbreak{}advantage identity and std-\allowbreak{}norm sign & 1.5915 & pass \\
+P0.4a & beta=0 tabular flow reaches modal precision & 0.0012 & pass \\
+P0.4b & replicator/tilt terminal is mean precision & \ensuremath{1.11 \times 10^{-16}} & pass \\
+P0.4c & beta>0 equilibrium is the finite tilt & 0.0120 & pass \\
+P0.5.hand\_noisy.gap & hand\_noisy: resampled held-\allowbreak{}out minus fpF & 0.9938 & pass \\
+P0.5.hand\_noisy.close & hand\_noisy: resampled held-\allowbreak{}out vs fpI & \ensuremath{7.55 \times 10^{-5}} & pass \\
+P0.5.hand\_noisy.J & hand\_noisy: fpF, fpI and resampled share step-\allowbreak{}0 J & 0.0000 & pass \\
+P0.5.rf05.gap & rf05: resampled held-\allowbreak{}out minus fpF & 0.9913 & pass \\
+P0.5.rf05.close & rf05: resampled held-\allowbreak{}out vs fpI & \ensuremath{8.02 \times 10^{-5}} & pass \\
+P0.5.rf05.J & rf05: fpF, fpI and resampled share step-\allowbreak{}0 J & 0.0000 & pass \\
+P0.6.coverage & exact tau within tolerance of held-\allowbreak{}out accuracy & 0.9643 & pass \\
+P0.6.spearman & Spearman of exact tau with held-\allowbreak{}out accuracy & 0.8600 & pass \\
+P0.6.spearman\_J & exact tau beats step-\allowbreak{}0 J & 0.2248 & pass \\
+P0.6.spearman\_prec & exact tau beats step-\allowbreak{}0 precision & 0.3074 & pass \\
+P0.7.spearman & 16-\allowbreak{}sample tau\_pool ranks held-\allowbreak{}out accuracy & 0.8617 & pass \\
+P0.7.calibration & 16-\allowbreak{}sample tau\_pool within tolerance of held-\allowbreak{}out accuracy & 1.0000 & pass \\
+P0.7.tau\_rel & 16-\allowbreak{}sample per-\allowbreak{}prompt tau\_rel ranks held-\allowbreak{}out accuracy & 0.7769 & documented \\
+P0.7.reliability & split-\allowbreak{}half reliability of the 16-\allowbreak{}sample velocity & 0.9871 & pass \\
+P0.8 & knife-\allowbreak{}edge: tau predicts success, shared flow collapses & 0.0226 & documented \\
+\bottomrule
+\end{tabular}

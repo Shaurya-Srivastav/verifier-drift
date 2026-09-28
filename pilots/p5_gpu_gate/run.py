@@ -1,4 +1,4 @@
-"""Run pilot P5: ``python pilots/p5_gpu_gate/run.py [--set mode=full]``."""
+"""Run pilot P5: ``python pilots/p5_gpu_gate/run.py [--set stage=path]``."""
 
 from vfates.pilots.common import main_guard
 from vfates.pilots.p5_gpu_gate import run

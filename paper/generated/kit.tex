@@ -1,0 +1,18 @@
+\begin{tabular}{p{0.30\textwidth}lp{0.32\textwidth}}
+\toprule
+Arm & Channel & Structure \\
+\midrule
+\texttt{oracle} & none & clean reward \\
+\texttt{fp\_hash} & FPR 0.15 & prompt-specific false positives \\
+\texttt{fp\_trigger} & FPR 0.15 & shared, phrase not enriched \\
+\texttt{fp\_trigger\_enriched} & FPR 0.15 & shared, phrase enriched for correct answers \\
+\texttt{noise\_fp} & matched to fp\_hash & resampled, answered wrong outputs \\
+\texttt{noise\_fp\_trigger} & matched to fp\_trigger & resampled, every wrong output \\
+\texttt{noise\_fp\_trigger\_enriched} & matched to fp\_trigger\_enriched & resampled, every wrong output \\
+\texttt{fn\_behavior} & FNR 0.30 & shared, phrase predicts correctness \\
+\texttt{fn\_behavior\_depleted} & FNR 0.30 & shared, phrase depleted among correct answers \\
+\texttt{fn\_prompt\_subset} & FNR 0.30 & prompt-specific false negatives \\
+\texttt{noise\_fn} & matched to fn\_behavior & resampled, correct outputs \\
+\texttt{noise\_fn\_depleted} & matched to fn\_behavior\_depleted & resampled, correct outputs \\
+\bottomrule
+\end{tabular}

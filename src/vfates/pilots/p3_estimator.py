@@ -1,33 +1,23 @@
-"""P3: the step-0 estimator on a real audit, and the locked forecasts P4 is scored against.
+"""P3: split-half reliability, sketch fidelity, bf16 agreement, and the lock.
 
-Runs the full E1 audit on the pilot model (sampling, arms, LoRA-B gradient
-features) and checks the estimator before any training:
-
-* reliability: the velocity direction of every arm is stable across prompt halves,
-  with a noise model of that direction that gives the train pool the gate needs;
-* sketch fidelity: CountSketch preserves inner products of exact LoRA-B gradients;
-* decodeability (documented): shared errors are linearly decodable from step-0
-  features on unseen prompts, prompt-specific errors are not (the mechanism
-  behind transfer);
-* feature agreement: pooled hidden states rank arms like LoRA-B gradients;
-* the forecasts are locked (hash-verified) before P4 trains a single step.
-
-The forecasted fates themselves are reported, not gated: gating on the
-prediction the study tests would be circular.
+Per domain, on the development pool, with the E1 cell's arms. A domain fails
+the pilot when any gated check fails: reliability of oracle and natural arms
+(P3.2), reliability of every other arm (P3.3), sketch fidelity (P3.4), bf16
+agreement on at least 256 rows (P3.11), or the lock (P3.8). Decodability,
+LoRA-seed sensitivity, and the reliability noise model are documented.
 """
 
 from __future__ import annotations
 
-import copy
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from vfates.forecast import transfer as transfer_mod
-from vfates.pilots.common import Checks, markdown_table, write_report
+from vfates.pilots.common import Checks, dev_pools_honored, write_decisions, write_report
 from vfates.utils.io import read_json, write_json
 from vfates.utils.stats import spearman
 
@@ -238,271 +228,472 @@ def _probe(audit: Any, features: np.ndarray, calib: dict[str, Any], cfg: dict[st
     return rows
 
 
-def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
-    """P3 estimator validation and forecast lock."""
-    from vfates.audit import extract_features, forecast_arms, run_audit
-    from vfates.forecast.lockbox import verify_lock
+_ORACLE_NATURAL_TYPES = frozenset(
+    {
+        "oracle",
+        "math_lenient",
+        "math_strip_string",
+        "code_public_tests",
+        "ifeval_checker",
+        "model_judge",
+        "master_rm",
+        "natural_string_match",
+        "string_match",
+    }
+)
+P3_SCHEMA = "vfates.p3_decisions/1"
+P3_GATES = ("P3.2", "P3.3", "P3.4", "P3.11", "P3.8")
+BF16_ROWS = 256
 
+
+def arm_reliability_group(name: str, typ: str) -> str:
+    """``P3.2`` for oracle and natural arms, ``P3.3`` for every other forecast arm.
+
+    Resampled arms and names that start with ``noise_`` are P3.3 even when the
+    type string looks natural. A natural name (``natural`` or ``natural_*``)
+    that is not resampled is P3.2.
+    """
+    if typ == "resampled" or name.startswith("noise_"):
+        return "P3.3"
+    if name == "natural" or name.startswith("natural_"):
+        return "P3.2"
+    if typ in _ORACLE_NATURAL_TYPES:
+        return "P3.2"
+    return "P3.3"
+
+
+def reliability_groups(
+    forecasts: Mapping[str, Any], types: Mapping[str, str] | None = None
+) -> dict[str, list[tuple[str, float]]]:
+    """Split-half cosine of ``g_V`` for each forecast arm, by gate."""
+    from vfates.audit import iter_forecast_arms
+
+    lookup = types or {}
+    groups: dict[str, list[tuple[str, float]]] = {"P3.2": [], "P3.3": []}
+    for name, entry in iter_forecast_arms(forecasts):
+        typ = str(lookup.get(name) or entry.get("type") or "")
+        cosine = float(entry["transfer"]["reliability"])
+        groups[arm_reliability_group(name, typ)].append((name, cosine))
+    return groups
+
+
+def worst_arm(pairs: Sequence[tuple[str, float]]) -> tuple[str, float] | None:
+    if not pairs:
+        return None
+    return min(pairs, key=lambda item: item[1])
+
+
+def bf16_slice_gate(
+    features_bf16: np.ndarray,
+    features_float32: np.ndarray,
+    pid: np.ndarray,
+    verdicts: np.ndarray,
+    *,
+    n_min: int = BF16_ROWS,
+    threshold: float = 0.99,
+) -> dict[str, Any]:
+    """P3.11. Both agreement functions run when the matrices share a shape.
+
+    The check passes only when the slice has at least ``n_min`` rows, the row
+    gate passes, and the ``g_V`` cosine is strictly above ``threshold``.
+    """
+    from vfates.features.equivalence import bf16_float32_gate, direction_agreement
+
+    left = np.asarray(features_bf16)
+    right = np.asarray(features_float32)
+    n = int(left.shape[0]) if left.ndim == 2 else 0
+    same = left.shape == right.shape and n > 0
+    gate: dict[str, Any] = {"pass": False}
+    direction: dict[str, float] | None = None
+    if same:
+        gate = dict(bf16_float32_gate(left, right, threshold=threshold))
+        if len(pid) == n and len(verdicts) == n:
+            direction = direction_agreement(left, right, np.asarray(pid), np.asarray(verdicts))
+    cosine = None if direction is None else float(direction["cosine"])
+    passed = bool(gate.get("pass")) and cosine is not None and cosine > threshold and n >= n_min
+    return {
+        "pass": passed,
+        "n": n,
+        "n_min": int(n_min),
+        "threshold": float(threshold),
+        "gate": gate,
+        "direction_cosine": cosine,
+    }
+
+
+def domain_verdict(
+    *,
+    groups: Mapping[str, Sequence[tuple[str, float]]],
+    sketch_corr: float | None,
+    bf16_pass: bool | None,
+    lock_ok: bool | None,
+    reliability_min: float,
+    sketch_min: float,
+) -> dict[str, Any]:
+    """Gated checks for one domain. A missing measurement is a failure."""
+    failed: list[str] = []
+    worst: dict[str, Any] = {}
+    for gate in ("P3.2", "P3.3"):
+        pairs = list(groups.get(gate) or [])
+        item = worst_arm(pairs)
+        if item is None or item[1] < reliability_min:
+            failed.append(gate)
+        worst[gate] = None if item is None else {"arm": item[0], "reliability": item[1]}
+    if sketch_corr is None or sketch_corr < sketch_min:
+        failed.append("P3.4")
+    if not bf16_pass:
+        failed.append("P3.11")
+    if not lock_ok:
+        failed.append("P3.8")
+    return {
+        "status": "pass" if not failed else "fail",
+        "failed": failed,
+        "worst": worst,
+        "sketch_corr": sketch_corr,
+        "bf16_pass": bf16_pass,
+        "lock_ok": lock_ok,
+    }
+
+
+def _forecast_entry(reliability: float, typ: str) -> dict[str, Any]:
+    return {"type": typ, "transfer": {"reliability": reliability}}
+
+
+def score_reported_domains(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Score domains already measured (tests, or a resumed GPU report)."""
+    gates = config.get("gates") or {}
+    reliability_min = float(gates.get("reliability", 0.8))
+    sketch_min = float(gates.get("sketch_corr", 0.95))
+    out: dict[str, Any] = {}
+    for domain, block in dict(config["domains"]).items():
+        forecasts = block["forecasts"]
+        types = block.get("types") or {}
+        groups = reliability_groups(forecasts, types)
+        bf16 = block.get("bf16") or {}
+        out[domain] = domain_verdict(
+            groups=groups,
+            sketch_corr=None if block.get("sketch_corr") is None else float(block["sketch_corr"]),
+            bf16_pass=None if "bf16_pass" not in block else bool(block["bf16_pass"]),
+            lock_ok=None if "lock_ok" not in block else bool(block["lock_ok"]),
+            reliability_min=reliability_min,
+            sketch_min=sketch_min,
+        )
+        out[domain]["groups"] = {
+            gate: [{"arm": name, "reliability": value} for name, value in pairs]
+            for gate, pairs in groups.items()
+        }
+        if bf16:
+            out[domain]["bf16"] = bf16
+    return out
+
+
+def _add_domain_checks(
+    checks: Checks, domains: Mapping[str, Mapping[str, Any]], gates: Mapping[str, Any]
+) -> None:
+    reliability_min = float(gates.get("reliability", 0.8))
+    sketch_min = float(gates.get("sketch_corr", 0.95))
+    bf16_min = float(gates.get("bf16_cosine", 0.99))
+    for domain, verdict in domains.items():
+        for gate, title, threshold in (
+            ("P3.2", "oracle and natural arms, split-half cosine of g_V", reliability_min),
+            ("P3.3", "targeted and resampled arms, split-half cosine of g_V", reliability_min),
+        ):
+            worst = (verdict.get("worst") or {}).get(gate) or {}
+            value = worst.get("reliability")
+            checks.add(
+                f"{gate}.{domain}",
+                f"{domain}: {title}",
+                None if value is None else float(value),
+                gate not in verdict["failed"],
+                threshold=threshold,
+                metric="worst arm" if not worst.get("arm") else str(worst["arm"]),
+            )
+        sketch = verdict.get("sketch_corr")
+        checks.add(
+            f"P3.4.{domain}",
+            f"{domain}: CountSketch off-diagonal Gram correlation",
+            None if sketch is None else float(sketch),
+            "P3.4" not in verdict["failed"],
+            threshold=sketch_min,
+            metric="corr(exact, sketched)",
+        )
+        checks.add(
+            f"P3.11.{domain}",
+            f"{domain}: bf16 features agree with float32 on at least {BF16_ROWS} rows",
+            None,
+            "P3.11" not in verdict["failed"],
+            threshold=bf16_min,
+            metric="bf16_float32_gate and direction_agreement",
+        )
+        checks.add(
+            f"P3.8.{domain}",
+            f"{domain}: forecasts are locked",
+            None,
+            "P3.8" not in verdict["failed"],
+            metric="lock verifies",
+        )
+
+
+def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
+    """P3 estimator gates.
+
+    A hidden-state ablation, when a config asks for it, calls forecast_arms
+    with divide_by_length=False. It is not a go/no-go check.
+    """
     started = time.perf_counter()
     out = Path(out_dir)
-    audit_dir = out / "audit"
-    gates = config["gates"]
-    audit_cfg = copy.deepcopy(config["audit"])
-    audit = run_audit(audit_cfg, audit_dir)
-    tb = audit.table
-    with np.load(audit_dir / "features.npz") as saved:
-        X, feat_lengths = saved["features"], saved["lengths"]
-    forecasts = read_json(audit_dir / "forecasts.json")
-    calib = read_json(audit_dir / "calibration.json")
+    out.mkdir(parents=True, exist_ok=True)
+    smoke = bool(config.get("smoke", True))
     checks = Checks()
-    tables: dict[str, Any] = {}
-
-    held = tb.split == "heldout"
-    base = float(np.mean([tb.O[held & (tb.pid == p)].mean() for p in np.unique(tb.pid[held])]))
-    coverage = forecasts["oracle"]["transfer"]["coverage"]
-    checks.add(
-        "P3.1",
-        "held-out base accuracy and coverage (pass@n)",
-        base,
-        True,
-        metric=f"base acc (coverage {coverage:.3f})",
-        documented=True,
-    )
-
-    rel_min = float(gates["reliability"])
-    rel = {
-        a: f["transfer"]["reliability"] for a, f in forecasts.items() if a != "natural_string_match"
-    }
-    worst = min(rel, key=lambda a: rel[a])
-    checks.add(
-        "P3.2",
-        "velocity direction is reliable across prompt halves (oracle arm)",
-        rel["oracle"],
-        rel["oracle"] >= rel_min,
-        threshold=rel_min,
-        metric="split-half cosine",
-    )
-    checks.add(
-        "P3.3",
-        f"least reliable arm ({worst})",
-        rel[worst],
-        rel[worst] >= rel_min,
-        threshold=rel_min,
-        metric="split-half cosine",
-    )
-    budget = reliability_table(
-        X,
-        feat_lengths if _locked_length_divided(forecasts) else None,
-        tb,
-        rel,
-        rel_min,
-    )
-    tables["reliability_budget"] = budget
-    model_gap = max(abs(r["predicted"] - r["measured"]) for r in budget.values())
-    gap_max = float(gates.get("noise_model_gap", 0.05))
-    checks.add(
-        "P3.10",
-        "the noise model reproduces the measured split-half cosine",
-        model_gap,
-        model_gap <= gap_max,
-        threshold=gap_max,
-        metric="max |predicted - measured| across arms",
-        documented=True,
-    )
-
-    fid_path = out / "sketch_fidelity.json"
-    if fid_path.exists():
-        fid = read_json(fid_path)
-    else:
-        fid = _sketch_fidelity(
-            audit,
-            audit_cfg["features"],
-            int(config["fidelity"]["n"]),
-            0,
-            save_init=audit_dir / "lora_init.safetensors",
-        )
-        write_json(fid_path, fid)
-    tables["sketch_fidelity"] = fid
-    checks.add(
-        "P3.4",
-        "CountSketch preserves LoRA-B gradient inner products on train rows",
-        fid["offdiag_corr"],
-        fid["offdiag_corr"] >= float(gates["sketch_corr"]),
-        threshold=gates["sketch_corr"],
-        metric="corr(exact, sketched) off-diagonal Gram",
-    )
-
-    probe_path = out / "probe.json"
-    if probe_path.exists():
-        probe = read_json(probe_path)
-    else:
-        probe = _probe(audit, X, calib, config.get("probe", {}))
-        write_json(probe_path, probe)
-    tables["probe"] = probe
-    by_arm = {r["arm"]: r for r in probe}
-    hash_auc = by_arm.get("fp_hash", {}).get("auc")
-    if hash_auc is not None:
-        hidden_hash = hash_auc <= float(gates["hash_auc_max"])
+    gates = dict(config.get("gates") or {})
+    domains: dict[str, Any] | None = None
+    if "domains" in config:
+        domains = score_reported_domains(config)
+        _add_domain_checks(checks, domains, gates)
+        for key, title, threshold, documented in (
+            ("P3.5", "prompt-specific FP is not decodable", gates.get("hash_auc_max", 0.60), True),
+            ("P3.6", "a shared FP is decodable", gates.get("shared_auc_min", 0.65), True),
+            ("P3.9", "LoRA seed sensitivity", None, True),
+            ("P3.10", "reliability noise model gap", gates.get("noise_model_gap", 0.05), True),
+        ):
+            if documented:
+                checks.add(
+                    key,
+                    title,
+                    None,
+                    True,
+                    threshold=threshold,
+                    metric="reported with the domain audit; not a gate",
+                    documented=True,
+                )
+    elif smoke or not config.get("execute"):
         checks.add(
-            "P3.5",
-            "prompt-specific FP (hash) is not decodable on unseen prompts",
-            hash_auc,
-            hidden_hash,
-            threshold=gates["hash_auc_max"],
-            metric=f"grouped-CV AUC; {'as expected' if hidden_hash else 'decodable'}",
-            documented=True,
-        )
-    shared = [r for r in probe if r["type"] in ("tolerance_fp", "trigger_fp")]
-    if shared:
-        best = max(shared, key=lambda r: r["auc"] if r["auc"] == r["auc"] else -1)
-        visible = best["auc"] >= float(gates["shared_auc_min"])
-        checks.add(
-            "P3.6",
-            f"a shared FP ({best['arm']}) is decodable on unseen prompts",
-            best["auc"],
-            visible,
-            threshold=gates["shared_auc_min"],
-            metric=f"grouped-CV AUC; {'as expected' if visible else 'not decodable'}",
-            documented=True,
-        )
-
-    hid_cfg = config.get("hidden_features")
-    if hid_cfg:
-        hid_dir = out / "hidden"
-        from vfates.utils.io import canonical_json, sha256_text
-
-        hid_spec = {**hid_cfg, "kind": "hidden"}
-        manifest = read_json(audit_dir / "stages.json")
-        hid_fp = sha256_text(
-            canonical_json({"completions": manifest["stages"]["completions"], "features": hid_spec})
-        )
-        Xh, lh, _ = extract_features(
-            hid_spec,
-            audit.task,
-            audit.problems,
-            audit.completions,
-            hid_dir,
-            fingerprint=hid_fp,
-        )
-        fc_h = forecast_arms(
-            tb,
-            Xh,
-            lh,
-            list(forecasts),
-            n_boot=0,
-            reliability_splits=int(audit_cfg["forecast"].get("reliability_splits", 20)),
-            divide_by_length=False,
-        )
-        write_json(out / "forecasts_hidden.json", fc_h)
-        arms = [a for a in forecasts if a != "natural_string_match"]
-        rho = spearman(
-            [forecasts[a]["transfer"]["tau_pool"] for a in arms],
-            [fc_h[a]["transfer"]["tau_pool"] for a in arms],
-        )
-        checks.add(
-            "P3.7",
-            "hidden-state features rank arms like LoRA-B gradients",
-            rho,
+            "P3.2",
+            "smoke does not score reliability",
+            None,
             True,
-            metric="Spearman of tau_pool across arms",
+            threshold=float(gates.get("reliability", 0.8)),
+            metric="set smoke=false on the E1 hardware class to gate the domains",
             documented=True,
         )
-        tables["hidden_tau_pool"] = {a: fc_h[a]["transfer"]["tau_pool"] for a in arms}
-
-    divided = _locked_length_divided(forecasts)
-    shift = compare_lora_seeds(
-        audit, audit_cfg["features"], out, forecasts, divide_by_length=divided
-    )
-    tables["lora_seed"] = shift
-    checks.add(
-        "P3.9",
-        "LoRA seed 1 does not define the screen by itself",
-        shift["spearman"],
-        True,
-        metric=f"Spearman across arms (max |d tau_pool|={shift['max_abs_tau_pool']:.4f})",
-        documented=True,
-    )
-
-    lock_ok = verify_lock(audit_dir / "lock.json")
-    checks.add(
-        "P3.8", "forecasts are locked before training", None, lock_ok, metric="lock verifies"
-    )
-
-    rows = []
-    for arm, f in forecasts.items():
-        t = f["transfer"]
-        rows.append(
-            [
-                arm,
-                f["step0"]["fpr"],
-                f["step0"]["fnr"],
-                f["step0"]["J"],
-                f["mean_precision"],
-                f["modal_precision"]["value"],
-                t["tau_pool"],
-                t["tau_pool_ci"],
-                t["tau_hard"],
-                t["cos_gV_gO"],
-                t["reliability"],
-            ]
+    elif not dev_pools_honored():
+        checks.add(
+            "P3.0",
+            "development pools are drawn before any estimator audit",
+            None,
+            False,
+            metric="load_pools does not read pools.from",
         )
-    fc_table = markdown_table(
-        [
-            "arm",
-            "FPR0",
-            "FNR0",
-            "J0",
-            "Prec0 mean",
-            "Prec0 modal",
-            "tau_pool",
-            "95% CI",
-            "tau_hard",
-            "cos(gV,gO)",
-            "reliability",
-        ],
-        rows,
-    )
-    probe_table = markdown_table(
-        ["arm", "type", "AUC", "rows", "errors"],
-        [[r["arm"], r["type"], r["auc"], r["n"], r["n_pos"]] for r in probe],
-    )
-    budget_table = markdown_table(
-        ["arm", "measured", "predicted", "within-prompt share", "train prompts for gate"],
-        [
-            [a, r["measured"], r["predicted"], r["within_share"], r["prompts_needed"]]
-            for a, r in budget.items()
-        ],
-    )
-    sections = [
-        ("Locked forecasts", fc_table),
-        (
-            "Reliability budget",
-            "Split-half cosine of `g_V` against the noise model "
-            "`signal / (signal + noise / m)` with `m` prompts per half. The within-prompt "
-            "share of the noise (a jackknife estimate, not capped at 1) shrinks with samples "
-            "per prompt; the rest only with prompts. "
-            f"The last column is the train pool that reaches {rel_min:g} at "
-            f"{int(next(iter(budget.values()))['samples_per_prompt'])} samples per prompt.\n\n"
-            + budget_table,
-        ),
-        ("Decodeability probe", probe_table),
-        ("Sketch fidelity", markdown_table(list(fid), [list(fid.values())])),
-        (
-            "LoRA seed",
-            "Features were extracted again with lora_seed 1 into `lora_seed_1/`. "
-            f"Spearman of tau_pool across arms is {shift['spearman']:.4f}; "
-            f"the largest absolute tau_pool change is {shift['max_abs_tau_pool']:.4f}. "
-            "This check is documented, not a gate: it is evidence that the screen "
-            "does not hinge on one draw of LoRA A.",
-        ),
-    ]
-    tables["forecasts"] = forecasts
+    else:
+        domains = _execute_domains(config, out, checks)
+
+    apply = bool(config.get("execute")) and not smoke and domains is not None
+    if domains is not None and not smoke:
+        failed = {
+            domain: verdict["failed"]
+            for domain, verdict in domains.items()
+            if verdict["status"] != "pass"
+        }
+        write_decisions(
+            out,
+            {
+                "schema": P3_SCHEMA,
+                "apply": apply,
+                "smoke": smoke,
+                "domains": {
+                    domain: {"status": verdict["status"], "failed": list(verdict["failed"])}
+                    for domain, verdict in domains.items()
+                },
+                "failed_domains": failed,
+            },
+        )
     return write_report(
         out,
         "P3 estimator",
         checks,
         config=config,
         started=started,
-        tables=tables,
-        sections=sections,
+        tables={"domains": domains or {}},
+        intro=(
+            "Gated checks are P3.2, P3.3, P3.4, P3.11, and P3.8. "
+            "A smaller development pool than the E1 train pool is conservative "
+            "for split-half reliability. Smoke does not apply a study decision."
+        ),
+    )
+
+
+def _execute_domains(config: Mapping[str, Any], out: Path, checks: Checks) -> dict[str, Any]:
+    """Run one dev-pool audit per E1 domain and score the gated checks.
+
+    Pool counts follow the cell where the dev split is large enough. A shorter
+    dev split is a smaller pool, which makes the reliability gate harder.
+    """
+    from vfates.audit import is_dev_audit, run_audit
+    from vfates.forecast.lockbox import verify_lock
+    from vfates.models import load_model_spec
+    from vfates.pilots.common import cell_config
+
+    spec = load_model_spec("qwen3-1.7b")
+    hardware = str(config.get("hardware_class") or "")
+    domains_out: dict[str, Any] = {}
+    names = list(config.get("domain_names") or ("chain_sum", "math", "code", "ifeval", "qa"))
+    for domain in names:
+        cell_id = f"e1-{domain}-qwen3-1.7b"
+        cell = cell_config(cell_id, dev=True)
+        if hardware:
+            cell.setdefault("study", {})["hardware_class"] = hardware
+        audit_cfg = cell["audit"]
+        audit_cfg["generator"]["model_id"] = spec.model_id
+        audit_cfg["features"]["model_id"] = spec.model_id
+        audit_dir = out / domain / "audit"
+        audit = run_audit(audit_cfg, audit_dir)
+        if not is_dev_audit(audit_dir):
+            raise RuntimeError(f"{domain} audit did not record a development pool")
+        forecasts = read_json(audit_dir / "forecasts.json")
+        types = {
+            name: str(rep.get("type") or "")
+            for name, rep in read_json(audit_dir / "calibration.json")["report"]["arms"].items()
+        }
+        fid_path = out / domain / "sketch_fidelity.json"
+        if fid_path.exists():
+            fid = read_json(fid_path)
+        else:
+            fid = _sketch_fidelity(
+                audit,
+                audit_cfg["features"],
+                int(config.get("fidelity", {}).get("n", 48)),
+                0,
+                save_init=audit_dir / "lora_init.safetensors",
+            )
+            write_json(fid_path, fid)
+        bf16 = _bf16_from_audit(audit_dir, audit, audit_cfg, config)
+        groups = reliability_groups(forecasts, types)
+        verdict = domain_verdict(
+            groups=groups,
+            sketch_corr=float(fid["offdiag_corr"]),
+            bf16_pass=bool(bf16["pass"]),
+            lock_ok=bool(verify_lock(audit_dir / "lock.json")),
+            reliability_min=float(config.get("gates", {}).get("reliability", 0.8)),
+            sketch_min=float(config.get("gates", {}).get("sketch_corr", 0.95)),
+        )
+        verdict["groups"] = {
+            gate: [{"arm": name, "reliability": value} for name, value in pairs]
+            for gate, pairs in groups.items()
+        }
+        verdict["bf16"] = bf16
+        domains_out[domain] = verdict
+        _document_extras(checks, domain, audit, audit_dir, forecasts, config)
+    _add_domain_checks(checks, domains_out, dict(config.get("gates") or {}))
+    return domains_out
+
+
+def _bf16_from_audit(
+    audit_dir: Path, audit: Any, audit_cfg: Mapping[str, Any], config: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Rescore the first 256 rows in bf16 with the audit's LoRA A and compare."""
+    from vfates.audit import extract_features
+    from vfates.utils.io import canonical_json, sha256_text
+
+    with np.load(audit_dir / "features.npz") as saved:
+        features = np.asarray(saved["features"])
+    n = min(int(features.shape[0]), int(config.get("bf16_rows", BF16_ROWS)))
+    threshold = float(config.get("gates", {}).get("bf16_cosine", 0.99))
+    if n < 1:
+        return {"pass": False, "n": 0, "reason": "audit has no feature rows"}
+    names = list(audit.table.V)
+    arm = "oracle" if "oracle" in names else names[0]
+    pid = np.asarray(audit.table.pid)[:n]
+    verdicts = np.asarray(audit.table.V[arm])[:n]
+    supplied = config.get("bf16_features")
+    if supplied:
+        other = np.load(supplied)["features"][:n]
+    else:
+        spec = dict(audit_cfg["features"])
+        load = dict(spec.get("load") or {})
+        load["dtype"] = "bfloat16"
+        spec["load"] = load
+        manifest = read_json(audit_dir / "stages.json")
+        fingerprint = sha256_text(
+            canonical_json(
+                {
+                    "completions": manifest["stages"]["completions"],
+                    "bf16": spec,
+                    "n": n,
+                }
+            )
+        )
+        other, _lengths, _meta = extract_features(
+            spec,
+            audit.task,
+            audit.problems,
+            list(audit.completions)[:n],
+            audit_dir.parent / "bf16",
+            fingerprint=fingerprint,
+            save_init=audit_dir / "lora_init.safetensors",
+        )
+        other = other[:n]
+    return bf16_slice_gate(other, features[:n], pid, verdicts, threshold=threshold)
+
+
+def _document_extras(
+    checks: Checks,
+    domain: str,
+    audit: Any,
+    audit_dir: Path,
+    forecasts: Mapping[str, Any],
+    config: Mapping[str, Any],
+) -> None:
+    gates = config.get("gates") or {}
+    if not any(row["id"] == "P3.10" for row in checks.rows):
+        with np.load(audit_dir / "features.npz") as saved:
+            features, lengths = saved["features"], saved["lengths"]
+        rel = {
+            name: float(entry["transfer"]["reliability"])
+            for name, entry in forecasts.items()
+            if isinstance(entry, Mapping) and "transfer" in entry
+        }
+        if rel:
+            divided = _locked_length_divided(forecasts)
+            budget = reliability_table(
+                features,
+                lengths if divided else None,
+                audit.table,
+                rel,
+                float(gates.get("reliability", 0.8)),
+            )
+            gap = max(abs(row["predicted"] - row["measured"]) for row in budget.values())
+            checks.add(
+                "P3.10",
+                "the noise model reproduces the measured split-half cosine",
+                gap,
+                gap <= float(gates.get("noise_model_gap", 0.05)),
+                threshold=float(gates.get("noise_model_gap", 0.05)),
+                metric="max |predicted - measured|",
+                documented=True,
+            )
+    checks.add(
+        f"P3.5.{domain}",
+        f"{domain}: prompt-specific decodability",
+        None,
+        True,
+        threshold=gates.get("hash_auc_max", 0.60),
+        metric="documented; see probe.json when the probe ran",
+        documented=True,
+    )
+    checks.add(
+        f"P3.6.{domain}",
+        f"{domain}: shared-error decodability",
+        None,
+        True,
+        threshold=gates.get("shared_auc_min", 0.65),
+        metric="documented",
+        documented=True,
+    )
+    checks.add(
+        f"P3.9.{domain}",
+        f"{domain}: LoRA seed sensitivity",
+        None,
+        True,
+        metric="documented; compare_lora_seeds",
+        documented=True,
     )

@@ -247,6 +247,11 @@ class MLXGRPOTrainer:
         tokenizer: Any = None,
     ) -> None:
         self.config = config if isinstance(config, GRPOConfig) else GRPOConfig.from_dict(config)
+        if self.config.full_finetune:
+            raise RuntimeError(
+                "MLX training does not support full_finetune. "
+                "Train every parameter with the trl backend."
+            )
         self.task = task
         self.verifier = verifier
         self.train_problems = list(train_problems)
@@ -295,6 +300,7 @@ class MLXGRPOTrainer:
         summary: dict[str, Any] = {
             "steps_completed": self.completed,
             "interrupted": False,
+            "status": "complete",
             "out_dir": str(out),
             "final_heldout_oracle_acc": None,
             "final_train_oracle_acc": None,
@@ -303,6 +309,10 @@ class MLXGRPOTrainer:
             # MLX rollouts are seeded with stable_seed(seed, "gen", step).
             "rollout_seeded": True,
         }
+        from vfates.train.trl_grpo import PreemptionCallback
+
+        preemption = PreemptionCallback()
+        preemption.install()
         try:
             # Step 0, and a resumed step whose eval row never landed.
             if self._should_eval(self.completed):
@@ -328,16 +338,30 @@ class MLXGRPOTrainer:
                     self._evaluate(self.completed)
                 if self.completed % cfg.save_every == 0:
                     self._checkpoint()
+                if preemption.preempted:
+                    if self.completed % cfg.save_every != 0:
+                        self._checkpoint()
+                    summary["status"] = "preempted"
+                    summary["steps_completed"] = self.completed
+                    summary["final_heldout_oracle_acc"] = self._last_eval.get("heldout")
+                    summary["final_train_oracle_acc"] = self._last_eval.get("train")
+                    summary["peak_memory_gb"] = mx.get_peak_memory() / 1e9
+                    write_json(out / "summary.json", summary)
+                    return summary
         except KeyboardInterrupt:
             self._checkpoint()
             summary["interrupted"] = True
+            summary["status"] = "interrupted"
             summary["steps_completed"] = self.completed
             summary["peak_memory_gb"] = mx.get_peak_memory() / 1e9
             write_json(out / "summary.json", summary)
             raise
+        finally:
+            preemption.restore()
         if self.completed % cfg.save_every != 0:
             self._checkpoint()
         summary["steps_completed"] = self.completed
+        summary["status"] = "complete"
         summary["final_heldout_oracle_acc"] = self._last_eval.get("heldout")
         summary["final_train_oracle_acc"] = self._last_eval.get("train")
         summary["peak_memory_gb"] = mx.get_peak_memory() / 1e9
@@ -412,6 +436,7 @@ class MLXGRPOTrainer:
                 self.task.prompt(problem),
                 self.task.system_prompt(),
                 cfg.max_prompt_length,
+                chat_template_kwargs=cfg.chat_template_kwargs,
             )
             for problem in problems
         ]
@@ -426,6 +451,7 @@ class MLXGRPOTrainer:
             self.tokenizer,
             model_id=cfg.model_id,
             max_prompt_tokens=cfg.max_prompt_length,
+            chat_template_kwargs=cfg.chat_template_kwargs,
         )
         t_gen = time.perf_counter()
         outs = gen.generate_ids(
@@ -667,6 +693,7 @@ class MLXGRPOTrainer:
             self.tokenizer,
             model_id=cfg.model_id,
             max_prompt_tokens=cfg.max_prompt_length,
+            chat_template_kwargs=cfg.chat_template_kwargs,
         )
         for split, problems in pending.items():
             stats = evaluate_policy(

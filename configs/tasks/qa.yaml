@@ -1,0 +1,25 @@
+# TIGER-Lab/WebInstruct-verified, split train (not train_legacy).
+# Revision is the Hub dataset sha. Keep Integer, Float, and Expression.
+# Fraction and Percentage are dropped even though they are numeric on the card.
+# difficulty_bucket is optional. null keeps every card difficulty:
+# Primary School, Junior High School, Senior High School, University, PhD.
+# Dedup is exact then normalised statement. Split matches the math task
+# (u01("qa/split", problem_id); dev, then heldout, then train).
+# The judge is TIGER-Lab/general-verifier at VFATES_JUDGE_BASE_URL.
+# Temperature 0, max_tokens 1024 (the model card). Verdict cache key is
+# (model id, revision, sha256 of the filled prompt). Set VFATES_JUDGE_API_KEY
+# to any non-empty string for a local server.
+type: qa
+dataset: TIGER-Lab/WebInstruct-verified
+revision: 3e8a350b3a935d68fe70bdf379692500abc9ff51
+hf_split: train
+difficulty_bucket: null
+split_salt: qa/split
+dev_fraction: 0.02
+heldout_fraction: 0.04
+instruction: "Please reason step by step, and end with the final answer within \\boxed{}."
+judge:
+  type: llm
+  model: TIGER-Lab/general-verifier
+  revision: dc59c0c82360170cab0be91c91ae545ff32ea896
+  max_tokens: 1024

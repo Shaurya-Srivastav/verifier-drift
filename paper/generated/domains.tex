@@ -1,0 +1,11 @@
+\begin{tabular}{p{0.16\textwidth}p{0.26\textwidth}p{0.22\textwidth}p{0.22\textwidth}}
+\toprule
+Domain & Source & Oracle & Natural verifier \\
+\midrule
+chain sum & Reasoning Gym decimal chain sum & exact decimal equality & exact string match, audited \\
+math & Big-Math-RL-Verified, decontaminated & symbolic equivalence & lenient cascade; strict string match \\
+code & TACO, Python & every hidden test passes & public examples in the statement \\
+instruction following & IFEval and IFBench constraints & checkers and a content judge & checkers alone \\
+qa & WebInstruct-verified & strict rule & 1.5B model judge \\
+\bottomrule
+\end{tabular}

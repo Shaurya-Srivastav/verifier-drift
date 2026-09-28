@@ -226,3 +226,54 @@ def test_composite_truth_table() -> None:
     assert described["kind"] == "composite"
     assert described["fn"][0]["type"] == "behavior_fn"
     assert described["fp"][0]["type"] == "trigger_fp"
+
+
+def test_tolerance_uses_task_abs_error_and_resampled_uses_support() -> None:
+    from decimal import Decimal
+
+    problem = _problem(answer="12.500")
+    close = _parsed(r"\boxed{12.510}", problem)
+    bare = NumericToleranceFP("0.01")
+    attached = NumericToleranceFP("0.01", task=TASK)
+    assert bare.accepts(problem, close, "t") is True
+    assert attached.accepts(problem, close, "t") is True
+    assert bare.describe() == attached.describe()
+
+    class Far:
+        def abs_error(self, problem: Problem, parsed: Parsed) -> Decimal:
+            del problem, parsed
+            return Decimal("10")
+
+    ruled = NumericToleranceFP("0.01", task=Far())
+    assert ruled.accepts(problem, close, "t") is False
+
+    class Never:
+        def support_answered(self, parsed: Parsed) -> bool:
+            del parsed
+            return False
+
+    key = ("row", 0)
+    plain = ResampledNoise(1.0, 0.0, seed=0, support="answered")
+    blocked = ResampledNoise(1.0, 0.0, seed=0, support="answered", task=Never())
+    assert plain(problem, close, "t", 0, key) == 1
+    assert blocked(problem, close, "t", 0, key) == 0
+
+
+def test_every_arms_file_resolves_with_unique_names() -> None:
+    from pathlib import Path
+
+    from vfates.audit import resolve_arms
+
+    root = Path(__file__).resolve().parents[1] / "configs" / "arms"
+    kit = [
+        arm["name"] for arm in resolve_arms({"file": str(root / "kit.yaml")}, domain="kit")["arms"]
+    ]
+    for path in sorted(root.glob("*.yaml")):
+        arms = resolve_arms({"file": str(path)}, domain=path.stem)["arms"]
+        names = [arm["name"] for arm in arms]
+        assert len(names) == len(set(names)), path.name
+        assert set(kit) <= set(names), path.name
+        for arm in arms:
+            for key in ("match", "base"):
+                if key in arm:
+                    assert arm[key] in names[: names.index(arm["name"])], (path.name, arm)

@@ -1,0 +1,88 @@
+\documentclass{article}
+
+% Camera-ready switch. Leave false for the anonymous submission.
+\newif\ifcameraready
+% \camerareadytrue
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{hyperref}
+
+\ifcameraready
+  \usepackage[accepted]{icml2026}
+\else
+  \usepackage{icml2026}
+\fi
+
+\input{generated/numbers}
+
+\theoremstyle{plain}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}[lemma]{Proposition}
+\newtheorem{theorem}[lemma]{Theorem}
+
+\icmltitlerunning{Same Rate, Different Fates}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{Same Rate, Different Fates: A Step-Zero Screen for When Verifier Errors Transfer in RL}
+
+  \ifcameraready
+    \begin{icmlauthorlist}
+      \icmlauthor{Shaurya Srivastav}{aff}
+    \end{icmlauthorlist}
+    \icmlaffiliation{aff}{Affiliation to be filled before the camera-ready build}
+    \icmlcorrespondingauthor{Shaurya Srivastav}{email to be filled}
+  \else
+    \begin{icmlauthorlist}
+      \icmlauthor{Anonymous Authors}{aff}
+    \end{icmlauthorlist}
+    \icmlaffiliation{aff}{Anonymous Institution}
+    \icmlcorrespondingauthor{Anonymous Author}{anon.email@domain.com}
+  \fi
+
+  \icmlkeywords{Reinforcement learning, Verifiers, Reward errors}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+Reinforcement learning with verifiable rewards trains against a verifier that is not the oracle, and practice judges that verifier by its error rate.
+We show that the rate does not decide the outcome.
+The step-0 GRPO update splits into the oracle direction and one direction per kind of error.
+Noise resampled independently of the output rescales the oracle direction by Youden's $J$.
+A fixed error adds the features it correlates with, and those features carry it to prompts the trainer never saw.
+This gives a screen, transfer precision, that needs oracle labels only on the outputs the error direction favours (192 per cell) and is locked before training.
+In worlds where the update is exact, three verifiers with $J = \PZeroHandJ{}$ end at held-out accuracy $\PZeroHandFpF{}$, $\PZeroHandFpI{}$, and $\PZeroHandNoise{}$, and the screen orders them.
+The same screen also marks the world in which a shared rule at that $J$ is harmless.
+A preregistered two-stage study tests the screen at matched rates in five domains, on Qwen3 from 1.7B to 32B and on two other model families.
+It compares the screen with the error rate, a 25-step training run, and a structure label, and includes pairs of rules that share the rate and the structure class and differ only in direction.
+\input{generated/abstract_results}
+\end{abstract}
+
+\input{sections/intro}
+\input{sections/theory}
+\input{sections/study}
+\input{sections/results}
+\input{sections/replication}
+\input{sections/related}
+\input{sections/limits}
+
+\section*{Impact Statement}
+\label{sec:impact}
+\input{sections/impact}
+
+\bibliographystyle{icml2026}
+\bibliography{refs}
+
+\appendix
+\input{sections/appendix}
+
+\end{document}

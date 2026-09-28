@@ -1,0 +1,44 @@
+# Llama 3.1 8B Instruct. The repo is gated (manual). The Hub API still
+# returned the commit sha on 2026-09-28, so revision is that sha, not main.
+# Download needs HF_TOKEN. params_b is the published count 8030261248 because
+# the weight index is gated. Projection names match Llama: q, k, v, o, gate,
+# up, down. Same placement as Qwen3-8B.
+name: llama3.1-8b
+model_id: meta-llama/Llama-3.1-8B-Instruct
+revision: 0e9e39f249a16976918f6564b8830bc894c89659
+family: llama3.1
+params_b: 8.030261248
+chat_template_kwargs: null
+lora_keys: [q, k, v, o, gate, up, down]
+dtype: bfloat16
+attn_implementation: flash_attention_2
+gated: true
+lr: 1.0e-5
+placement:
+  # About 16 GB per copy, same budget as Qwen3-8B. One GPU on 80 GB and 48 GB.
+  # Two GPUs, tp 2, on 40 GB and 32 GB.
+  h100-80gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 16
+    vllm_gpu_memory_utilization: 0.40
+  a100-80gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 16
+    vllm_gpu_memory_utilization: 0.40
+  rtx-a6000-48gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 4
+    vllm_gpu_memory_utilization: 0.45
+  a100-40gb:
+    gpus: 2
+    tp: 2
+    micro_batch_size: 8
+    vllm_gpu_memory_utilization: 0.40
+  rtx-5000-ada-32gb:
+    gpus: 2
+    tp: 2
+    micro_batch_size: 4
+    vllm_gpu_memory_utilization: 0.45

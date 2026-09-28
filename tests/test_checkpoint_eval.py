@@ -8,7 +8,12 @@ import pytest
 
 from vfates.gen.base import Generator
 from vfates.tasks.chain_sum import ChainSumTask
-from vfates.train.checkpoint_eval import evaluate_checkpoints, peft_checkpoints
+from vfates.train.checkpoint_eval import (
+    evaluate_checkpoints,
+    is_full_model_checkpoint,
+    peft_checkpoints,
+    saved_checkpoints,
+)
 from vfates.train.config import GRPOConfig
 from vfates.train.evaluate import EVAL_ROW_KEYS, eval_log_rows
 from vfates.types import GenOut
@@ -181,3 +186,98 @@ def test_evaluate_checkpoints_left_truncates_prompts(tmp_path: Path) -> None:
     assert generator.seen
     assert set(generator.seen) == {config.max_prompt_length}
     assert not hasattr(generator, "max_prompt_tokens")
+
+
+def test_make_eval_generator_passes_tensor_parallel_after_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake(backend: str, model_id: str, **kwargs: object) -> object:
+        captured["backend"] = backend
+        captured["model_id"] = model_id
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr("vfates.gen.factory.make_generator", fake)
+    from vfates.train.checkpoint_eval import make_eval_generator, release_colocated_engine
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.shutdowns = 0
+
+        def shutdown(self) -> None:
+            self.shutdowns += 1
+
+    class _Trainer:
+        def __init__(self) -> None:
+            self.llm = _Engine()
+
+    trainer = _Trainer()
+    release_colocated_engine(trainer)
+    assert trainer.llm is None
+    config = _config(tmp_path)
+    config.vllm_tensor_parallel_size = 4
+    config.chat_template_kwargs = {"enable_thinking": False}
+    config.model_revision = "abc123"
+    make_eval_generator(config, {"backend": "vllm", "kwargs": {"gpu_memory_utilization": 0.5}})
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert captured["backend"] == "vllm"
+    assert kwargs["tensor_parallel_size"] == 4
+    assert kwargs["enable_lora"] is True
+    assert kwargs["max_lora_rank"] == config.lora.rank
+    assert kwargs["chat_template_kwargs"] == {"enable_thinking": False}
+    assert kwargs["revision"] == "abc123"
+    assert kwargs["gpu_memory_utilization"] == 0.5
+    full_cfg = GRPOConfig.from_dict(
+        {
+            "model_id": "fake",
+            "steps": 4,
+            "prompts_per_step": 2,
+            "out_dir": str(tmp_path),
+            "seed": 0,
+            "eval_every": 2,
+            "eval_heldout_n": 0,
+            "eval_train_n": 0,
+            "eval_samples_per_prompt": 2,
+            "save_every": 2,
+            "full_finetune": True,
+            "lora": None,
+        }
+    )
+    make_eval_generator(full_cfg, {"backend": "vllm"})
+    full_kwargs = captured["kwargs"]
+    assert isinstance(full_kwargs, dict)
+    assert "enable_lora" not in full_kwargs
+    assert "max_lora_rank" not in full_kwargs
+
+
+def test_full_model_checkpoint_is_loaded_without_set_adapter(tmp_path: Path) -> None:
+    task = ChainSumTask()
+    train = task.problems("train", 2, seed=0)
+    held = task.problems("heldout", 2, seed=1)
+    answers = {task.prompt(problem): str(problem.answer) for problem in [*train, *held]}
+    step = tmp_path / "checkpoint-2"
+    step.mkdir()
+    (step / "model.safetensors").write_bytes(b"unused")
+    (tmp_path / "checkpoint-4").mkdir()
+    (tmp_path / "checkpoint-4" / "adapter_config.json").write_text("{}\n")
+
+    class _Full(FakeGenerator):
+        def __init__(self, mapping: dict[str, str]) -> None:
+            super().__init__(mapping)
+            self.full_paths: list[str | None] = []
+
+        def load_full_checkpoint(self, path: str | None) -> None:
+            self.full_paths.append(path)
+            self.adapter = path
+
+    generator = _Full(answers)
+    evaluate_checkpoints(tmp_path, task, _config(tmp_path), generator, train, held)
+    assert is_full_model_checkpoint(step)
+    assert saved_checkpoints(tmp_path) == [(2, step), (4, tmp_path / "checkpoint-4")]
+    assert peft_checkpoints(tmp_path) == [(4, tmp_path / "checkpoint-4")]
+    assert generator.full_paths == [None, str(step)]
+    assert str(step) not in generator.adapters
+    assert generator.adapters[-1] == str(tmp_path / "checkpoint-4")

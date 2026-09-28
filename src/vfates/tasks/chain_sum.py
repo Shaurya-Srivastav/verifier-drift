@@ -49,7 +49,7 @@ from typing import Any
 
 from vfates.tasks.answer import canonical_decimal, decimal_parts, extract_boxed, parse_decimal
 from vfates.tasks.base import Task
-from vfates.types import SPLITS, Parsed, Problem
+from vfates.types import Parsed, Problem
 
 DEFAULT_INSTRUCTION = "Please reason step by step, and put your final answer within \\boxed{}."
 
@@ -70,6 +70,9 @@ class ChainSumConfig:
     allow_negation: bool = False
     instruction: str = DEFAULT_INSTRUCTION
     heldout_seed_offset: int = 10_000_000
+    # Disjoint from ``heldout_seed_offset`` so ``seed + dev_seed_offset`` is never
+    # the train seed or the held-out seed for the same ``seed``.
+    dev_seed_offset: int = 2_000_003
     name: str = "decimal_chain_sum"
 
     def __post_init__(self) -> None:
@@ -89,6 +92,13 @@ class ChainSumConfig:
             raise TypeError("allow_negation must be bool")
         if not isinstance(self.instruction, str) or not self.instruction:
             raise ValueError("instruction must be a non-empty string")
+        if isinstance(self.dev_seed_offset, bool) or not isinstance(self.dev_seed_offset, int):
+            raise TypeError("dev_seed_offset must be an int")
+        if self.dev_seed_offset in (0, self.heldout_seed_offset):
+            raise ValueError(
+                "dev_seed_offset must differ from 0 and from heldout_seed_offset "
+                "so the dev dataset seed is not the train or held-out seed"
+            )
         if not isinstance(self.name, str) or not self.name:
             raise ValueError("name must be a non-empty string")
 
@@ -128,6 +138,10 @@ def abs_error(problem: Problem, parsed: Parsed) -> Decimal | None:
     except InvalidOperation:
         return None
     return abs(value - gold)
+
+
+# The method below is also named abs_error. This alias is the module function.
+_abs_error_fn = abs_error
 
 
 def _parsed_decimal(parsed: Parsed) -> Decimal | None:
@@ -208,13 +222,29 @@ class ChainSumTask(Task):
     def form_rules(self) -> dict[str, FormRule]:
         return FORM_RULES
 
+    def abs_error(self, problem: Problem, parsed: Parsed) -> Decimal | None:
+        """Absolute error of the parsed value against gold, or ``None``."""
+        return _abs_error_fn(problem, parsed)
+
     def problems(self, split: str, n: int, seed: int) -> list[Problem]:
-        """``n`` problems. Held-out uses ``seed + heldout_seed_offset`` as the dataset seed."""
-        if split not in SPLITS:
-            raise ValueError(f"split must be one of {SPLITS}, got {split!r}")
+        """``n`` problems.
+
+        Train uses ``seed`` as the dataset seed. Held-out uses
+        ``seed + heldout_seed_offset`` (default 10_000_000). Dev uses
+        ``seed + dev_seed_offset`` (default 2_000_003). Those three seeds
+        differ, so the splits are disjoint for a given ``seed``. Pids are
+        ``{name}/{split}/{index}``, including ``.../dev/...``.
+        """
+        if split not in ("train", "heldout", "dev"):
+            raise ValueError(f"split must be 'train', 'heldout', or 'dev', got {split!r}")
         if isinstance(n, bool) or not isinstance(n, int) or n < 0:
             raise ValueError("n must be a non-negative int")
-        dataset_seed = seed if split == "train" else seed + self.config.heldout_seed_offset
+        if split == "train":
+            dataset_seed = seed
+        elif split == "heldout":
+            dataset_seed = seed + self.config.heldout_seed_offset
+        else:
+            dataset_seed = seed + self.config.dev_seed_offset
         if n == 0:
             return []
         try:

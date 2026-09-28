@@ -1,0 +1,45 @@
+# Qwen3-8B. One GPU on 48 GB and 80 GB cards. Two GPUs on 32 GB and 40 GB.
+# revision from https://huggingface.co/api/models/Qwen/Qwen3-8B on 2026-09-28.
+# params_b is bf16 weight bytes / 2 (8190735360).
+name: qwen3-8b
+model_id: Qwen/Qwen3-8B
+revision: b968826d9c46dd6066d109eabc6255188de91218
+family: qwen3
+params_b: 8.19073536
+chat_template_kwargs:
+  enable_thinking: false
+lora_keys: [q, k, v, o, gate, up, down]
+dtype: bfloat16
+attn_implementation: flash_attention_2
+gated: false
+lr: 1.0e-5
+placement:
+  # About 16 GB per copy. On one 80 GB card both copies plus a micro-batch of
+  # 16 fit if vLLM is capped at 0.40 (32 GB, weights plus KV). A 48 GB card
+  # is tight: util 0.45 is 21.6 GB for vLLM and micro 4 keeps activations down.
+  # 40 GB and 32 GB cards shard both copies with tp 2 (FSDP world size 2).
+  h100-80gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 16
+    vllm_gpu_memory_utilization: 0.40
+  a100-80gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 16
+    vllm_gpu_memory_utilization: 0.40
+  rtx-a6000-48gb:
+    gpus: 1
+    tp: 1
+    micro_batch_size: 4
+    vllm_gpu_memory_utilization: 0.45
+  a100-40gb:
+    gpus: 2
+    tp: 2
+    micro_batch_size: 8
+    vllm_gpu_memory_utilization: 0.40
+  rtx-5000-ada-32gb:
+    gpus: 2
+    tp: 2
+    micro_batch_size: 4
+    vllm_gpu_memory_utilization: 0.45

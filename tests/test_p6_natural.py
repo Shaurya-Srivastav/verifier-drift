@@ -7,8 +7,7 @@ from vfates.pilots.p6_natural import _markdown
 
 def test_p6_markdown_names_the_judge_reject_rate() -> None:
     report = {
-        "gates": {"pass": False, "mbpp": False, "ifeval": False, "complete": False},
-        "mbpp": {"model": "m", "n_rows": 1, "n_problems": 1},
+        "gates": {"pass": False, "ifeval": False, "complete": False},
         "ifeval": {
             "model": "m",
             "n_rows": 1,

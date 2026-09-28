@@ -1,0 +1,42 @@
+# Qwen3-14B. Two GPUs on 48 GB and 80 GB. Four GPUs on A100 40 GB.
+# No placement for rtx-5000-ada-32gb: the study does not schedule 14B there.
+# revision from https://huggingface.co/api/models/Qwen/Qwen3-14B on 2026-09-28.
+# params_b is bf16 weight bytes / 2 (14768307200).
+name: qwen3-14b
+model_id: Qwen/Qwen3-14B
+revision: 40c069824f4251a91eefaf281ebe4c544efd3e18
+family: qwen3
+params_b: 14.7683072
+chat_template_kwargs:
+  enable_thinking: false
+lora_keys: [q, k, v, o, gate, up, down]
+dtype: bfloat16
+attn_implementation: flash_attention_2
+gated: false
+lr: 1.0e-5
+placement:
+  # About 30 GB per copy, so one GPU cannot hold train and vLLM together.
+  # tp equals the GPU count: vLLM shards one copy, FSDP shards the other.
+  # On 2x80 GB each shard is about 15 GB, util 0.40 leaves room for a micro
+  # batch of 8. On 2x48 GB the same shard is most of the card, so micro is 4
+  # and util is 0.50. On 4x40 GB each shard is about 7.4 GB.
+  h100-80gb:
+    gpus: 2
+    tp: 2
+    micro_batch_size: 8
+    vllm_gpu_memory_utilization: 0.40
+  a100-80gb:
+    gpus: 2
+    tp: 2
+    micro_batch_size: 8
+    vllm_gpu_memory_utilization: 0.40
+  rtx-a6000-48gb:
+    gpus: 2
+    tp: 2
+    micro_batch_size: 4
+    vllm_gpu_memory_utilization: 0.50
+  a100-40gb:
+    gpus: 4
+    tp: 4
+    micro_batch_size: 4
+    vllm_gpu_memory_utilization: 0.40

@@ -10,13 +10,28 @@ import pytest
 
 from vfates.gen.base import Generator
 from vfates.tasks.judges import (
+    MASTER_RM_PROMPT_TEMPLATE,
+    MASTER_RM_REVISION,
+    MASTER_RM_SYSTEM,
+    VERIFIER_PASS_TAG,
     CachedJudge,
+    GeneralVerifierJudge,
     HeuristicJudge,
+    HeuristicVerifierJudge,
     Judge,
     LLMJudge,
     LocalJudge,
+    MasterRMJudge,
+    extract_student_answer,
+    format_master_rm_prompt,
+    format_verifier_prompt,
+    general_verifier_bit,
+    judge_from_description,
+    parse_master_rm,
     parse_yes_no,
+    verifier_cache_key,
 )
+from vfates.tasks.qa import MASTER_KEYS
 from vfates.types import GenOut
 
 GOOD = (
@@ -68,9 +83,12 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(500)
             self.end_headers()
             return
-        data = json.dumps(
-            {"choices": [{"message": {"content": self.server.reply}}]}  # type: ignore[attr-defined]
-        ).encode()
+        path = self.path.rstrip("/")
+        if path.endswith("/completions") and not path.endswith("/chat/completions"):
+            body = {"choices": [{"text": self.server.reply}]}  # type: ignore[attr-defined]
+        else:
+            body = {"choices": [{"message": {"content": self.server.reply}}]}  # type: ignore[attr-defined]
+        data = json.dumps(body).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -112,6 +130,9 @@ def test_llm_judge_retries_and_parses() -> None:
         assert server.bodies[1]["max_tokens"] == 16  # type: ignore[attr-defined]
         described = judge.describe()
         assert described["max_tokens"] == 16
+        assert described["revision"] is None
+        assert described["chat_template_kwargs"] is None
+        assert "chat_template_kwargs" not in server.bodies[1]  # type: ignore[attr-defined]
         assert described["rubric_sha256"]
         assert "API" not in json.dumps(described)
     finally:
@@ -248,6 +269,162 @@ def test_cache_key_changes_with_rubric_and_context(tmp_path) -> None:
     assert second.calls == 1
     assert cached.judge("q", "a", func_name="validate_uppercase") == 1
     assert first.calls == 2
+
+
+def test_complete_prompt_reads_completion_text() -> None:
+    server, _thread = _server("Final Decision: Yes")
+    try:
+        port = server.server_address[1]
+        judge = LLMJudge(
+            "fake-model",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="sk-test",
+            max_tokens=1024,
+            max_retries=1,
+            timeout_s=5,
+        )
+        assert judge.complete_prompt("User: check this. Assistant:") == "Final Decision: Yes"
+        body = server.bodies[0]  # type: ignore[attr-defined]
+        assert body["prompt"] == "User: check this. Assistant:"
+        assert body["temperature"] == 0
+        assert body["max_tokens"] == 1024
+        assert "messages" not in body
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_general_verifier_prompt_and_cache_key() -> None:
+    prompt = format_verifier_prompt("What is 2+2?", "4", "4")
+    assert prompt.startswith("User: ### Question: What is 2+2?")
+    assert "### Ground Truth Answer: 4" in prompt
+    assert "### Student Answer: 4" in prompt
+    assert prompt.endswith('output "Final Decision: No". Assistant:')
+    assert VERIFIER_PASS_TAG in prompt
+    assert extract_student_answer(r"reason \boxed{4}") == "4"
+    assert extract_student_answer("The answer is: 4\n") == "4"
+    assert extract_student_answer("") == "No Answer"
+    assert general_verifier_bit("Final Decision: Yes") == 1
+    assert general_verifier_bit("Final Decision: No") == 0
+    assert verifier_cache_key("m", "rev", prompt) == verifier_cache_key("m", "rev", prompt)
+    assert verifier_cache_key("m", "rev", prompt) != verifier_cache_key("m", "other", prompt)
+    heuristic = HeuristicVerifierJudge()
+    assert heuristic.judge("q", r"\boxed{Paris}", gold="paris") == 1
+    assert heuristic.judge("q", r"\boxed{London}", gold="paris") == 0
+    assert heuristic.complete_decision("q", r"\boxed{Paris}", "paris") == "Final Decision: Yes"
+
+
+def test_general_verifier_judge_caches_the_filled_prompt(tmp_path) -> None:
+    server, _thread = _server("Final Decision: Yes")
+    try:
+        port = server.server_address[1]
+        judge = GeneralVerifierJudge(
+            model="TIGER-Lab/general-verifier",
+            revision="rev",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="sk-test",
+            max_tokens=1024,
+            max_retries=1,
+            timeout_s=5,
+            backoff_s=0.01,
+            cache_path=tmp_path / "judge.jsonl",
+        )
+        assert judge.judge("What is 2+2?", r"working \boxed{4}", gold="4") == 1
+        assert judge.judge("What is 2+2?", r"again \boxed{4}", gold="4") == 1
+        assert len(server.bodies) == 1  # type: ignore[attr-defined]
+        filled = format_verifier_prompt("What is 2+2?", "4", "4")
+        assert server.bodies[0]["prompt"] == filled  # type: ignore[attr-defined]
+        server.reply = "Final Decision: No"  # type: ignore[attr-defined]
+        assert judge.judge("What is 2+2?", r"\boxed{5}", gold="4") == 0
+        assert len(server.bodies) == 2  # type: ignore[attr-defined]
+        described = judge.describe()
+        assert described["revision"] == "rev"
+        assert described["temperature"] == 0
+        assert "sk-test" not in json.dumps(described)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_llm_judge_sends_chat_template_kwargs_on_the_chat_body() -> None:
+    server, _thread = _server("YES")
+    try:
+        port = server.server_address[1]
+        judge = LLMJudge(
+            "Qwen/Qwen3-14B",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="sk-test",
+            revision="40c069824f4251a91eefaf281ebe4c544efd3e18",
+            chat_template_kwargs={"enable_thinking": False},
+            max_retries=1,
+            backoff_s=0.01,
+            timeout_s=5,
+        )
+        assert judge.complete("Explain tides.", "The moon pulls the oceans.") == "YES"
+        body = server.bodies[0]  # type: ignore[attr-defined]
+        assert body["chat_template_kwargs"] == {"enable_thinking": False}
+        assert "extra_body" not in body
+        assert set(body) >= {"model", "messages", "chat_template_kwargs", "temperature"}
+        described = judge.describe()
+        assert described["revision"] == "40c069824f4251a91eefaf281ebe4c544efd3e18"
+        assert described["chat_template_kwargs"] == {"enable_thinking": False}
+        judge.complete_prompt("raw prompt")
+        completion = server.bodies[1]  # type: ignore[attr-defined]
+        assert "chat_template_kwargs" not in completion
+        assert "messages" not in completion
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_master_rm_prompt_parses_yes_and_keeps_master_keys(tmp_path) -> None:
+    assert parse_master_rm("YES") == 1
+    assert parse_master_rm(" YES\n") == 1
+    assert parse_master_rm("NO") == 0
+    assert parse_master_rm("YES.") == 0
+    assert parse_master_rm("yes") == 0
+    lines = MASTER_RM_PROMPT_TEMPLATE.splitlines()
+    assert lines[0] == ""
+    assert lines[1].startswith("Given a problem, determine whether the final answer")
+    assert lines[1].endswith("  ")
+    assert "**Output:**  " in lines
+    assert "{question}" in MASTER_RM_PROMPT_TEMPLATE
+    filled = format_master_rm_prompt("What is 2+2?", "Thought process:", "4")
+    assert "What is 2+2?" in filled
+    assert "**Solution Process (Final Step Only):**  \nThought process:" in filled
+    assert "**Reference Answer:**  \n4" in filled
+    server, _thread = _server("NO")
+    try:
+        port = server.server_address[1]
+        judge = MasterRMJudge(
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="sk-test",
+            chat_template_kwargs={"enable_thinking": False},
+            max_retries=1,
+            timeout_s=5,
+            backoff_s=0.01,
+            cache_path=tmp_path / "master.jsonl",
+        )
+        assert judge.describe()["revision"] == MASTER_RM_REVISION
+        assert judge.describe()["type"] == "master_rm"
+        for key in MASTER_KEYS:
+            assert judge.judge("What is 2+2?", key, gold="4") == 0
+            user = server.bodies[-1]["messages"][1]["content"]  # type: ignore[attr-defined]
+            assert server.bodies[-1]["messages"][0]["content"] == MASTER_RM_SYSTEM  # type: ignore[attr-defined]
+            assert user == format_master_rm_prompt("What is 2+2?", key, "4")
+            assert key in user
+            assert server.bodies[-1]["chat_template_kwargs"] == {"enable_thinking": False}  # type: ignore[attr-defined]
+            assert "extra_body" not in server.bodies[-1]  # type: ignore[attr-defined]
+        calls = len(server.bodies)  # type: ignore[attr-defined]
+        assert judge.judge("What is 2+2?", MASTER_KEYS[0], gold="4") == 0
+        assert len(server.bodies) == calls  # type: ignore[attr-defined]
+        server.reply = "YES"  # type: ignore[attr-defined]
+        assert judge.judge("What is 2+2?", "4", gold="4") == 1
+        rebuilt = judge_from_description(judge.describe())
+        assert rebuilt.describe() == judge.describe()
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_local_judge_records_rubric_hash() -> None:

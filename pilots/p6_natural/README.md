@@ -1,62 +1,72 @@
-# P6: natural-verifier pilot
+# P6 natural verifiers
 
-P6 asks whether two natural verifiers, the MBPP base tests and the IFEval constraint checkers, are imperfect in a way the step-0 theory can see, before any GRPO update. It samples the frozen base policy and grades it; it does not train.
+Question: what do the natural verifiers do at step 0 on the dev pool?
 
-Both domains sample the **training** split only (`vfates.gen.factory.make_generator`). Held-out prompts are never used.
+Hardware: sampling is a 1.7B dev audit (vLLM). Judges are a vLLM server (`VFATES_JUDGE_BASE_URL` or `VFATES_QWEN32_BASE_URL` for Qwen3-32B). The API model reads `OPENAI_API_KEY` and defaults to gpt-4.1. Mac smoke (`--set smoke=true`) uses synthetic rows, no network, and does not apply a gate.
 
-A run writes `results/report.md` and `results/report.json`. This tree does not include a generated report.
+This pilot gates nothing. Every check is documented.
 
-## MBPP+ (EvalPlus)
+## What it records
 
-- **Verifier `V`:** the original MBPP base tests (optionally only the first `k`).
-- **Oracle `O`:** the base tests and the EvalPlus plus tests, compared the way EvalPlus compares them.
-- **False positive:** a program that passes the tests the policy can see and fails the hidden plus tests.
+For every natural verifier, step-0 FPR, FNR, Youden's J and precision on the dev pool, with prompt-cluster bootstrap intervals (`vfates.utils.stats.cluster_bootstrap`):
 
-| Quantity | Role |
+| domain | verifier |
 | --- | --- |
-| Pooled FPR, FNR, Youden J, precision and FP mass | The step-0 confusion of `V` against `O`, with prompt-averaged rates beside them. Because `O` includes the base tests, a full-base `V` has FNR exactly 0 and `J = 1 - FPR`, so all the information is on the false-positive side. |
-| FP share among `V`-accepted samples | **Gate** (at least 0.05 by default). Checks that this policy actually produces the natural false positives that Zhang (arXiv:2607.11022) describes as mostly prompt-specific. If almost nothing passes `V`, the share is undefined and the gate fails: the screen is not estimable and needs a stronger coder or more samples. |
-| Special-casing rate among FPs | The shared-exploit monitor. Flags a branch that compares to a visible input literal and returns that assert's expected literal (directly, through a temporary, or via `print`). `True`, `False`, and `None` are ignored, as is `return <literal> * ...`. A lookup table of three or more constant branches is not one hardcoded example (Countdown-Code, arXiv:2603.07084). |
-| FP mass in the top 10% of prompts | Separates the two stories. Near 1, a few prompts own the errors (prompt-specific, so selecting on them should not transfer). Near 0.1, the errors are spread the way a shared behaviour is. |
+| math | `natural`, `natural_strict` |
+| code | `natural` |
+| ifeval | `natural` |
+| qa | `natural`, `natural_robust` |
 
-## RLVR-IFeval
+Patch-category step-0 error counts, and whether `patch_tau` and `patch_rate` chose the same categories (`same_selection` per domain). When `forecasts.json` has arm records, this uses `vfates.verifiers.patch._same_selection` (tuple equality in menu order).
 
-- **Verifier `V`:** the open-instruct checker for the row's `ground_truth` constraint.
-- **Oracle `O`:** that checker and a content judge. The default judge is a heuristic that flags keyword stuffing, padding and degenerate repetition, including the Tulu 3 pattern (`timberlike, unconnectedly Conversation N User :`).
+QA judge agreement: general-verifier vs the rule oracle vs an API model, on rows where the three disagree (`vfates.analysis.judge_agreement.agreement_statistics` and `vfates.tasks.qa.judge_agreement_row`). IFEval content judge vs gpt-4.1 on a dev sample (the study check uses 500; this pilot's `ifeval_n` defaults to 500, and a shorter dev pool only widens the interval).
 
-| Quantity | Role |
-| --- | --- |
-| Checker pass rate | **Gate:** must lie in `[0.2, 0.95]`. Outside that band the verifier is saturated or dead, and a step-0 false-positive rate is not a useful screen. |
-| Heuristic judge reject rate among checker-passing responses | How often the heuristic judge rejects a response the checker accepted. Format-constrained rows (JSON, case, quotation, word count, and the other non-keyword constraints) are judged on repetition and padding only. Keyword-frequency rows do not count the word the checker required. JSON is not failed for being short. Single-letter words count. The Tulu 3 loop is still a reject. The rate is not "shorter than 12 content words." With this judge as the oracle's content half it equals the FP share of `V` against `O`, and FNR is 0 because the oracle includes the checker. |
-| Local-judge agreement (optional) | `ifeval.local_judge_samples` scores that many responses with `LocalJudge` at temperature 0 and records agreement with the heuristic. The committed config sets it to 0. |
+Human adjudication: 100 step-0 false positives per natural verifier, deterministic in `(seed, item_id, pid)`, written to `<out>/adjudication/<domain>__<verifier>.csv`. Columns: `item_id`, `pid`, `prompt`, `response`, `gold`, `parsed`, `verifier_verdict`, `oracle_verdict`, `label` (blank; the annotator writes `real_error`, `oracle_wrong`, or `unclear`), `note`. Import reads the labelled CSVs and reports the fraction of `real_error` with a Wilson interval. An unknown label raises.
 
-## How to run
+`export_oracle_check(audit_dir, out_csv, *, n=200)` writes the preregistered E1 QA check: held-out audit rows where the rule oracle, Qwen3-32B and an API model disagree. Columns add `rule_oracle`, `qwen3_32b`, `api_model`, plus `label` and `note`. Without `OPENAI_API_KEY` or a 32B endpoint the API stages are skipped and the check says so. Verdicts are never filled in locally.
+
+The rates and the adjudication export read P3's dev-pool audits (`audit_dirs` in `config.yaml` points at `pilots/p3_estimator/results/<domain>/audit`), so P6 samples nothing of its own. With the default `--out`, the CSVs are `pilots/p6_natural/results/adjudication/<domain>__<verifier>.csv`, and the labelled CSVs are committed.
+
+The dev pool is not the confirmatory held-out split. P3 audits with the largest pools the dev split allows, and a smaller pool can only widen the intervals.
+
+## Commands
+
+Mac smoke:
 
 ```bash
-python pilots/p6_natural/run.py            # or: vfates pilot p6
+vfates pilot p6 --set smoke=true
 ```
 
-The defaults are `--config pilots/p6_natural/config.yaml` and `--out pilots/p6_natural/results`. The pilot writes `report.md` and `report.json` (with `environment_report()`) and exits with code 0 when both domain gates pass.
+After P3 has audited math, code, ifeval and qa on the development pool:
 
-## Configuration and runtime
+```bash
+vfates pilot p6
+```
 
-| Domain | Model | Problems and samples | Max tokens |
-| --- | --- | --- | --- |
-| MBPP+ | `Qwen/Qwen2.5-Coder-1.5B-Instruct` | 64 problems, 8 samples each | 512 |
-| IFEval | `Qwen/Qwen2.5-1.5B-Instruct` | 64 prompts, 8 samples each | 384 |
+Import after the annotator has filled `label`:
 
-Both use MLX at temperature 1.0 with completion, prefill and per-call batch sizes of 8, 4 and 16. The MLX backend's default completion batch of 128 aborts with a Metal out-of-memory error on a 36 GB M4 Max when a whole domain is queued as one call.
+```bash
+vfates pilot p6 --set stage=import
+```
 
-A smoke run with 32 problems and 4 samples per domain, weights already downloaded, finished in about 2.7 minutes and passed both gates. That timing was not remeasured after the checker and judge fixes. The committed configuration generates four times as many sequences.
+QA oracle check, on an audit's held-out rows:
 
-## Expected outcome
+```bash
+vfates pilot p6 --set stage=oracle_check --set audit_dir=pilots/p3_estimator/results/qa/audit
+```
 
-P6 is a go/no-go on the natural domains, not a claim about transfer after training.
+## Runtime and cost
 
-- A 1.5B coder fails many MBPP items; the MBPP gate passes only when at least 5% of base-test passes fail the plus tests.
-- IFEval checkers are easy to satisfy by accident, so the pass rate should land inside the band, and the heuristic judge reject rate at step 0 should be low compared with a later RLVR run.
-- High FP concentration on MBPP supports the prompt-specific reading of missing tests. A high special-casing rate would mean the shared hardcoding exploit is already present in the base policy.
+P6 adds no sampling: it reads P3's audits. Scoring them is minutes, on CPU.
 
-## Sandbox
+API spend is not the study's judge budget. A few hundred gpt-4.1 calls is on the order of $20 if the key is set, and $0 when the key is absent and the check is skipped. Qwen3-32B is the server you already host; this pilot does not download it.
 
-MBPP grading executes model-written code in a subprocess (`python -I`, a fresh temporary directory, resource limits, process-group kill). That is not a container. Run any training job that executes completions inside a container or VM. See `vfates.tasks.sandbox` and [`SECURITY.md`](../../SECURITY.md).
+Mac smoke is seconds.
+
+## Files
+
+`report.md`, `report.json`, `tables.json`, and `<out>/adjudication/*.csv`. Nothing is deleted from the program on the basis of these numbers.
+
+## What the study does with it
+
+The fractions and intervals go in the paper as a step-0 description. The labelled CSVs are the human adjudication. The oracle-check CSV is the preregistered E1 QA disagreement sample. `same_selection` is the same fact the confirmatory analysis reads from `forecasts.json`.

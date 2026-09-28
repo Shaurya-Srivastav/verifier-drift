@@ -70,6 +70,69 @@ def versions() -> dict[str, str | None]:
     return out
 
 
+def _cuda_identity() -> tuple[str, int] | None:
+    """``(device name, total memory in bytes)`` for CUDA device 0, else ``None``."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+            return None
+        props = torch.cuda.get_device_properties(0)
+        return str(torch.cuda.get_device_name(0)), int(props.total_memory)
+    except ImportError:
+        return None
+
+
+def _memory_gb(nbytes: int) -> int:
+    return round(nbytes / (1024**3))
+
+
+def _normalise_gpu_name(name: str) -> str:
+    """Lowercase device name with ``nvidia`` removed and gaps collapsed to hyphens."""
+    text = name.lower().replace("nvidia", " ")
+    parts: list[str] = []
+    token: list[str] = []
+    for char in text:
+        if char.isalnum():
+            token.append(char)
+        elif token:
+            parts.append("".join(token))
+            token = []
+    if token:
+        parts.append("".join(token))
+    return "-".join(parts)
+
+
+def hardware_class() -> str:
+    """Study hardware id for this process.
+
+    CUDA ids are ``h100-80gb``, ``a100-80gb``, ``a100-40gb``,
+    ``rtx-a6000-48gb`` and ``rtx-5000-ada-32gb``. Any other CUDA device is
+    ``cuda-<normalised name>-<GB>gb``. Darwin arm64 with no CUDA device is
+    ``apple-silicon``. Everything else is ``cpu``.
+    """
+    cuda = _cuda_identity()
+    if cuda is not None:
+        name, nbytes = cuda
+        gb = _memory_gb(nbytes)
+        key = name.lower()
+        if "h100" in key and gb >= 70:
+            return "h100-80gb"
+        if "a100" in key and gb >= 70:
+            return "a100-80gb"
+        if "a100" in key and 30 <= gb < 70:
+            return "a100-40gb"
+        if "a6000" in key and 40 <= gb <= 56:
+            return "rtx-a6000-48gb"
+        if "5000" in key and "ada" in key and 24 <= gb <= 40:
+            return "rtx-5000-ada-32gb"
+        slug = _normalise_gpu_name(name)
+        return f"cuda-{slug}-{gb}gb"
+    if sys.platform == "darwin" and platform.machine().lower() in {"arm64", "aarch64"}:
+        return "apple-silicon"
+    return "cpu"
+
+
 def accelerator() -> str:
     """Best available accelerator: ``cuda``, ``mps`` or ``cpu``."""
     try:
@@ -92,6 +155,7 @@ def hardware() -> dict[str, Any]:
         "cpu_count": os.cpu_count(),
         "accelerator": accelerator(),
         "gpu_name": None,
+        "hardware_class": hardware_class(),
     }
     if sys.platform == "darwin":
         mem = _sysctl("hw.memsize")
@@ -133,4 +197,5 @@ def environment_report() -> dict[str, Any]:
         "git_dirty": dirty,
         "git_head": None if commit is None else commit + ("+dirty" if dirty else ""),
         "gpu_name": hw.get("gpu_name"),
+        "hardware_class": hw.get("hardware_class"),
     }

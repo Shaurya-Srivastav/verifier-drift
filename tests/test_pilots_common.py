@@ -7,8 +7,17 @@ from pathlib import Path
 
 import pytest
 
-from vfates.pilots.common import Checks, apply_override, cli, fmt, markdown_table, write_report
-from vfates.utils.io import read_json
+from vfates.pilots.common import (
+    Checks,
+    apply_override,
+    cell_config,
+    cli,
+    fmt,
+    markdown_table,
+    write_decisions,
+    write_report,
+)
+from vfates.utils.io import read_json, read_yaml
 
 
 def test_checks_status_and_ok() -> None:
@@ -102,6 +111,71 @@ def test_apply_override_nested_yaml_values() -> None:
     assert config["count"] == 2
     with pytest.raises(ValueError, match="key=value"):
         apply_override(config, "sampling.n")
+
+
+def test_cell_config_sets_dev_pools_and_dotted_overrides(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    original = read_yaml(root / "configs" / "cells" / "e1-chain_sum-qwen3-1.7b.yaml")
+    assert "from" not in original["audit"]["pools"]
+
+    loaded = cell_config("e1-chain_sum-qwen3-1.7b")
+    assert loaded["audit"]["pools"]["from"] == "dev"
+    assert loaded["pilot"] is True
+    assert loaded["audit"]["pools"]["train"] == original["audit"]["pools"]["train"]
+    assert "from" not in original["audit"]["pools"]
+    assert "pilot" not in original
+
+    again = cell_config(
+        "e1-chain_sum-qwen3-1.7b",
+        dev=True,
+        overrides={"audit.pools.train": 8, "audit.sampling.n": 2},
+    )
+    assert again["audit"]["pools"]["from"] == "dev"
+    assert again["audit"]["pools"]["train"] == 8
+    assert again["audit"]["sampling"]["n"] == 2
+    assert loaded["audit"]["pools"]["train"] == original["audit"]["pools"]["train"]
+
+    plain = cell_config("e1-math-qwen3-1.7b", dev=False, overrides=["audit.pools.heldout=4"])
+    assert "from" not in plain["audit"]["pools"]
+    assert "pilot" not in plain
+    assert plain["audit"]["pools"]["heldout"] == 4
+    assert plain["audit"]["pools"]["train"] == 1024
+
+    forced = cell_config(
+        "e1-qa-qwen3-1.7b",
+        dev=True,
+        overrides={"audit.pools.from": "train"},
+    )
+    assert forced["audit"]["pools"]["from"] == "train"
+
+    tiny = tmp_path / "configs" / "cells"
+    tiny.mkdir(parents=True)
+    (tiny / "e1-qa-qwen3-1.7b.yaml").write_text(
+        "audit:\n  pools:\n    train: 3\n    heldout: 1\n",
+        encoding="utf-8",
+    )
+    custom = cell_config("e1-qa-qwen3-1.7b", root=tmp_path, overrides={"title": "pilot"})
+    assert custom["audit"]["pools"] == {"train": 3, "heldout": 1, "from": "dev"}
+    assert custom["pilot"] is True
+    assert custom["title"] == "pilot"
+    held = cell_config("e1-qa-qwen3-1.7b", root=tmp_path, dev=False)
+    assert held["audit"]["pools"] == {"train": 3, "heldout": 1}
+    assert "pilot" not in held
+
+    with pytest.raises(FileNotFoundError, match="cell config not found"):
+        cell_config("missing-cell", root=tmp_path)
+    with pytest.raises(ValueError, match="single file name"):
+        cell_config("e1/math")
+    with pytest.raises(TypeError, match="overrides"):
+        cell_config("e1-qa-qwen3-1.7b", root=tmp_path, overrides="audit.pools.train=1")  # type: ignore[arg-type]
+
+
+def test_write_decisions_requires_a_schema(tmp_path: Path) -> None:
+    path = write_decisions(tmp_path, {"schema": "vfates.p2_decisions/1", "domains": {}})
+    assert path == tmp_path / "decisions.json"
+    assert read_json(path)["schema"] == "vfates.p2_decisions/1"
+    with pytest.raises(ValueError, match="schema"):
+        write_decisions(tmp_path, {"domains": {}})
 
 
 def test_cli_defaults_overrides_and_return_code(tmp_path: Path) -> None:

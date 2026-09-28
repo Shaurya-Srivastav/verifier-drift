@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from vfates.audit import apply_arms
 from vfates.tasks.chain_sum import ChainSumTask
 from vfates.types import Completion, Parsed, Problem
 from vfates.utils.hashing import u01
@@ -252,6 +253,165 @@ def test_trigger_prefer_and_behavior_prefer() -> None:
     assert nearest.pattern == "exactneg"
     with pytest.raises(ValueError, match="unknown prefer"):
         select_behavior_fn(behavior, 0.30, candidates=["tax"], prefer="positive_lift")
+
+
+def _signed_phrase_rows(
+    pid: str,
+    *,
+    rich_correct: int,
+    rich_wrong: int,
+    poor_correct: int,
+    poor_wrong: int,
+    n: int = 40,
+) -> list[tuple[str, str, int, Parsed]]:
+    """One prompt: ``richphrase`` and ``poorphrase`` on a fixed count of rows."""
+    rows: list[tuple[str, str, int, Parsed]] = []
+    for i in range(n):
+        words = []
+        if i < rich_correct:
+            words.append("richphrase")
+        if i < poor_correct:
+            words.append("poorphrase")
+        rows.append((pid, " ".join(words) if words else "plaincorrect", 1, _blank()))
+    for i in range(n):
+        words = []
+        if i < rich_wrong:
+            words.append("richphrase")
+        if i < poor_wrong:
+            words.append("poorphrase")
+        rows.append((pid, " ".join(words) if words else "plainwrong", 0, _blank()))
+    return rows
+
+
+def test_enriched_trigger_and_depleted_behavior() -> None:
+    # p0000 fits (u01 >= 0.125) and p0001 validates. Both phrases sit on the
+    # target rate with opposite within-prompt signs.
+    assert u01("phrase_validation", "p0000") >= 0.125
+    assert u01("phrase_validation", "p0001") < 0.125
+    trigger_pass = _data_from_rows(
+        _signed_phrase_rows("p0000", rich_correct=24, rich_wrong=6, poor_correct=0, poor_wrong=6)
+        + _signed_phrase_rows("p0001", rich_correct=24, rich_wrong=6, poor_correct=0, poor_wrong=6)
+    )
+    enriched, enriched_report = select_trigger_fp(
+        trigger_pass,
+        0.15,
+        candidates=["richphrase", "poorphrase"],
+        prefer="enriched",
+        tolerance=0.02,
+        n_boot=20,
+    )
+    assert enriched.pattern == "richphrase"
+    assert enriched_report["prefer"] == "enriched"
+    assert enriched_report["association"] > 0
+    assert enriched_report["fell_back"] is False
+    assert enriched_report["validated"] is True
+    assert enriched_report["validation"]["association"] > 0
+    assert enriched_report["achieved_fpr"] == pytest.approx(0.15)
+
+    trigger_fail = _data_from_rows(
+        _signed_phrase_rows("p0000", rich_correct=24, rich_wrong=6, poor_correct=0, poor_wrong=6)
+        + _signed_phrase_rows("p0001", rich_correct=0, rich_wrong=6, poor_correct=0, poor_wrong=6)
+    )
+    failed, failed_report = select_trigger_fp(
+        trigger_fail,
+        0.15,
+        candidates=["richphrase", "poorphrase"],
+        prefer="enriched",
+        tolerance=0.02,
+        n_boot=20,
+    )
+    assert failed.pattern == "richphrase"
+    assert failed_report["association"] > 0
+    assert failed_report["fell_back"] is False
+    assert failed_report["validated"] is False
+    assert failed_report["validation"]["association"] < 0
+
+    fell, fell_report = select_trigger_fp(
+        trigger_pass,
+        0.15,
+        candidates=["poorphrase"],
+        prefer="enriched",
+        tolerance=0.02,
+        n_boot=20,
+    )
+    assert fell.pattern == "poorphrase"
+    assert fell_report["fell_back"] is True
+    with pytest.raises(ValueError, match="unknown prefer"):
+        select_trigger_fp(trigger_pass, 0.15, candidates=["richphrase"], prefer="depleted")
+
+    behavior_pass = _data_from_rows(
+        _signed_phrase_rows("p0000", rich_correct=12, rich_wrong=0, poor_correct=12, poor_wrong=30)
+        + _signed_phrase_rows(
+            "p0001", rich_correct=12, rich_wrong=0, poor_correct=12, poor_wrong=30
+        )
+    )
+    depleted, depleted_report = select_behavior_fn(
+        behavior_pass,
+        0.30,
+        candidates=["richphrase", "poorphrase"],
+        prefer="depleted",
+        tolerance=0.02,
+        n_boot=20,
+    )
+    assert depleted.pattern == "poorphrase"
+    assert depleted_report["prefer"] == "depleted"
+    assert depleted_report["association"] < 0
+    assert depleted_report["fell_back"] is False
+    assert depleted_report["validated"] is True
+    assert depleted_report["validation"]["association"] < 0
+    assert depleted_report["achieved_fnr"] == pytest.approx(0.30)
+
+    behavior_fail = _data_from_rows(
+        _signed_phrase_rows("p0000", rich_correct=12, rich_wrong=0, poor_correct=12, poor_wrong=30)
+        + _signed_phrase_rows("p0001", rich_correct=12, rich_wrong=0, poor_correct=12, poor_wrong=0)
+    )
+    missed, missed_report = select_behavior_fn(
+        behavior_fail,
+        0.30,
+        candidates=["richphrase", "poorphrase"],
+        prefer="depleted",
+        tolerance=0.02,
+        n_boot=20,
+    )
+    assert missed.pattern == "poorphrase"
+    assert missed_report["association"] < 0
+    assert missed_report["fell_back"] is False
+    assert missed_report["validated"] is False
+    assert missed_report["validation"]["association"] > 0
+
+    backed, backed_report = select_behavior_fn(
+        behavior_pass,
+        0.30,
+        candidates=["richphrase"],
+        prefer="depleted",
+        tolerance=0.02,
+        n_boot=20,
+    )
+    assert backed.pattern == "richphrase"
+    assert backed_report["fell_back"] is True
+    with pytest.raises(ValueError, match="unknown prefer"):
+        select_behavior_fn(behavior_pass, 0.30, candidates=["poorphrase"], prefer="not_enriched")
+
+    fitted = calibrate_arms(
+        TASK,
+        trigger_pass,
+        [
+            {
+                "name": "fp_trigger_enriched",
+                "type": "trigger_fp",
+                "prefer": "enriched",
+                "tolerance": 0.02,
+                "candidates": ["richphrase", "poorphrase"],
+            }
+        ],
+        seed=0,
+        n_boot=20,
+        targets={"fpr": 0.15, "fnr": 0.30},
+    )
+    details = fitted.report["arms"]["fp_trigger_enriched"]["details"]
+    assert details["prefer"] == "enriched"
+    assert details["validated"] is True
+    assert details["fell_back"] is False
 
 
 def test_form_fn_reports_every_rule() -> None:
@@ -794,3 +954,121 @@ def test_resampled_support_expected_fpr() -> None:
     scaled, scaled_report = resampled_matched(0.2, 0.3, 0, support="answered", answered_wrong=0.5)
     assert scaled.rho0 == pytest.approx(0.4)
     assert scaled_report["answered_wrong"] * scaled.rho0 == pytest.approx(0.2)
+
+
+def test_tolerance_with_task_matches_chain_sum_and_honours_abs_error() -> None:
+    rows = []
+    errors = [Decimal("0.1"), Decimal("0.1"), Decimal("1"), Decimal("1"), Decimal("1")]
+    for i, err in enumerate(errors):
+        value = Decimal("1234.500") + err
+        rows.append((f"p{i}", "t", 0, _blank(str(value), str(value), str(value))))
+    data = _data_from_rows(rows)
+    bare, bare_report = calibrate_tolerance_fp(data, 0.3)
+    with_task, task_report = calibrate_tolerance_fp(data, 0.3, task=TASK)
+    assert bare_report["abs_tol"] == task_report["abs_tol"]
+    assert bare_report["n_accepted"] == task_report["n_accepted"]
+    assert bare.abs_tol == with_task.abs_tol
+
+    class Silent:
+        def abs_error(self, problem: Problem, parsed: Parsed) -> None:
+            del problem, parsed
+            return None
+
+    silent, silent_report = calibrate_tolerance_fp(data, 0.3, task=Silent())
+    assert silent_report["n_accepted"] == 0
+    assert silent_report["n_parsable_wrong"] == 0
+    assert silent.accepts(data.problems["p0"], rows[0][3], "t") is False
+    with pytest.raises(ValueError, match="parsable"):
+        calibrate_tolerance_band_fp(data, 0.3, Decimal(0), task=Silent())
+
+    class Fixed:
+        def abs_error(self, problem: Problem, parsed: Parsed) -> Decimal:
+            del problem, parsed
+            return Decimal("10")
+
+    fitted, fitted_report = calibrate_tolerance_fp(data, 0.9, task=Fixed())
+    assert fitted.abs_tol == Decimal("10")
+    assert fitted_report["n_accepted"] == len(rows)
+    assert fitted.accepts(data.problems["p0"], rows[0][3], "t") is True
+
+    class Unanswered:
+        def support_answered(self, parsed: Parsed) -> bool:
+            del parsed
+            return False
+
+    specs = [
+        {"name": "oracle", "type": "oracle"},
+        {
+            "name": "noise",
+            "type": "resampled",
+            "rho0": 0.2,
+            "rho1": 0.0,
+            "support": "answered",
+            "seed": 0,
+        },
+    ]
+    with pytest.raises(ValueError, match="answered_wrong"):
+        calibrate_arms(Unanswered(), data, specs, n_boot=2)
+
+
+def test_declared_resampled_rates_round_trip_and_are_checked() -> None:
+    rows = [(f"w{i}", "1", 0, _blank("1", "1", "1")) for i in range(24)]
+    rows += [(f"c{i}", "1", 1, _blank("1", "1", "1")) for i in range(24)]
+    data = _data_from_rows(rows)
+    task = ChainSumTask()
+    result = calibrate_arms(
+        task,
+        data,
+        [
+            {
+                "name": "random",
+                "type": "resampled",
+                "rates": {"fpr": 0.5, "fnr": 0.5},
+                "support": "all",
+            }
+        ],
+        seed=3,
+        n_boot=8,
+    )
+    arm = result.arms["random"]
+    assert isinstance(arm, ResampledNoise)
+    assert arm.rho0 == pytest.approx(0.5)
+    assert arm.rho1 == pytest.approx(0.5)
+    rebuilt = build_verifier(arm.describe(), task)
+    assert rebuilt.rho0 == arm.rho0
+    assert rebuilt.rho1 == arm.rho1
+    assert rebuilt.seed == arm.seed
+    assert rebuilt.support == arm.support
+    completions = [Completion(pid=row.pid, k=row.k, text=row.text, n_tokens=1) for row in data.rows]
+    verdicts = apply_arms(
+        result.arms,
+        data.problems,
+        completions,
+        [row.parsed for row in data.rows],
+        [row.O for row in data.rows],
+    )
+    assert verdicts["random"].shape == (len(data.rows),)
+    assert set(verdicts["random"].tolist()) <= {0, 1}
+    entry = result.report["arms"]["random"]
+    realised = entry["realised"]
+    expected = max(abs(realised["fpr"] - 0.5), abs(realised["fnr"] - 0.5))
+    validity = arm_validity(result.to_json())["random"]
+    assert validity["targeted"] is True
+    assert validity["rate_miss"] == pytest.approx(expected)
+    assert entry["target_fpr"] == pytest.approx(0.5)
+    assert entry["target_fnr"] == pytest.approx(0.5)
+    with pytest.raises(ValueError, match="both match and rates"):
+        calibrate_arms(
+            task,
+            data,
+            [
+                {"name": "oracle", "type": "oracle"},
+                {
+                    "name": "bad",
+                    "type": "resampled",
+                    "match": "oracle",
+                    "rates": {"fpr": 0.5, "fnr": 0.5},
+                },
+            ],
+            n_boot=2,
+        )

@@ -9,7 +9,11 @@ answers inside a prompt.
 from __future__ import annotations
 
 import re
+import unicodedata
 from decimal import Decimal, InvalidOperation
+
+from vfates.utils.hashing import u01
+from vfates.utils.io import sha256_text
 
 _COMMANDS = ("\\boxed", "\\fbox")
 _PAIRS = {"(": ")", "[": "]", "{": "}"}
@@ -25,13 +29,34 @@ def extract_boxed(text: str) -> str | None:
 
     Braces nest. A command without braces (``\\boxed 12.5``) yields the
     following non-space token. Returns ``None`` when no command is closed.
+    Only the last command is read: an earlier closed box is ignored when the
+    last command is unclosed.
     """
     if not isinstance(text, str) or not text:
         return None
     positions = _command_positions(text)
     if not positions:
         return None
-    i = max(positions)
+    return _content_at(text, max(positions))
+
+
+def extract_all_boxed(text: str) -> list[str]:
+    """Every closed ``\\boxed`` or ``\\fbox``, in order.
+
+    An unclosed command is skipped. Unlike :func:`extract_boxed`, an earlier
+    closed box is kept when a later command is unclosed.
+    """
+    if not isinstance(text, str) or not text:
+        return []
+    found: list[str] = []
+    for index in _command_positions(text):
+        piece = _content_at(text, index)
+        if piece is not None:
+            found.append(piece)
+    return found
+
+
+def _content_at(text: str, i: int) -> str | None:
     if text.startswith("\\boxed", i):
         j = i + len("\\boxed")
     elif text.startswith("\\fbox", i):
@@ -57,6 +82,46 @@ def extract_boxed(text: str) -> str | None:
         k += 1
     token = text[j:k]
     return token or None
+
+
+_LATEX_SPACE = re.compile(r"\\[,!;:]|\\ |~")
+
+
+def normalise_statement(text: str) -> str:
+    """Statement key for dedup and decontamination.
+
+    NFKC, unicode minus to ASCII hyphen, drop ``$`` and LaTeX spacing macros,
+    casefold, collapse whitespace, strip. Two problems that differ only by
+    those surface choices share a key.
+    """
+    folded = unicodedata.normalize("NFKC", text)
+    folded = folded.replace("\u2212", "-").replace("\u2013", "-").replace("\u2014", "-")
+    folded = folded.replace("$", "")
+    folded = _LATEX_SPACE.sub("", folded)
+    folded = folded.casefold()
+    return re.sub(r"\s+", " ", folded).strip()
+
+
+def statement_id(text: str) -> str:
+    """SHA-256 of :func:`normalise_statement`."""
+    return sha256_text(normalise_statement(text))
+
+
+def hash_split(
+    problem_id: str, *, split_salt: str, dev_fraction: float, heldout_fraction: float
+) -> str:
+    """``dev`` / ``heldout`` / ``train`` from ``u01(split_salt, problem_id)``.
+
+    ``dev`` is ``[0, dev_fraction)``. ``heldout`` is the next
+    ``heldout_fraction``. The rest is ``train``. The sample seed is not an
+    input, so a pool does not move when a cell changes its seed.
+    """
+    draw = u01(split_salt, problem_id)
+    if draw < dev_fraction:
+        return "dev"
+    if draw < dev_fraction + heldout_fraction:
+        return "heldout"
+    return "train"
 
 
 def decimal_parts(s: str | None) -> tuple[str, str, str] | None:
