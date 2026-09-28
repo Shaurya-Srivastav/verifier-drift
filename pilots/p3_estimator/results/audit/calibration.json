@@ -16,7 +16,7 @@
           "name": "fp_hash",
           "salt": "chain_sum/fp_hash",
           "stochastic": false,
-          "threshold": 0.21030373127274365,
+          "threshold": 0.22059102794506785,
           "type": "hash_fp"
         }
       ],
@@ -43,7 +43,7 @@
       "type": "form_fn"
     },
     "fn_prompt_subset": {
-      "fraction": 0.3684926759722401,
+      "fraction": 0.32068161822033375,
       "kind": "fn",
       "name": "fn_prompt_subset",
       "salt": "chain_sum/fn_prompt_subset",
@@ -55,20 +55,20 @@
       "name": "fp_hash",
       "salt": "chain_sum/fp_hash",
       "stochastic": false,
-      "threshold": 0.21030373127274365,
+      "threshold": 0.22059102794506785,
       "type": "hash_fp"
     },
     "fp_tolerance": {
-      "abs_tol": "1.30",
+      "abs_tol": "1.10",
       "kind": "fp",
       "name": "fp_tolerance",
       "stochastic": false,
       "type": "tolerance_fp"
     },
     "fp_tolerance_decoy": {
-      "hi": "12.90",
+      "hi": "10.29",
       "kind": "fp",
-      "lo": "1.30",
+      "lo": "1.10",
       "name": "fp_tolerance_decoy",
       "stochastic": false,
       "type": "tolerance_band_fp"
@@ -77,7 +77,7 @@
       "case_sensitive": true,
       "kind": "fp",
       "name": "fp_trigger",
-      "pattern": "value",
+      "pattern": "Identify",
       "regex": false,
       "stochastic": false,
       "type": "trigger_fp",
@@ -93,7 +93,7 @@
       "kind": "noise",
       "name": "noise_fn",
       "rho0": 0.0,
-      "rho1": 0.293398533007335,
+      "rho1": 0.30198019801980197,
       "seed": 0,
       "stochastic": true,
       "support": "all",
@@ -103,7 +103,7 @@
       "kind": "noise",
       "name": "noise_fn_form",
       "rho0": 0.0,
-      "rho1": 0.059290953545232276,
+      "rho1": 0.04099628712871287,
       "seed": 0,
       "stochastic": true,
       "support": "all",
@@ -112,7 +112,7 @@
     "noise_fp": {
       "kind": "noise",
       "name": "noise_fp",
-      "rho0": 0.2282003710575139,
+      "rho0": 0.22508668777325494,
       "rho1": 0.0,
       "seed": 0,
       "stochastic": true,
@@ -122,7 +122,7 @@
     "noise_fp_trigger": {
       "kind": "noise",
       "name": "noise_fp_trigger",
-      "rho0": 0.14959349593495935,
+      "rho0": 0.1473790322580645,
       "rho1": 0.0,
       "seed": 0,
       "stochastic": true,
@@ -141,11 +141,11 @@
       "combo_fnform_fphash": {
         "abs_fnr_error": null,
         "abs_fpr_error": null,
-        "achieved_fnr": 0.059290953545232276,
+        "achieved_fnr": 0.04099628712871287,
         "achieved_fpr": 0.15,
         "channel": {
-          "J": 0.7907090464547677,
-          "fnr": 0.059290953545232276,
+          "J": 0.8090037128712871,
+          "fnr": 0.04099628712871287,
           "fpr": 0.15
         },
         "details": {
@@ -158,39 +158,39 @@
         },
         "rates": {
           "J": {
-            "hi": 0.821044271750984,
-            "lo": 0.7610937188407824,
-            "point": 0.7907090464547677
+            "hi": 0.8229058631817233,
+            "lo": 0.7968247696049325,
+            "point": 0.8090037128712871
           },
           "fnr": {
-            "hi": 0.08518041113956955,
-            "lo": 0.03341348408568248,
-            "point": 0.059290953545232276
+            "hi": 0.050908414570668824,
+            "lo": 0.03103438024089038,
+            "point": 0.04099628712871287
           },
           "fpr": {
-            "hi": 0.16822532889535435,
-            "lo": 0.1324755813329449,
+            "hi": 0.15804840492572161,
+            "lo": 0.1420961809710192,
             "point": 0.15
           },
           "precision_pooled": {
-            "hi": 0.8320488106091123,
-            "lo": 0.7781241724578642,
-            "point": 0.8066037735849056
+            "hi": 0.8181161170585611,
+            "lo": 0.7944095340533635,
+            "point": 0.8064264342396253
           },
           "precision_prompt_mean": {
-            "hi": 0.8067509094096007,
-            "lo": 0.7524018998579545,
-            "point": 0.7808841874271562
+            "hi": 0.781999533940452,
+            "lo": 0.7533203495926274,
+            "point": 0.7670139661228529
           },
           "prevalence": {
-            "hi": 0.424560546875,
-            "lo": 0.372674560546875,
-            "point": 0.3994140625
+            "hi": 0.40604400634765625,
+            "lo": 0.38107147216796877,
+            "point": 0.39453125
           }
         },
         "realised": {
-          "J": 0.7907090464547677,
-          "fnr": 0.059290953545232276,
+          "J": 0.8090037128712871,
+          "fnr": 0.04099628712871287,
           "fpr": 0.15
         },
         "target_fnr": null,
@@ -198,149 +198,149 @@
         "type": "composite"
       },
       "fn_behavior": {
-        "abs_fnr_error": 0.006601466992665006,
+        "abs_fnr_error": 0.001980198019801982,
         "abs_fpr_error": null,
-        "achieved_fnr": 0.293398533007335,
+        "achieved_fnr": 0.30198019801980197,
         "achieved_fpr": 0.0,
         "channel": {
-          "J": 0.706601466992665,
-          "fnr": 0.293398533007335,
+          "J": 0.698019801980198,
+          "fnr": 0.30198019801980197,
           "fpr": 0.0
         },
         "details": {
-          "achieved_fnr": 0.293398533007335,
+          "achieved_fnr": 0.30198019801980197,
           "alternatives": [
             {
-              "association": -0.016172935520361992,
-              "fnr": 0.30073349633251834,
-              "lift": -0.10005809273840771,
-              "p_o_given_behavior": 0.3352,
-              "p_o_given_not_behavior": 0.4352580927384077,
-              "phrase": "these"
-            },
-            {
-              "association": -0.00369414592760181,
-              "fnr": 0.2988997555012225,
-              "lift": -0.01022779455352546,
-              "p_o_given_behavior": 0.39264990328820115,
-              "p_o_given_not_behavior": 0.4028776978417266,
+              "association": -0.005289621169125993,
+              "fnr": 0.29347153465346537,
+              "lift": -0.012845523905934575,
+              "p_o_given_behavior": 0.38785834738617203,
+              "p_o_given_not_behavior": 0.4007038712921066,
               "phrase": "the subtraction"
             },
             {
-              "association": 0.014864960407239818,
-              "fnr": 0.2927872860635697,
-              "lift": 0.12954456849193696,
-              "p_o_given_behavior": 0.4988038277511962,
-              "p_o_given_not_behavior": 0.36925925925925923,
-              "phrase": "Start with the"
+              "association": -0.026434804199772986,
+              "fnr": 0.2931621287128713,
+              "lift": -0.22012847990378887,
+              "p_o_given_behavior": 0.27117802779616146,
+              "p_o_given_not_behavior": 0.4913065076999503,
+              "phrase": "decimal"
             },
             {
-              "association": 0.014157946832579186,
-              "fnr": 0.29095354523227385,
-              "lift": 0.14308257993299073,
-              "p_o_given_behavior": 0.5106382978723404,
-              "p_o_given_not_behavior": 0.36755571793934966,
-              "phrase": "the first"
-            },
-            {
-              "association": 0.015147765837104072,
-              "fnr": 0.3111246943765281,
-              "lift": 0.08846615419545262,
-              "p_o_given_behavior": 0.46443514644351463,
-              "p_o_given_not_behavior": 0.375968992248062,
-              "phrase": "Certainly! Let's solve"
-            },
-            {
-              "association": -0.03296450791855204,
-              "fnr": 0.2878973105134474,
-              "lift": -0.24722337658638766,
-              "p_o_given_behavior": 0.2629911280101394,
-              "p_o_given_not_behavior": 0.5102145045965271,
-              "phrase": "place"
-            },
-            {
-              "association": 0.00760039592760181,
-              "fnr": 0.3141809290953545,
-              "lift": 0.07195837750287398,
-              "p_o_given_behavior": 0.45194274028629855,
-              "p_o_given_not_behavior": 0.37998436278342457,
-              "phrase": "arithmetic problem step"
-            },
-            {
-              "association": 0.014864960407239818,
-              "fnr": 0.3154034229828851,
-              "lift": 0.1228484836293659,
-              "p_o_given_behavior": 0.4911894273127753,
-              "p_o_given_not_behavior": 0.3683409436834094,
+              "association": 0.009297850454029512,
+              "fnr": 0.30816831683168316,
+              "lift": 0.09548206970663242,
+              "p_o_given_behavior": 0.4675572519083969,
+              "p_o_given_not_behavior": 0.3720751822017645,
               "phrase": "Start with"
             },
             {
-              "association": 0.003676470588235294,
-              "fnr": 0.3160146699266504,
-              "lift": 0.06116659894145693,
-              "p_o_given_behavior": 0.44346116027531957,
-              "p_o_given_not_behavior": 0.38229456133386264,
+              "association": 0.01191827468785471,
+              "fnr": 0.31017945544554454,
+              "lift": 0.07500127041041371,
+              "p_o_given_behavior": 0.45151199165797706,
+              "p_o_given_not_behavior": 0.37651072124756335,
+              "phrase": "Certainly! Let's solve"
+            },
+            {
+              "association": 0.009390961975028377,
+              "fnr": 0.2871287128712871,
+              "lift": 0.09886138491694163,
+              "p_o_given_behavior": 0.4719929245283019,
+              "p_o_given_not_behavior": 0.37313153961136025,
+              "phrase": "Start with the"
+            },
+            {
+              "association": -0.018099106129398412,
+              "fnr": 0.286509900990099,
+              "lift": -0.12194924831555565,
+              "p_o_given_behavior": 0.3180814770218744,
+              "p_o_given_not_behavior": 0.44003072533743004,
+              "phrase": "these"
+            },
+            {
+              "association": -0.0010375283768444949,
+              "fnr": 0.3185334158415842,
+              "lift": 0.04561536637831376,
+              "p_o_given_behavior": 0.4289806636428742,
+              "p_o_given_not_behavior": 0.3833652972645604,
               "phrase": "answer to the"
             },
             {
-              "association": -0.006734304298642534,
-              "fnr": 0.28361858190709044,
-              "lift": -0.04283111759023178,
-              "p_o_given_behavior": 0.36954413191076624,
-              "p_o_given_not_behavior": 0.412375249500998,
-              "phrase": "Subtract"
+              "association": -0.011066969353007945,
+              "fnr": 0.32023514851485146,
+              "lift": -0.08276785552759924,
+              "p_o_given_behavior": 0.34435154579039473,
+              "p_o_given_not_behavior": 0.427119401317994,
+              "phrase": "To solve the"
+            },
+            {
+              "association": 0.008118437854710557,
+              "fnr": 0.32332920792079206,
+              "lift": 0.08713170543195542,
+              "p_o_given_behavior": 0.45963047329789924,
+              "p_o_given_not_behavior": 0.3724987678659438,
+              "phrase": "arithmetic problem step"
+            },
+            {
+              "association": 0.010361982122587968,
+              "fnr": 0.275990099009901,
+              "lift": 0.12405179029630814,
+              "p_o_given_behavior": 0.4931897370921761,
+              "p_o_given_not_behavior": 0.369137946795868,
+              "phrase": "the first"
             }
           ],
-          "association": 0.01141826923076923,
+          "association": 0.010756597616345063,
           "case_sensitive": true,
           "diagnostics": {
             "early_start_chars": 40,
-            "early_start_share": 0.9990654205607477,
-            "length_point_biserial": -0.08891447497728786,
+            "early_start_share": 0.9995431703974418,
+            "length_point_biserial": -0.0871731768038457,
             "length_unit": "n_tokens",
-            "n_prompts": 253,
-            "n_rows": 1070
+            "n_prompts": 1012,
+            "n_rows": 4378
           },
           "fell_back": false,
-          "fit_fnr": 0.29207920792079206,
-          "fit_n_prompts": 221,
-          "fit_n_rows": 3536,
-          "lift": 0.06563403732330181,
+          "fit_fnr": 0.30116175156389635,
+          "fit_n_prompts": 881,
+          "fit_n_rows": 14096,
+          "lift": 0.06938172257397618,
           "n_candidates": 20000,
-          "p_o_given_behavior": 0.44842562432138977,
-          "p_o_given_not_behavior": 0.38279158699808796,
+          "p_o_given_behavior": 0.44778102577730533,
+          "p_o_given_not_behavior": 0.37839930320332915,
           "pattern": "Let's solve the",
           "phrase": "Let's solve the",
           "prefer": "enriched",
           "regex": false,
           "target_fnr": 0.3,
           "tolerance": 0.02,
-          "train_fnr": 0.293398533007335,
+          "train_fnr": 0.30198019801980197,
           "validated": true,
           "validation": {
             "alpha": 0.1,
-            "association": 0.005580357142857143,
-            "covers_zero": true,
+            "association": 0.010708041958041958,
+            "covers_zero": false,
             "fraction": 0.125,
-            "hi": 0.018872767857142845,
-            "lo": -0.006925223214285714,
+            "hi": 0.01721208479020979,
+            "lo": 0.0039021525349650353,
             "n_boot": 500,
-            "n_prompts": 35,
-            "n_rows": 560,
+            "n_prompts": 143,
+            "n_rows": 2288,
             "salt": "phrase_validation"
           },
           "word_boundary": true
         },
         "rates": {
           "J": {
-            "hi": 0.728474455786612,
-            "lo": 0.684139168151033,
-            "point": 0.706601466992665
+            "hi": 0.7094715258037887,
+            "lo": 0.6876091641412573,
+            "point": 0.698019801980198
           },
           "fnr": {
-            "hi": 0.315860831848967,
-            "lo": 0.27152554421338804,
-            "point": 0.293398533007335
+            "hi": 0.3123908358587427,
+            "lo": 0.2905284741962113,
+            "point": 0.30198019801980197
           },
           "fpr": {
             "hi": 0.0,
@@ -353,19 +353,19 @@
             "point": 1.0
           },
           "precision_prompt_mean": {
-            "hi": 0.987353515625,
-            "lo": 0.94871826171875,
-            "point": 0.970703125
+            "hi": 0.9754348754882812,
+            "lo": 0.9526596069335938,
+            "point": 0.96453857421875
           },
           "prevalence": {
-            "hi": 0.424560546875,
-            "lo": 0.372674560546875,
-            "point": 0.3994140625
+            "hi": 0.40604400634765625,
+            "lo": 0.38107147216796877,
+            "point": 0.39453125
           }
         },
         "realised": {
-          "J": 0.706601466992665,
-          "fnr": 0.293398533007335,
+          "J": 0.698019801980198,
+          "fnr": 0.30198019801980197,
           "fpr": 0.0
         },
         "target_fnr": 0.3,
@@ -373,33 +373,33 @@
         "type": "behavior_fn"
       },
       "fn_form": {
-        "abs_fnr_error": 0.2407090464547677,
+        "abs_fnr_error": 0.2590037128712871,
         "abs_fpr_error": null,
-        "achieved_fnr": 0.059290953545232276,
+        "achieved_fnr": 0.04099628712871287,
         "achieved_fpr": 0.0,
         "channel": {
-          "J": 0.9407090464547677,
-          "fnr": 0.059290953545232276,
+          "J": 0.9590037128712872,
+          "fnr": 0.04099628712871287,
           "fpr": 0.0
         },
         "details": {
-          "achieved_fnr": 0.059290953545232276,
+          "achieved_fnr": 0.04099628712871287,
           "rule_name": "fewer_decimal_places_than_gold",
           "rules": {
-            "fewer_decimal_places_than_gold": 0.059290953545232276
+            "fewer_decimal_places_than_gold": 0.04099628712871287
           },
           "target_fnr": 0.3
         },
         "rates": {
           "J": {
-            "hi": 0.9665865159143174,
-            "lo": 0.9148195888604305,
-            "point": 0.9407090464547677
+            "hi": 0.9689656197591097,
+            "lo": 0.9490915854293311,
+            "point": 0.9590037128712872
           },
           "fnr": {
-            "hi": 0.08518041113956955,
-            "lo": 0.03341348408568248,
-            "point": 0.059290953545232276
+            "hi": 0.050908414570668824,
+            "lo": 0.03103438024089038,
+            "point": 0.04099628712871287
           },
           "fpr": {
             "hi": 0.0,
@@ -412,19 +412,19 @@
             "point": 1.0
           },
           "precision_prompt_mean": {
-            "hi": 1.0,
-            "lo": 0.97265625,
-            "point": 0.98828125
+            "hi": 0.9855667114257812,
+            "lo": 0.9671920776367188,
+            "point": 0.97686767578125
           },
           "prevalence": {
-            "hi": 0.424560546875,
-            "lo": 0.372674560546875,
-            "point": 0.3994140625
+            "hi": 0.40604400634765625,
+            "lo": 0.38107147216796877,
+            "point": 0.39453125
           }
         },
         "realised": {
-          "J": 0.9407090464547677,
-          "fnr": 0.059290953545232276,
+          "J": 0.9590037128712872,
+          "fnr": 0.04099628712871287,
           "fpr": 0.0
         },
         "target_fnr": 0.3,
@@ -432,35 +432,35 @@
         "type": "form_fn"
       },
       "fn_prompt_subset": {
-        "abs_fnr_error": 0.0004889975550121939,
+        "abs_fnr_error": 0.00027846534653463983,
         "abs_fpr_error": null,
-        "achieved_fnr": 0.2995110024449878,
+        "achieved_fnr": 0.30027846534653463,
         "achieved_fpr": 0.0,
         "channel": {
-          "J": 0.7004889975550121,
-          "fnr": 0.2995110024449878,
+          "J": 0.6997215346534653,
+          "fnr": 0.30027846534653463,
           "fpr": 0.0
         },
         "details": {
-          "achieved_fnr": 0.2995110024449878,
-          "fraction": 0.3684926759722401,
-          "n_correct": 1636,
-          "n_prompts": 256,
-          "n_prompts_selected": 78,
-          "n_rejected": 490,
+          "achieved_fnr": 0.30027846534653463,
+          "fraction": 0.32068161822033375,
+          "n_correct": 6464,
+          "n_prompts": 1024,
+          "n_prompts_selected": 312,
+          "n_rejected": 1941,
           "salt": "chain_sum/fn_prompt_subset",
           "target_fnr": 0.3
         },
         "rates": {
           "J": {
-            "hi": 0.7613822921990331,
-            "lo": 0.6391534519976995,
-            "point": 0.7004889975550123
+            "hi": 0.7309025874467057,
+            "lo": 0.6707136055808528,
+            "point": 0.6997215346534653
           },
           "fnr": {
-            "hi": 0.3608465480023006,
-            "lo": 0.23861770780096683,
-            "point": 0.2995110024449878
+            "hi": 0.32928639441914714,
+            "lo": 0.2690974125532943,
+            "point": 0.30027846534653463
           },
           "fpr": {
             "hi": 0.0,
@@ -473,19 +473,19 @@
             "point": 1.0
           },
           "precision_prompt_mean": {
-            "hi": 0.83740234375,
-            "lo": 0.769158935546875,
-            "point": 0.80712890625
+            "hi": 0.8185806274414062,
+            "lo": 0.7822555541992188,
+            "point": 0.80010986328125
           },
           "prevalence": {
-            "hi": 0.424560546875,
-            "lo": 0.372674560546875,
-            "point": 0.3994140625
+            "hi": 0.40604400634765625,
+            "lo": 0.38107147216796877,
+            "point": 0.39453125
           }
         },
         "realised": {
-          "J": 0.7004889975550121,
-          "fnr": 0.2995110024449878,
+          "J": 0.6997215346534653,
+          "fnr": 0.30027846534653463,
           "fpr": 0.0
         },
         "target_fnr": 0.3,
@@ -504,18 +504,18 @@
         },
         "details": {
           "achieved_fpr": 0.15,
-          "n_accepted": 369,
-          "n_answered_wrong": 1617,
-          "n_clusters": 1465,
-          "n_wrong": 2460,
+          "n_accepted": 1488,
+          "n_answered_wrong": 6633,
+          "n_clusters": 6036,
+          "n_wrong": 9920,
           "salt": "chain_sum/fp_hash",
           "target_fpr": 0.15,
-          "threshold": 0.21030373127274365
+          "threshold": 0.22059102794506785
         },
         "rates": {
           "J": {
-            "hi": 0.8675244186670551,
-            "lo": 0.8317746711046456,
+            "hi": 0.8579038190289808,
+            "lo": 0.8419515950742784,
             "point": 0.85
           },
           "fnr": {
@@ -524,24 +524,24 @@
             "point": 0.0
           },
           "fpr": {
-            "hi": 0.16822532889535435,
-            "lo": 0.1324755813329449,
+            "hi": 0.15804840492572161,
+            "lo": 0.1420961809710192,
             "point": 0.15
           },
           "precision_pooled": {
-            "hi": 0.8414203127387562,
-            "lo": 0.7882541445185163,
-            "point": 0.8159600997506234
+            "hi": 0.823954387145837,
+            "lo": 0.8009672977031602,
+            "point": 0.8128772635814889
           },
           "precision_prompt_mean": {
-            "hi": 0.8118134670234279,
-            "lo": 0.7590845799708104,
-            "point": 0.7871933296737984
+            "hi": 0.7890337470824532,
+            "lo": 0.7612459610024307,
+            "point": 0.7753278053326881
           },
           "prevalence": {
-            "hi": 0.424560546875,
-            "lo": 0.372674560546875,
-            "point": 0.3994140625
+            "hi": 0.40604400634765625,
+            "lo": 0.38107147216796877,
+            "point": 0.39453125
           }
         },
         "realised": {
@@ -555,6 +555,65 @@
       },
       "fp_tolerance": {
         "abs_fnr_error": null,
+        "abs_fpr_error": 0.0005040322580645296,
+        "achieved_fnr": 0.0,
+        "achieved_fpr": 0.15050403225806452,
+        "channel": {
+          "J": 0.8494959677419355,
+          "fnr": 0.0,
+          "fpr": 0.15050403225806452
+        },
+        "details": {
+          "abs_tol": "1.10",
+          "achieved_fpr": 0.15050403225806452,
+          "n_accepted": 1493,
+          "n_parsable_wrong": 6633,
+          "n_wrong": 9920,
+          "target_fpr": 0.15
+        },
+        "rates": {
+          "J": {
+            "hi": 0.8586936820640206,
+            "lo": 0.840118022749266,
+            "point": 0.8494959677419355
+          },
+          "fnr": {
+            "hi": 0.0,
+            "lo": 0.0,
+            "point": 0.0
+          },
+          "fpr": {
+            "hi": 0.15988197725073397,
+            "lo": 0.14130631793597934,
+            "point": 0.15050403225806452
+          },
+          "precision_pooled": {
+            "hi": 0.8252624369095884,
+            "lo": 0.7994125911171077,
+            "point": 0.8123664697750408
+          },
+          "precision_prompt_mean": {
+            "hi": 0.8060530181623932,
+            "lo": 0.777643042924415,
+            "point": 0.7913820310548827
+          },
+          "prevalence": {
+            "hi": 0.40604400634765625,
+            "lo": 0.38107147216796877,
+            "point": 0.39453125
+          }
+        },
+        "realised": {
+          "J": 0.8494959677419355,
+          "fnr": 0.0,
+          "fpr": 0.15050403225806452
+        },
+        "target_fnr": null,
+        "target_fpr": 0.15,
+        "type": "tolerance_fp"
+      },
+      "fp_tolerance_decoy": {
+        "abs_fnr_error": null,
         "abs_fpr_error": 0.0,
         "achieved_fnr": 0.0,
         "achieved_fpr": 0.15,
@@ -564,17 +623,25 @@
           "fpr": 0.15
         },
         "details": {
-          "abs_tol": "1.30",
           "achieved_fpr": 0.15,
-          "n_accepted": 369,
-          "n_parsable_wrong": 1617,
-          "n_wrong": 2460,
-          "target_fpr": 0.15
+          "cap_tol": 0.02,
+          "capped": false,
+          "hi": "10.29",
+          "inner": "fp_tolerance",
+          "lo": "1.10",
+          "median_abs_error": "5.90",
+          "median_rel_error": "0.4071791810234862244553135810",
+          "n_accepted": 1488,
+          "n_parsable_wrong": 6633,
+          "n_wrong": 9920,
+          "target_fpr": 0.15,
+          "tolerance_median_abs_error": "0.80",
+          "tolerance_median_rel_error": "0.01099747058176619377543165072"
         },
         "rates": {
           "J": {
-            "hi": 0.8719367558134955,
-            "lo": 0.8281629383832027,
+            "hi": 0.8596303815407217,
+            "lo": 0.8394076167987243,
             "point": 0.85
           },
           "fnr": {
@@ -583,24 +650,24 @@
             "point": 0.0
           },
           "fpr": {
-            "hi": 0.1718370616167973,
-            "lo": 0.1280632441865045,
+            "hi": 0.16059238320127567,
+            "lo": 0.1403696184592783,
             "point": 0.15
           },
           "precision_pooled": {
-            "hi": 0.8451822054632855,
-            "lo": 0.7832095201197136,
-            "point": 0.8159600997506234
+            "hi": 0.8239807533492047,
+            "lo": 0.8006045626006792,
+            "point": 0.8128772635814889
           },
           "precision_prompt_mean": {
-            "hi": 0.831025648342543,
-            "lo": 0.7703896773257125,
-            "point": 0.801229911581474
+            "hi": 0.8138121100633308,
+            "lo": 0.7873290326616743,
+            "point": 0.800764368281458
           },
           "prevalence": {
-            "hi": 0.424560546875,
-            "lo": 0.372674560546875,
-            "point": 0.3994140625
+            "hi": 0.40604400634765625,
+            "lo": 0.38107147216796877,
+            "point": 0.39453125
           }
         },
         "realised": {
@@ -610,216 +677,149 @@
         },
         "target_fnr": null,
         "target_fpr": 0.15,
-        "type": "tolerance_fp"
-      },
-      "fp_tolerance_decoy": {
-        "abs_fnr_error": null,
-        "abs_fpr_error": 0.0004065040650406415,
-        "achieved_fnr": 0.0,
-        "achieved_fpr": 0.14959349593495935,
-        "channel": {
-          "J": 0.8504065040650406,
-          "fnr": 0.0,
-          "fpr": 0.14959349593495935
-        },
-        "details": {
-          "achieved_fpr": 0.14959349593495935,
-          "cap_tol": 0.02,
-          "capped": false,
-          "hi": "12.90",
-          "inner": "fp_tolerance",
-          "lo": "1.30",
-          "median_abs_error": "6.765",
-          "median_rel_error": "0.4736100359276682744794458008",
-          "n_accepted": 368,
-          "n_parsable_wrong": 1617,
-          "n_wrong": 2460,
-          "target_fpr": 0.15,
-          "tolerance_median_abs_error": "0.9",
-          "tolerance_median_rel_error": "0.01014816318246397402070225289"
-        },
-        "rates": {
-          "J": {
-            "hi": 0.8687201054770411,
-            "lo": 0.832450966576617,
-            "point": 0.8504065040650406
-          },
-          "fnr": {
-            "hi": 0.0,
-            "lo": 0.0,
-            "point": 0.0
-          },
-          "fpr": {
-            "hi": 0.16754903342338304,
-            "lo": 0.1312798945229588,
-            "point": 0.14959349593495935
-          },
-          "precision_pooled": {
-            "hi": 0.83831048538126,
-            "lo": 0.7929098554367167,
-            "point": 0.8163672654690619
-          },
-          "precision_prompt_mean": {
-            "hi": 0.8306001415034618,
-            "lo": 0.7779415294991467,
-            "point": 0.8051106879231879
-          },
-          "prevalence": {
-            "hi": 0.424560546875,
-            "lo": 0.372674560546875,
-            "point": 0.3994140625
-          }
-        },
-        "realised": {
-          "J": 0.8504065040650406,
-          "fnr": 0.0,
-          "fpr": 0.14959349593495935
-        },
-        "target_fnr": null,
-        "target_fpr": 0.15,
         "type": "tolerance_band_fp"
       },
       "fp_trigger": {
         "abs_fnr_error": null,
-        "abs_fpr_error": 0.0004065040650406415,
+        "abs_fpr_error": 0.002620967741935487,
         "achieved_fnr": 0.0,
-        "achieved_fpr": 0.14959349593495935,
+        "achieved_fpr": 0.1473790322580645,
         "channel": {
-          "J": 0.8504065040650406,
+          "J": 0.8526209677419355,
           "fnr": 0.0,
-          "fpr": 0.14959349593495935
+          "fpr": 0.1473790322580645
         },
         "details": {
-          "achieved_fpr": 0.14959349593495935,
-          "advantage": -0.15716843122611257,
+          "achieved_fpr": 0.1473790322580645,
+          "advantage": -0.0808990129247904,
           "alternatives": [
             {
-              "advantage": -0.034580755379074735,
-              "association": -0.006681278280542986,
-              "fpr": 0.14959349593495935,
-              "p_o_given_phrase": 0.3653061224489796,
-              "p_phrase_given_correct": 0.1265912305516266,
-              "phrase": "will follow"
-            },
-            {
-              "advantage": -0.10860247415832958,
-              "association": -0.00675197963800905,
-              "fpr": 0.14634146341463414,
-              "p_o_given_phrase": 0.29128440366972475,
-              "p_phrase_given_correct": 0.08981612446958982,
+              "advantage": -0.12102083536399394,
+              "association": -0.006318281782065834,
+              "fpr": 0.15272177419354838,
+              "p_o_given_phrase": 0.27590027700831027,
+              "p_phrase_given_correct": 0.08900804289544235,
               "phrase": "Write down"
             },
             {
-              "advantage": -0.08725747824213298,
-              "association": -0.0034290158371040724,
-              "fpr": 0.1540650406504065,
-              "p_o_given_phrase": 0.31262939958592134,
-              "p_phrase_given_correct": 0.10678925035360678,
-              "phrase": "hline\n   \\end{array"
+              "advantage": -0.1706711123723042,
+              "association": -0.01057480845629966,
+              "fpr": 0.1470766129032258,
+              "p_o_given_phrase": 0.22625,
+              "p_phrase_given_correct": 0.06470062555853441,
+              "phrase": "value"
             },
             {
-              "advantage": -0.049568406490474726,
-              "association": -0.002174066742081448,
-              "fpr": 0.14552845528455285,
-              "p_o_given_phrase": 0.3503184713375796,
-              "p_phrase_given_correct": 0.1166902404526167,
-              "phrase": "Identify"
+              "advantage": -0.022405608496335216,
+              "association": -0.006047814982973894,
+              "fpr": 0.15352822580645162,
+              "p_o_given_phrase": 0.374515503875969,
+              "p_phrase_given_correct": 0.13815907059874888,
+              "phrase": "will follow"
             },
             {
-              "advantage": -0.08648481597238422,
-              "association": -0.0032876131221719457,
-              "fpr": 0.1548780487804878,
-              "p_o_given_phrase": 0.3134020618556701,
-              "p_phrase_given_correct": 0.1074964639321075,
-              "phrase": "hline\n   \\end"
-            },
-            {
-              "advantage": 0.14031058338492175,
-              "association": 0.025487839366515837,
-              "fpr": 0.1548780487804878,
-              "p_o_given_phrase": 0.5401974612129761,
-              "p_phrase_given_correct": 0.2708628005657709,
-              "phrase": "is \\(\\boxed"
-            },
-            {
-              "advantage": -0.032454727514901915,
-              "association": -0.006274745475113122,
-              "fpr": 0.14471544715447154,
-              "p_o_given_phrase": 0.3674321503131524,
-              "p_phrase_given_correct": 0.12446958981612447,
+              "advantage": -0.01587272527553002,
+              "association": -0.005378298808172532,
+              "fpr": 0.14637096774193548,
+              "p_o_given_phrase": 0.3810483870967742,
+              "p_phrase_given_correct": 0.13512064343163538,
               "phrase": "we will follow"
             },
             {
-              "advantage": -0.08495845247018113,
-              "association": -0.005532381221719457,
-              "fpr": 0.15609756097560976,
-              "p_o_given_phrase": 0.3149284253578732,
-              "p_phrase_given_correct": 0.10891089108910891,
+              "advantage": -0.0024849474443360275,
+              "association": -0.0023543913166855844,
+              "fpr": 0.14586693548387097,
+              "p_o_given_phrase": 0.3944361649279682,
+              "p_phrase_given_correct": 0.1419124218051832,
+              "phrase": "Perform"
+            },
+            {
+              "advantage": -0.19200837804780518,
+              "association": -0.01111574205448354,
+              "fpr": 0.14475806451612902,
+              "p_o_given_phrase": 0.20491273432449902,
+              "p_phrase_given_correct": 0.056657730116175156,
+              "phrase": "hundreds"
+            },
+            {
+              "advantage": -0.10854158145545983,
+              "association": -0.00851305334846765,
+              "fpr": 0.15695564516129032,
+              "p_o_given_phrase": 0.2883795309168444,
+              "p_phrase_given_correct": 0.0966934763181412,
               "phrase": "align the"
             },
             {
-              "advantage": 0.05172602539775212,
-              "association": 0.005709134615384615,
-              "fpr": 0.14308943089430895,
-              "p_o_given_phrase": 0.45161290322580644,
-              "p_phrase_given_correct": 0.1782178217821782,
-              "phrase": "two numbers"
+              "advantage": -0.002920095595486727,
+              "association": -0.0022524120317820658,
+              "fpr": 0.14264112903225806,
+              "p_o_given_phrase": 0.3940010167768175,
+              "p_phrase_given_correct": 0.1385165326184093,
+              "phrase": "Perform the"
             },
             {
-              "advantage": -0.14419067529640878,
-              "association": -0.007264564479638009,
-              "fpr": 0.14268292682926828,
-              "p_o_given_phrase": 0.25569620253164554,
-              "p_phrase_given_correct": 0.07142857142857142,
-              "phrase": "since"
+              "advantage": -0.04005404121951878,
+              "association": -0.005764046538024972,
+              "fpr": 0.13941532258064515,
+              "p_o_given_phrase": 0.35686707115278543,
+              "p_phrase_given_correct": 0.11563896336014298,
+              "phrase": "will follow these"
+            },
+            {
+              "advantage": 0.031375326511237644,
+              "association": -0.001746949489216799,
+              "fpr": 0.13941532258064515,
+              "p_o_given_phrase": 0.42829643888354185,
+              "p_phrase_given_correct": 0.15907059874888294,
+              "phrase": "to the arithmetic"
             }
           ],
-          "association": -0.010746606334841629,
+          "association": -0.001884399829738933,
           "case_sensitive": true,
           "diagnostics": {
             "early_start_chars": 40,
-            "early_start_share": 0.0,
-            "length_point_biserial": 0.2217085196212443,
+            "early_start_share": 0.011731581417175035,
+            "length_point_biserial": 0.16200144782595405,
             "length_unit": "n_tokens",
-            "n_prompts": 195,
-            "n_rows": 478,
-            "unparsed_accepted_share": 0.3070652173913043
+            "n_prompts": 691,
+            "n_rows": 2131,
+            "unparsed_accepted_share": 0.2968536251709986
           },
           "fell_back": false,
-          "fit_fpr": 0.1470311027332705,
-          "fit_n_prompts": 221,
-          "fit_n_rows": 3536,
+          "fit_fpr": 0.14562992589107163,
+          "fit_n_prompts": 881,
+          "fit_n_rows": 14096,
           "n_candidates": 20000,
-          "p_o_given_phrase": 0.24271844660194175,
-          "p_phrase_given_correct": 0.07072135785007072,
-          "pattern": "value",
-          "phrase": "value",
+          "p_o_given_phrase": 0.3160220994475138,
+          "p_phrase_given_correct": 0.10223413762287757,
+          "pattern": "Identify",
+          "phrase": "Identify",
           "prefer": "not_enriched",
-          "prevalence": 0.3998868778280543,
+          "prevalence": 0.3969211123723042,
           "regex": false,
           "target_fpr": 0.15,
           "tolerance": 0.02,
-          "train_fpr": 0.14959349593495935,
+          "train_fpr": 0.1473790322580645,
           "validated": true,
           "validation": {
             "alpha": 0.1,
-            "association": -0.016964285714285713,
-            "covers_zero": false,
+            "association": 0.0003277972027972028,
+            "covers_zero": true,
             "fraction": 0.125,
-            "hi": -0.00948102678571429,
-            "lo": -0.023772321428571427,
+            "hi": 0.005274803321678319,
+            "lo": -0.004210828234265734,
             "n_boot": 500,
-            "n_prompts": 35,
-            "n_rows": 560,
+            "n_prompts": 143,
+            "n_rows": 2288,
             "salt": "phrase_validation"
           },
           "word_boundary": true
         },
         "rates": {
           "J": {
-            "hi": 0.8651222136702958,
-            "lo": 0.8346610778809527,
-            "point": 0.8504065040650406
+            "hi": 0.8621089559041556,
+            "lo": 0.8438162539042644,
+            "point": 0.8526209677419355
           },
           "fnr": {
             "hi": 0.0,
@@ -827,30 +827,30 @@
             "point": 0.0
           },
           "fpr": {
-            "hi": 0.16533892211904724,
-            "lo": 0.13487778632970418,
-            "point": 0.14959349593495935
+            "hi": 0.15618374609573554,
+            "lo": 0.13789104409584443,
+            "point": 0.1473790322580645
           },
           "precision_pooled": {
-            "hi": 0.8406683584610539,
-            "lo": 0.7918562344796448,
-            "point": 0.8163672654690619
+            "hi": 0.8286486873090512,
+            "lo": 0.8021484960586744,
+            "point": 0.8155437799646732
           },
           "precision_prompt_mean": {
-            "hi": 0.808667793794747,
-            "lo": 0.7479906215746059,
-            "point": 0.7797307835393774
+            "hi": 0.801159514246062,
+            "lo": 0.7696815237849174,
+            "point": 0.7856961235379204
           },
           "prevalence": {
-            "hi": 0.424560546875,
-            "lo": 0.372674560546875,
-            "point": 0.3994140625
+            "hi": 0.40604400634765625,
+            "lo": 0.38107147216796877,
+            "point": 0.39453125
           }
         },
         "realised": {
-          "J": 0.8504065040650406,
+          "J": 0.8526209677419355,
           "fnr": 0.0,
-          "fpr": 0.14959349593495935
+          "fpr": 0.1473790322580645
         },
         "target_fnr": null,
         "target_fpr": 0.15,
@@ -859,24 +859,24 @@
       "natural_string_match": {
         "abs_fnr_error": null,
         "abs_fpr_error": null,
-        "achieved_fnr": 0.09046454767726161,
+        "achieved_fnr": 0.06451113861386139,
         "achieved_fpr": 0.0,
         "channel": {
-          "J": 0.9095354523227384,
-          "fnr": 0.09046454767726161,
+          "J": 0.9354888613861386,
+          "fnr": 0.06451113861386139,
           "fpr": 0.0
         },
         "details": {},
         "rates": {
           "J": {
-            "hi": 0.9354095207305608,
-            "lo": 0.8831159838121997,
-            "point": 0.9095354523227384
+            "hi": 0.9469400803823078,
+            "lo": 0.9241635766307591,
+            "point": 0.9354888613861386
           },
           "fnr": {
-            "hi": 0.11688401618780031,
-            "lo": 0.06459047926943923,
-            "point": 0.09046454767726161
+            "hi": 0.07583642336924089,
+            "lo": 0.053059919617692256,
+            "point": 0.06451113861386139
           },
           "fpr": {
             "hi": 0.0,
@@ -889,19 +889,19 @@
             "point": 1.0
           },
           "precision_prompt_mean": {
-            "hi": 1.0,
-            "lo": 0.97265625,
-            "point": 0.98828125
+            "hi": 0.9837966918945312,
+            "lo": 0.9630355834960938,
+            "point": 0.97412109375
           },
           "prevalence": {
-            "hi": 0.424560546875,
-            "lo": 0.372674560546875,
-            "point": 0.3994140625
+            "hi": 0.40604400634765625,
+            "lo": 0.38107147216796877,
+            "point": 0.39453125
           }
         },
         "realised": {
-          "J": 0.9095354523227384,
-          "fnr": 0.09046454767726161,
+          "J": 0.9354888613861386,
+          "fnr": 0.06451113861386139,
           "fpr": 0.0
         },
         "target_fnr": null,
@@ -911,31 +911,31 @@
       "noise_fn": {
         "abs_fnr_error": 0.0,
         "abs_fpr_error": 0.0,
-        "achieved_fnr": 0.293398533007335,
+        "achieved_fnr": 0.30198019801980197,
         "achieved_fpr": 0.0,
         "channel": {
-          "J": 0.706601466992665,
-          "fnr": 0.293398533007335,
+          "J": 0.698019801980198,
+          "fnr": 0.30198019801980197,
           "fpr": 0.0
         },
         "details": {
-          "answered_wrong": 0.6573170731707317,
+          "answered_wrong": 0.6686491935483871,
           "matched_arm": "fn_behavior",
           "rho0": 0.0,
-          "rho1": 0.293398533007335,
+          "rho1": 0.30198019801980197,
           "seed": 0,
           "support": "all"
         },
         "rates": {
           "J": {
-            "hi": 0.7408116708462213,
-            "lo": 0.6942394603104293,
-            "point": 0.7182151589242054
+            "hi": 0.7163959017163875,
+            "lo": 0.6937618620832585,
+            "point": 0.7049814356435643
           },
           "fnr": {
-            "hi": 0.30576053968957073,
-            "lo": 0.2591883291537786,
-            "point": 0.2817848410757946
+            "hi": 0.30623813791674154,
+            "lo": 0.2836040982836126,
+            "point": 0.29501856435643564
           },
           "fpr": {
             "hi": 0.0,
@@ -948,57 +948,57 @@
             "point": 1.0
           },
           "precision_prompt_mean": {
-            "hi": 0.984503173828125,
-            "lo": 0.936151123046875,
-            "point": 0.963134765625
+            "hi": 0.9701858520507812,
+            "lo": 0.9461807250976563,
+            "point": 0.9580078125
           },
           "prevalence": {
-            "hi": 0.424560546875,
-            "lo": 0.372674560546875,
-            "point": 0.3994140625
+            "hi": 0.40604400634765625,
+            "lo": 0.38107147216796877,
+            "point": 0.39453125
           }
         },
         "realised": {
-          "J": 0.7182151589242054,
-          "fnr": 0.2817848410757946,
+          "J": 0.7049814356435644,
+          "fnr": 0.29501856435643564,
           "fpr": 0.0,
           "key_fields": [
             "pid",
             "k"
           ]
         },
-        "target_fnr": 0.293398533007335,
+        "target_fnr": 0.30198019801980197,
         "target_fpr": 0.0,
         "type": "resampled"
       },
       "noise_fn_form": {
         "abs_fnr_error": 0.0,
         "abs_fpr_error": 0.0,
-        "achieved_fnr": 0.059290953545232276,
+        "achieved_fnr": 0.04099628712871287,
         "achieved_fpr": 0.0,
         "channel": {
-          "J": 0.9407090464547677,
-          "fnr": 0.059290953545232276,
+          "J": 0.9590037128712872,
+          "fnr": 0.04099628712871287,
           "fpr": 0.0
         },
         "details": {
-          "answered_wrong": 0.6573170731707317,
+          "answered_wrong": 0.6686491935483871,
           "matched_arm": "fn_form",
           "rho0": 0.0,
-          "rho1": 0.059290953545232276,
+          "rho1": 0.04099628712871287,
           "seed": 0,
           "support": "all"
         },
         "rates": {
           "J": {
-            "hi": 0.9612656042282567,
-            "lo": 0.9421878454950401,
-            "point": 0.9523227383863081
+            "hi": 0.9632671028686159,
+            "lo": 0.9542468021830466,
+            "point": 0.958694306930693
           },
           "fnr": {
-            "hi": 0.05781215450495994,
-            "lo": 0.03873439577174332,
-            "point": 0.04767726161369193
+            "hi": 0.04575319781695345,
+            "lo": 0.036732897131384036,
+            "point": 0.04130569306930693
           },
           "fpr": {
             "hi": 0.0,
@@ -1011,26 +1011,26 @@
             "point": 1.0
           },
           "precision_prompt_mean": {
-            "hi": 0.99609375,
-            "lo": 0.96875,
-            "point": 0.984619140625
+            "hi": 0.986328125,
+            "lo": 0.96881103515625,
+            "point": 0.9776611328125
           },
           "prevalence": {
-            "hi": 0.424560546875,
-            "lo": 0.372674560546875,
-            "point": 0.3994140625
+            "hi": 0.40604400634765625,
+            "lo": 0.38107147216796877,
+            "point": 0.39453125
           }
         },
         "realised": {
-          "J": 0.9523227383863081,
-          "fnr": 0.04767726161369193,
+          "J": 0.958694306930693,
+          "fnr": 0.04130569306930693,
           "fpr": 0.0,
           "key_fields": [
             "pid",
             "k"
           ]
         },
-        "target_fnr": 0.059290953545232276,
+        "target_fnr": 0.04099628712871287,
         "target_fpr": 0.0,
         "type": "resampled"
       },
@@ -1038,25 +1038,25 @@
         "abs_fnr_error": 0.0,
         "abs_fpr_error": 0.0,
         "achieved_fnr": 0.0,
-        "achieved_fpr": 0.15,
+        "achieved_fpr": 0.15050403225806452,
         "channel": {
-          "J": 0.85,
+          "J": 0.8494959677419355,
           "fnr": 0.0,
-          "fpr": 0.15
+          "fpr": 0.15050403225806452
         },
         "details": {
-          "answered_wrong": 0.6573170731707317,
+          "answered_wrong": 0.6686491935483871,
           "matched_arm": "fp_tolerance",
-          "rho0": 0.2282003710575139,
+          "rho0": 0.22508668777325494,
           "rho1": 0.0,
           "seed": 0,
           "support": "answered"
         },
         "rates": {
           "J": {
-            "hi": 0.8692844822502653,
-            "lo": 0.8393042223714907,
-            "point": 0.8544715447154472
+            "hi": 0.8600976929508959,
+            "lo": 0.8442105967830568,
+            "point": 0.8526209677419355
           },
           "fnr": {
             "hi": 0.0,
@@ -1064,62 +1064,62 @@
             "point": 0.0
           },
           "fpr": {
-            "hi": 0.1606957776285093,
-            "lo": 0.13071551774973464,
-            "point": 0.14552845528455285
+            "hi": 0.1557894032169432,
+            "lo": 0.13990230704910414,
+            "point": 0.1473790322580645
           },
           "precision_pooled": {
-            "hi": 0.8413135728347713,
-            "lo": 0.7984393580993334,
-            "point": 0.8204613841524574
+            "hi": 0.8267737326617783,
+            "lo": 0.8036825383456878,
+            "point": 0.8155437799646732
           },
           "precision_prompt_mean": {
-            "hi": 0.8099416371389028,
-            "lo": 0.7545296971908301,
-            "point": 0.7830257307796371
+            "hi": 0.79022328765798,
+            "lo": 0.7603746046434036,
+            "point": 0.7747291039039086
           },
           "prevalence": {
-            "hi": 0.424560546875,
-            "lo": 0.372674560546875,
-            "point": 0.3994140625
+            "hi": 0.40604400634765625,
+            "lo": 0.38107147216796877,
+            "point": 0.39453125
           }
         },
         "realised": {
-          "J": 0.8544715447154472,
+          "J": 0.8526209677419355,
           "fnr": 0.0,
-          "fpr": 0.14552845528455285,
+          "fpr": 0.1473790322580645,
           "key_fields": [
             "pid",
             "k"
           ]
         },
         "target_fnr": 0.0,
-        "target_fpr": 0.15,
+        "target_fpr": 0.15050403225806452,
         "type": "resampled"
       },
       "noise_fp_trigger": {
         "abs_fnr_error": 0.0,
         "abs_fpr_error": 0.0,
         "achieved_fnr": 0.0,
-        "achieved_fpr": 0.14959349593495935,
+        "achieved_fpr": 0.1473790322580645,
         "channel": {
-          "J": 0.8504065040650406,
+          "J": 0.8526209677419355,
           "fnr": 0.0,
-          "fpr": 0.14959349593495935
+          "fpr": 0.1473790322580645
         },
         "details": {
-          "answered_wrong": 0.6573170731707317,
+          "answered_wrong": 0.6686491935483871,
           "matched_arm": "fp_trigger",
-          "rho0": 0.14959349593495935,
+          "rho0": 0.1473790322580645,
           "rho1": 0.0,
           "seed": 0,
           "support": "all"
         },
         "rates": {
           "J": {
-            "hi": 0.8610959695114909,
-            "lo": 0.8316617515931121,
-            "point": 0.8463414634146341
+            "hi": 0.858473424280059,
+            "lo": 0.844292283963906,
+            "point": 0.8517137096774193
           },
           "fnr": {
             "hi": 0.0,
@@ -1127,37 +1127,37 @@
             "point": 0.0
           },
           "fpr": {
-            "hi": 0.16833824840688796,
-            "lo": 0.13890403048850908,
-            "point": 0.15365853658536585
+            "hi": 0.155707716036094,
+            "lo": 0.141526575719941,
+            "point": 0.14828629032258064
           },
           "precision_pooled": {
-            "hi": 0.8338849995333907,
-            "lo": 0.789469131614654,
-            "point": 0.8123138033763655
+            "hi": 0.8243741091456782,
+            "lo": 0.8034303696219585,
+            "point": 0.8146187775677378
           },
           "precision_prompt_mean": {
-            "hi": 0.8016105780070624,
-            "lo": 0.7455883125121406,
-            "point": 0.7755243454462205
+            "hi": 0.7877010764233054,
+            "lo": 0.7607121036176823,
+            "point": 0.7747811772103764
           },
           "prevalence": {
-            "hi": 0.424560546875,
-            "lo": 0.372674560546875,
-            "point": 0.3994140625
+            "hi": 0.40604400634765625,
+            "lo": 0.38107147216796877,
+            "point": 0.39453125
           }
         },
         "realised": {
-          "J": 0.8463414634146341,
+          "J": 0.8517137096774193,
           "fnr": 0.0,
-          "fpr": 0.15365853658536585,
+          "fpr": 0.14828629032258064,
           "key_fields": [
             "pid",
             "k"
           ]
         },
         "target_fnr": 0.0,
-        "target_fpr": 0.14959349593495935,
+        "target_fpr": 0.1473790322580645,
         "type": "resampled"
       },
       "oracle": {
@@ -1193,14 +1193,14 @@
             "point": 1.0
           },
           "precision_prompt_mean": {
-            "hi": 1.0,
-            "lo": 0.97265625,
-            "point": 0.98828125
+            "hi": 0.9873046875,
+            "lo": 0.970703125,
+            "point": 0.9794921875
           },
           "prevalence": {
-            "hi": 0.424560546875,
-            "lo": 0.372674560546875,
-            "point": 0.3994140625
+            "hi": 0.40604400634765625,
+            "lo": 0.38107147216796877,
+            "point": 0.39453125
           }
         },
         "realised": {
@@ -1214,8 +1214,8 @@
       }
     },
     "n_boot": 500,
-    "n_prompts": 256,
-    "n_rows": 4096,
+    "n_prompts": 1024,
+    "n_rows": 16384,
     "schema": "vfates.calibration/2",
     "seed": 0,
     "targets": {
