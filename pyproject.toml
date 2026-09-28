@@ -29,9 +29,11 @@ dependencies = [
 tasks = ["reasoning-gym>=0.1.19", "sympy>=1.12", "datasets>=2.20"]
 # PyTorch path: hidden-state / LoRA-gradient features and the TRL trainer (MPS or CUDA).
 torch = ["torch>=2.3", "transformers>=4.46", "peft>=0.13", "accelerate>=0.34", "safetensors>=0.4"]
-# Apple-silicon path: MLX generation and the MLX GRPO trainer.
-mlx = ["mlx>=0.26; sys_platform == 'darwin' and platform_machine == 'arm64'",
-       "mlx-lm>=0.28; sys_platform == 'darwin' and platform_machine == 'arm64'",
+# Apple-silicon path: MLX generation and the MLX GRPO trainer. Pinned to the
+# versions the pilots ran on: the backend relies on BatchGenerator internals
+# (insert signature, where log-probabilities are taken) verified on mlx-lm 0.28.3.
+mlx = ["mlx==0.30.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+       "mlx-lm==0.28.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
        "safetensors>=0.4"]
 # Rented-GPU production path (Linux + CUDA).
 gpu = ["trl>=0.25,<0.26", "vllm>=0.8; sys_platform == 'linux'"]

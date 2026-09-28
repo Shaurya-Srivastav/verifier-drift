@@ -294,7 +294,8 @@ class _Even(Verifier):
 
 
 def _tiny_hf():
-    import torch
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("trl")
     from transformers import AutoTokenizer, Qwen2Config, Qwen2ForCausalLM
 
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", local_files_only=True)

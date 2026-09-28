@@ -443,8 +443,10 @@ def _lora_a(model) -> dict[str, np.ndarray]:
 def test_warmup_matches_transformers_schedule() -> None:
     import mlx.core as mx
     import mlx.nn as nn
-    import torch
-    from transformers import get_constant_schedule_with_warmup
+
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    get_constant_schedule_with_warmup = transformers.get_constant_schedule_with_warmup
 
     from vfates.train.mlx_grpo import _make_optimizer, constant_with_warmup_lr
 
