@@ -1,0 +1,275 @@
+{
+  "config": {
+    "backend": "mlx",
+    "gates": {
+      "ifeval_checker_pass_max": 0.95,
+      "ifeval_checker_pass_min": 0.2,
+      "mbpp_fp_share_among_accepted": 0.05
+    },
+    "ifeval": {
+      "generator_kwargs": {
+        "completion_batch_size": 8,
+        "max_sequences_per_call": 16,
+        "prefill_batch_size": 4
+      },
+      "heldout_fraction": 0.33,
+      "local_judge_samples": 0,
+      "max_keyword_density": 0.5,
+      "max_repeat_ratio": 0.4,
+      "max_tokens": 384,
+      "min_content_words": 12,
+      "model": "Qwen/Qwen2.5-1.5B-Instruct",
+      "n_problems": 64,
+      "samples": 8,
+      "temperature": 1.0,
+      "top_p": 1.0
+    },
+    "mbpp": {
+      "generator_kwargs": {
+        "completion_batch_size": 8,
+        "max_sequences_per_call": 16,
+        "prefill_batch_size": 4
+      },
+      "heldout_fraction": 0.33,
+      "max_tokens": 512,
+      "model": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+      "n_problems": 64,
+      "per_test_timeout_s": 4.0,
+      "samples": 8,
+      "temperature": 1.0,
+      "top_p": 1.0,
+      "verifier_k": null,
+      "visible_only": false
+    },
+    "seed": 0
+  },
+  "environment": {
+    "git_commit": "830b6dc25adbfed2d496fa267cb5f93985706d81",
+    "git_dirty": true,
+    "git_head": "830b6dc25adbfed2d496fa267cb5f93985706d81+dirty",
+    "gpu_name": null,
+    "hardware": {
+      "accelerator": "mps",
+      "chip": "Apple M4 Max",
+      "cpu_count": 14,
+      "gpu_name": null,
+      "machine": "arm64",
+      "memory_gb": 36.0,
+      "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+      "python": "3.14.0"
+    },
+    "versions": {
+      "accelerate": "1.12.0",
+      "datasets": "4.4.1",
+      "mlx": "0.30.0",
+      "mlx_lm": "0.28.3",
+      "numpy": "2.3.3",
+      "peft": "0.18.0",
+      "python": "3.14.0",
+      "reasoning_gym": "0.1.25",
+      "safetensors": "0.7.0",
+      "sympy": "1.14.0",
+      "torch": "2.9.0",
+      "transformers": "4.57.1",
+      "trl": "0.25.1",
+      "vfates": "0.1.0",
+      "vllm": null
+    }
+  },
+  "gates": {
+    "complete": true,
+    "ifeval": true,
+    "mbpp": true,
+    "pass": true,
+    "thresholds": {
+      "ifeval_checker_pass_max": 0.95,
+      "ifeval_checker_pass_min": 0.2,
+      "mbpp_fp_share_among_accepted": 0.05
+    }
+  },
+  "ifeval": {
+    "checker_pass_rate": 0.22265625,
+    "completed": true,
+    "domain": "ifeval",
+    "examples": [
+      {
+        "judge_reject": true,
+        "k": 5,
+        "pid": "ifeval/train/00000",
+        "text": "internet protocol version 6 (ipv6) was developed to replace the older internet protocol, ipv4, primarily to address the limitations of ipv4, such as a scarcity of ipv4 addresses and the eventual complete exhaustion of address space. ipv6 was designed to provide a more scalable, flexible, and error-free way to address and network devices on the internet. it allows for a greater number of unique glo"
+      },
+      {
+        "judge_reject": true,
+        "k": 1,
+        "pid": "ifeval/train/00005",
+        "text": "it's not possible to give an exact number, but i can provide some general guidance on how to estimate how many pineapples you can fit into a suitcase.\n\nfirst, consider the dimensions of a pineapple. a medium-sized pineapple can vary in size, but generally measures about 10-15 centimeters in diameter. a quarter-sized pineapple, a common size, measures about 5 centimeters in diameter.\n\nnext, estimat"
+      },
+      {
+        "judge_reject": true,
+        "k": 2,
+        "pid": "ifeval/train/00005",
+        "text": "the number of pineapples that can fit into a suitcase depends on a few factors:\n\n1. **suitcase size:** generally, you can fit about half a dozen pineapples comfortably in a small size (55 liters) suitcase. a medium size (65 liters) suitcase can handle around 10-12 pineapples. large size (75 liters) suitcases can typically fit 15-18 pineapples.\n  \n2. **pineapple size:** the average pineapple is abo"
+      },
+      {
+        "judge_reject": true,
+        "k": 5,
+        "pid": "ifeval/train/00005",
+        "text": "there's no fixed answer to how many pineapples can fit into a suitcase, as this depends on various factors such as suitcase size, pineapple size, shape, weight, and personal preference for packing efficiency. however, a rough estimate can be made with the following assumptions:\n\n- consider a standard suitcase capacity of around 55 liters.\n- assume an average pineapple weight of 1 to 1.5 kilograms "
+      },
+      {
+        "judge_reject": true,
+        "k": 6,
+        "pid": "ifeval/train/00005",
+        "text": "it's impossible to give an exact number without more information about the suitcase dimensions and the size of a pineapple. that being said, let's make some reasonable assumptions:\n- let's assume the suitcase has a width of 45 cm and a length of 60 cm\n- let's assume the size of a pineapple is approximately 30 cm in diameter (this is a rough estimate and can vary greatly depending on the variety)\n-"
+      }
+    ],
+    "fp_concentration_top10": 0.9230769230769231,
+    "fp_share_among_accepted": 0.22807017543859648,
+    "generator": {
+      "adapter_path": null,
+      "backend": "MLXGenerator",
+      "completion_batch_size": 8,
+      "logprobs": false,
+      "max_prompt_tokens": null,
+      "max_sequences_per_call": 16,
+      "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "prefill_batch_size": 4
+    },
+    "judge": {
+      "max_keyword_density": 0.5,
+      "max_repeat_ratio": 0.4,
+      "min_content_words": 12,
+      "name": "heuristic"
+    },
+    "judge_reject_rate_among_checker_passes": 0.22807017543859648,
+    "local_judge": null,
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "n_accepted": 114,
+    "n_errors": 0,
+    "n_fp": 26,
+    "n_problems": 64,
+    "n_rows": 512,
+    "oracle_pass_rate": 0.171875,
+    "pooled": {
+      "fn": 0,
+      "fnr": 0.0,
+      "fp": 26,
+      "fp_mass": 0.05078125,
+      "fp_share_among_accepted": 0.22807017543859648,
+      "fpr": 0.06132075471698113,
+      "j": 0.9386792452830188,
+      "n": 512,
+      "precision": 0.7719298245614035,
+      "tn": 398,
+      "tp": 88
+    },
+    "prompt_averaged": {
+      "fnr": 0.0,
+      "fp_mass": 0.05078125,
+      "fp_share_among_accepted": 0.2999482401656315,
+      "fpr": 0.07162698412698412,
+      "j": 0.7968253968253969,
+      "n_prompts": 64,
+      "precision": 0.7000517598343684
+    },
+    "verifier": {
+      "kind": "natural",
+      "name": "ifeval_checker",
+      "stochastic": false,
+      "type": "ifeval_checker"
+    }
+  },
+  "mbpp": {
+    "checker_pass_rate": 0.58203125,
+    "code_block_rate": 0.998046875,
+    "completed": true,
+    "domain": "mbpp_plus",
+    "examples": [
+      {
+        "k": 1,
+        "pid": "mbpp_plus/train/Mbpp/6",
+        "suspect": false,
+        "text": "To solve this problem, we need to check if two numbers differ in exactly one bit position. Here's a step-by-step approach to achieve this:\n\n1. Convert both numbers to their binar representations.\n2. Remove the '0b' prefix from the binar representations.\n3. Pad the shorter binary representation with zeros on the left to match the length of the longer binary representation.\n4. Compare the two binary"
+      },
+      {
+        "k": 4,
+        "pid": "mbpp_plus/train/Mbpp/6",
+        "suspect": false,
+        "text": "```python\ndef differ_At_One_Bit_Pos(a, b):\n    cnt = 0\n    while a or b:\n        if a & 1 != b & 1:\n            cnt += 1\n        a >>= 1\n        b >>= 1\n    return cnt == 1\n\n\nassert differ_At_One_Bit_Pos(13,9) == True\n```"
+      },
+      {
+        "k": 5,
+        "pid": "mbpp_plus/train/Mbpp/6",
+        "suspect": false,
+        "text": "Certainly! Below is the complete Python solution for the problem of checking whether two numbers differ at exactly one bit position.\n\n```python\ndef differ_At_One_Bit_Pos(num1, num2):\n    # XOR the two numbers\n    xor_result = num1 ^ num2\n    \n    # Count the number of set bits in the XOR result\n    count_one = xor_result.bit_count()\n    \n    # Check if there is exactly one set bit\n    return count"
+      },
+      {
+        "k": 6,
+        "pid": "mbpp_plus/train/Mbpp/6",
+        "suspect": false,
+        "text": "```python\ndef differ_At_One_Bit_Pos(a, b):\n    \"\"\"\n    Function to check if two numbers differ at exactly one bit position.\n    \n    :param int a: First number\n    :param int b: Second number\n    :return: True if the numbers differ at exactly one bit position, False otherwise\n    \"\"\"\n    xor_result = a ^ b  # XOR operation of both numbers gives a number with bits set at those positions where the b"
+      },
+      {
+        "k": 7,
+        "pid": "mbpp_plus/train/Mbpp/6",
+        "suspect": false,
+        "text": "Certainly! Below is the complete Python code for the function `differ_At_One_Bit_Pos` that checks whether the two numbers differ at exactly one bit position.\n\n```python\ndef differ_At_One_Bit_Pos(num1, num2):\n    # XOR the two numbers\n    xor_result = num1 ^ num2\n    \n    # Count the number of set bits in the XOR result\n    count_set_bits = bin(xor_result).count('1')\n    \n    # Return True if there"
+      }
+    ],
+    "fp_concentration_top10": 0.6521739130434783,
+    "fp_share_among_accepted": 0.15436241610738255,
+    "generator": {
+      "adapter_path": null,
+      "backend": "MLXGenerator",
+      "completion_batch_size": 8,
+      "logprobs": false,
+      "max_prompt_tokens": null,
+      "max_sequences_per_call": 16,
+      "model_id": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+      "prefill_batch_size": 4
+    },
+    "mean_code_length": 379.205078125,
+    "model": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+    "n_accepted": 298,
+    "n_errors": 0,
+    "n_fp": 46,
+    "n_problems": 64,
+    "n_rows": 512,
+    "oracle_pass_rate": 0.4921875,
+    "parsed_rate": 1.0,
+    "pooled": {
+      "fn": 0,
+      "fnr": 0.0,
+      "fp": 46,
+      "fp_mass": 0.08984375,
+      "fp_share_among_accepted": 0.15436241610738255,
+      "fpr": 0.17692307692307693,
+      "j": 0.823076923076923,
+      "n": 512,
+      "precision": 0.8456375838926175,
+      "tn": 214,
+      "tp": 252
+    },
+    "prompt_averaged": {
+      "fnr": 0.0,
+      "fp_mass": 0.08984375,
+      "fp_share_among_accepted": 0.23690476190476192,
+      "fpr": 0.18835714285714286,
+      "j": 0.8189732142857143,
+      "n_prompts": 64,
+      "precision": 0.7630952380952382
+    },
+    "special_casing_rate_among_fps": 0.0,
+    "verifier": {
+      "k": null,
+      "kind": "natural",
+      "name": "mbpp_base_tests",
+      "stochastic": false,
+      "type": "mbpp_base_tests",
+      "visible_only": false
+    }
+  },
+  "ok": true,
+  "pilot": "p6_natural",
+  "summary": "PASS"
+}

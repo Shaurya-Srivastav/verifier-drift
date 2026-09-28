@@ -685,6 +685,7 @@ def extract_features(
                 **options,
             )
             ln = np.array([c.n_tokens for c in completions[lo:hi]], dtype=np.int64)
+            _release_accelerators()
         atomic_npz(
             path,
             features=np.asarray(f, dtype=np.float32),

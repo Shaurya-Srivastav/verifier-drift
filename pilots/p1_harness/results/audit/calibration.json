@@ -1,0 +1,352 @@
+{
+  "arms": {
+    "fn_prompt_subset": {
+      "fraction": 0.42863027557400374,
+      "kind": "fn",
+      "name": "fn_prompt_subset",
+      "salt": "chain_sum/fn_prompt_subset",
+      "stochastic": false,
+      "type": "prompt_subset_fn"
+    },
+    "fp_hash": {
+      "kind": "fp",
+      "name": "fp_hash",
+      "salt": "chain_sum/fp_hash",
+      "stochastic": false,
+      "threshold": 0.6315482442622466,
+      "type": "hash_fp"
+    },
+    "fp_tolerance": {
+      "abs_tol": "10.00",
+      "kind": "fp",
+      "name": "fp_tolerance",
+      "stochastic": false,
+      "type": "tolerance_fp"
+    },
+    "noise_fp": {
+      "kind": "noise",
+      "name": "noise_fp",
+      "rho0": 0.15151515151515152,
+      "rho1": 0.0,
+      "seed": 0,
+      "stochastic": true,
+      "support": "all",
+      "type": "resampled"
+    },
+    "oracle": {
+      "kind": "oracle",
+      "name": "oracle",
+      "stochastic": false,
+      "type": "oracle"
+    }
+  },
+  "report": {
+    "arms": {
+      "fn_prompt_subset": {
+        "abs_fnr_error": 0.033333333333333326,
+        "abs_fpr_error": null,
+        "achieved_fnr": 0.26666666666666666,
+        "achieved_fpr": 0.0,
+        "channel": {
+          "J": 0.7333333333333334,
+          "fnr": 0.26666666666666666,
+          "fpr": 0.0
+        },
+        "details": {
+          "achieved_fnr": 0.26666666666666666,
+          "fraction": 0.42863027557400374,
+          "n_correct": 30,
+          "n_prompts": 24,
+          "n_prompts_selected": 5,
+          "n_rejected": 8,
+          "salt": "chain_sum/fn_prompt_subset",
+          "target_fnr": 0.3
+        },
+        "rates": {
+          "J": {
+            "hi": 0.9383403361344538,
+            "lo": 0.46602564102564104,
+            "point": 0.7333333333333333
+          },
+          "fnr": {
+            "hi": 0.533974358974359,
+            "lo": 0.06165966386554622,
+            "point": 0.26666666666666666
+          },
+          "fpr": {
+            "hi": 0.0,
+            "lo": 0.0,
+            "point": 0.0
+          },
+          "precision_pooled": {
+            "hi": 1.0,
+            "lo": 1.0,
+            "point": 1.0
+          },
+          "precision_prompt_mean": {
+            "hi": 0.7557291666666666,
+            "lo": 0.4213541666666667,
+            "point": 0.5833333333333334
+          },
+          "prevalence": {
+            "hi": 0.4223958333333333,
+            "lo": 0.20260416666666667,
+            "point": 0.3125
+          }
+        },
+        "realised": {
+          "J": 0.7333333333333334,
+          "fnr": 0.26666666666666666,
+          "fpr": 0.0
+        },
+        "target_fnr": 0.3,
+        "target_fpr": null,
+        "type": "prompt_subset_fn"
+      },
+      "fp_hash": {
+        "abs_fnr_error": null,
+        "abs_fpr_error": 0.001515151515151525,
+        "achieved_fnr": 0.0,
+        "achieved_fpr": 0.15151515151515152,
+        "channel": {
+          "J": 0.8484848484848485,
+          "fnr": 0.0,
+          "fpr": 0.15151515151515152
+        },
+        "details": {
+          "achieved_fpr": 0.15151515151515152,
+          "n_accepted": 10,
+          "n_answered_wrong": 14,
+          "n_clusters": 14,
+          "n_wrong": 66,
+          "salt": "chain_sum/fp_hash",
+          "target_fpr": 0.15,
+          "threshold": 0.6315482442622466
+        },
+        "rates": {
+          "J": {
+            "hi": 0.8935722610722611,
+            "lo": 0.7549907456372289,
+            "point": 0.8484848484848485
+          },
+          "fnr": {
+            "hi": 0.0,
+            "lo": 0.0,
+            "point": 0.0
+          },
+          "fpr": {
+            "hi": 0.24500925436277102,
+            "lo": 0.10642773892773894,
+            "point": 0.15151515151515152
+          },
+          "precision_pooled": {
+            "hi": 0.873248106060606,
+            "lo": 0.580205773955774,
+            "point": 0.75
+          },
+          "precision_prompt_mean": {
+            "hi": 0.7831597222222222,
+            "lo": 0.38055555555555554,
+            "point": 0.6006944444444444
+          },
+          "prevalence": {
+            "hi": 0.4223958333333333,
+            "lo": 0.20260416666666667,
+            "point": 0.3125
+          }
+        },
+        "realised": {
+          "J": 0.8484848484848485,
+          "fnr": 0.0,
+          "fpr": 0.15151515151515152
+        },
+        "target_fnr": null,
+        "target_fpr": 0.15,
+        "type": "hash_fp"
+      },
+      "fp_tolerance": {
+        "abs_fnr_error": null,
+        "abs_fpr_error": 0.001515151515151525,
+        "achieved_fnr": 0.0,
+        "achieved_fpr": 0.15151515151515152,
+        "channel": {
+          "J": 0.8484848484848485,
+          "fnr": 0.0,
+          "fpr": 0.15151515151515152
+        },
+        "details": {
+          "abs_tol": "10.00",
+          "achieved_fpr": 0.15151515151515152,
+          "n_accepted": 10,
+          "n_parsable_wrong": 14,
+          "n_wrong": 66,
+          "target_fpr": 0.15
+        },
+        "rates": {
+          "J": {
+            "hi": 0.906826923076923,
+            "lo": 0.7721529175050302,
+            "point": 0.8484848484848485
+          },
+          "fnr": {
+            "hi": 0.0,
+            "lo": 0.0,
+            "point": 0.0
+          },
+          "fpr": {
+            "hi": 0.22784708249496982,
+            "lo": 0.09317307692307693,
+            "point": 0.15151515151515152
+          },
+          "precision_pooled": {
+            "hi": 0.840218058968059,
+            "lo": 0.6077308362369338,
+            "point": 0.75
+          },
+          "precision_prompt_mean": {
+            "hi": 0.8062499999999999,
+            "lo": 0.4009548611111111,
+            "point": 0.6215277777777778
+          },
+          "prevalence": {
+            "hi": 0.4223958333333333,
+            "lo": 0.20260416666666667,
+            "point": 0.3125
+          }
+        },
+        "realised": {
+          "J": 0.8484848484848485,
+          "fnr": 0.0,
+          "fpr": 0.15151515151515152
+        },
+        "target_fnr": null,
+        "target_fpr": 0.15,
+        "type": "tolerance_fp"
+      },
+      "noise_fp": {
+        "abs_fnr_error": 0.0,
+        "abs_fpr_error": 0.0,
+        "achieved_fnr": 0.0,
+        "achieved_fpr": 0.15151515151515152,
+        "channel": {
+          "J": 0.8484848484848485,
+          "fnr": 0.0,
+          "fpr": 0.15151515151515152
+        },
+        "details": {
+          "answered_wrong": 0.21212121212121213,
+          "matched_arm": "fp_tolerance",
+          "rho0": 0.15151515151515152,
+          "rho1": 0.0,
+          "seed": 0,
+          "support": "all"
+        },
+        "rates": {
+          "J": {
+            "hi": 0.9310939907550076,
+            "lo": 0.7711580086580087,
+            "point": 0.8636363636363636
+          },
+          "fnr": {
+            "hi": 0.0,
+            "lo": 0.0,
+            "point": 0.0
+          },
+          "fpr": {
+            "hi": 0.22884199134199126,
+            "lo": 0.0689060092449923,
+            "point": 0.13636363636363635
+          },
+          "precision_pooled": {
+            "hi": 0.9000659195781147,
+            "lo": 0.62078173374613,
+            "point": 0.7692307692307693
+          },
+          "precision_prompt_mean": {
+            "hi": 0.8645833333333334,
+            "lo": 0.5050347222222222,
+            "point": 0.6701388888888888
+          },
+          "prevalence": {
+            "hi": 0.4223958333333333,
+            "lo": 0.20260416666666667,
+            "point": 0.3125
+          }
+        },
+        "realised": {
+          "J": 0.8636363636363636,
+          "fnr": 0.0,
+          "fpr": 0.13636363636363635,
+          "key_fields": [
+            "pid",
+            "k"
+          ]
+        },
+        "target_fnr": 0.0,
+        "target_fpr": 0.15151515151515152,
+        "type": "resampled"
+      },
+      "oracle": {
+        "abs_fnr_error": null,
+        "abs_fpr_error": null,
+        "achieved_fnr": 0.0,
+        "achieved_fpr": 0.0,
+        "channel": {
+          "J": 1.0,
+          "fnr": 0.0,
+          "fpr": 0.0
+        },
+        "details": {},
+        "rates": {
+          "J": {
+            "hi": 1.0,
+            "lo": 1.0,
+            "point": 1.0
+          },
+          "fnr": {
+            "hi": 0.0,
+            "lo": 0.0,
+            "point": 0.0
+          },
+          "fpr": {
+            "hi": 0.0,
+            "lo": 0.0,
+            "point": 0.0
+          },
+          "precision_pooled": {
+            "hi": 1.0,
+            "lo": 1.0,
+            "point": 1.0
+          },
+          "precision_prompt_mean": {
+            "hi": 0.9166666666666666,
+            "lo": 0.5416666666666666,
+            "point": 0.7083333333333334
+          },
+          "prevalence": {
+            "hi": 0.4223958333333333,
+            "lo": 0.20260416666666667,
+            "point": 0.3125
+          }
+        },
+        "realised": {
+          "J": 1.0,
+          "fnr": 0.0,
+          "fpr": 0.0
+        },
+        "target_fnr": null,
+        "target_fpr": null,
+        "type": "oracle"
+      }
+    },
+    "n_boot": 50,
+    "n_prompts": 24,
+    "n_rows": 96,
+    "schema": "vfates.calibration/2",
+    "seed": 0,
+    "targets": {
+      "fnr": 0.3,
+      "fpr": 0.15
+    }
+  }
+}

@@ -14,7 +14,20 @@ audit:
     model_id: Qwen/Qwen2.5-0.5B-Instruct
     kwargs: {dtype: float32, batch_size: 16}
   sampling: {n: 4, max_tokens: 96, temperature: 1.0, seed: 0, chunk_prompts: 8}
-  arms: {file: configs/arms/chain_sum.yaml, n_boot: 20, seed: 0}
+  # P1's toy arm list, one per calibration family that 32 completions can fit.
+  # The full arm file needs a real-size audit: the decoy needs parsable wrong
+  # answers and the phrase arms need a fit and a validation split. The full gate
+  # below calibrates the whole file.
+  arms:
+    targets: {fpr: 0.15, fnr: 0.30}
+    n_boot: 20
+    seed: 0
+    arms:
+      - {name: oracle, type: oracle}
+      - {name: fp_hash, type: hash_fp, salt: chain_sum/fp_hash}
+      - {name: fp_tolerance, type: tolerance_fp}
+      - {name: noise_fp, type: resampled, match: fp_tolerance, seed: 0}
+      - {name: fn_prompt_subset, type: prompt_subset_fn, salt: chain_sum/fn_prompt_subset}
   features: {kind: lora_grad, model_id: Qwen/Qwen2.5-0.5B-Instruct, sketch_dim: 256,
              load: {dtype: float32}}
   forecast: {n_boot: 10, reliability_splits: 4, loss_agg: seq_mean}

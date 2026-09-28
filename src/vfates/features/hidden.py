@@ -8,6 +8,11 @@ is the residual stream after the final RMSNorm (``Qwen2Model.norm`` /
 linear head's per-token gradient is an affine function of this vector, so a
 pool of it is an exact feature for a linear head and a proxy for LoRA.
 
+The forward runs the decoder backbone (``model.base_model``) and reads its
+``last_hidden_state``, the same tensor, without the vocabulary projection or
+the per-layer states. At 151,936 vocabulary entries the float32 logits of one
+batch are gigabytes that the pool never reads.
+
 Pooling uses the hidden states that predict the completion tokens: the state
 at position ``t - 1`` predicts the token at ``t``, the same shift as the LoRA
 log-probability. Left and right padding are both accepted
@@ -212,6 +217,7 @@ def hidden_features(
     saw_memory = False
     was_training = model.training
     model.eval()
+    backbone = getattr(model, "base_model", model)
     try:
         with torch.inference_mode():
             for start in range(0, len(encoded), batch_size):
@@ -222,18 +228,16 @@ def hidden_features(
                 input_ids = input_ids.to(param_device)
                 attention_mask = attention_mask.to(param_device)
                 position_ids = _position_ids(attention_mask)
-                outputs = model(
+                outputs = backbone(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    output_hidden_states=True,
                     use_cache=False,
                 )
-                hidden = outputs.hidden_states
-                if not hidden:
-                    raise RuntimeError("model returned no hidden states")
-                # Last entry is post-final-norm; see the module docstring.
-                final = hidden[-1]
+                # Post-final-norm; see the module docstring.
+                final = getattr(outputs, "last_hidden_state", None)
+                if final is None:
+                    raise RuntimeError("model backbone returned no last_hidden_state")
                 memory = _memory_bytes(param_device)
                 if memory is not None:
                     saw_memory = True
@@ -254,7 +258,9 @@ def hidden_features(
                     span = final[row, pred_lo:pred_hi]
                     pooled = span[-1] if pooling == "last" else span.mean(dim=0)
                     features[start + row] = pooled.float().cpu().numpy()
-                del outputs, final, hidden
+                del outputs, final
+                # Batch widths vary, so cached blocks rarely fit the next batch.
+                _release_memory(param_device)
     finally:
         model.train(was_training)
     hidden_features.peak_memory = (  # type: ignore[attr-defined]

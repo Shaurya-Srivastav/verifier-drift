@@ -1,7 +1,7 @@
 """Command line: ``vfates {env,audit,train,score,study,pilot}``.
 
 ``vfates audit --config configs/experiments/e1_chain_sum.yaml --out runs/e1/audit``
-``vfates train --audit runs/e1/audit --arm fp_tolerance --config configs/train/mlx_pilot.yaml --out runs/e1/fp_tolerance``
+``vfates train --audit runs/e1/audit --arm fp_tolerance --config configs/train/trl_h100.yaml --backend trl --out runs/e1/fp_tolerance``
 ``vfates score --lock runs/e1/audit/lock.json --run oracle=runs/e1/oracle --run fp_tolerance=runs/e1/fp_tolerance``
 ``vfates study --config configs/experiments/e1_chain_sum.yaml --out runs/e1``
 ``vfates pilot p2 --set sampling.n=4``

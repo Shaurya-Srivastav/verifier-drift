@@ -1,0 +1,991 @@
+{
+  "artifacts": {
+    "arms_file": "e1bb9a235e7a448f2a8b197321e00e39d0b9940094c0d644478a96261d3d51d2",
+    "calibration": "f70f2844d503c99e285f24459ac101ea6995b8c6f6bbc15e278b67b0ba0c3363",
+    "completions": "4c41047e43f807bc007ef5109dad3e39ef0ee0dae415b4199a87f9ec13f89fab",
+    "features": "5bd5f504f5e080fcbeb857565187284eff627e3622ae715d16e14069a54ea5fb",
+    "grades": "40d5b3cd26075de11b13649a9ce53d4b6e7a49660a63dc4e5de8f55d0c3d5af7",
+    "lora_init": "9d3416cc3ef69aa4fab204b6f1ee5a82a58b5af118ca3ba09f23b0ee4653106e",
+    "problems": "3b49ef1ab8c5d9f7531d0ab2f5e1fd96b9e96f9087a15f16a4f7503ec92b92a7"
+  },
+  "config": {
+    "arms": {
+      "file": "configs/arms/chain_sum.yaml",
+      "n_boot": 500,
+      "seed": 0
+    },
+    "features": {
+      "kind": "lora_grad",
+      "load": {
+        "dtype": "float32"
+      },
+      "lora_alpha": 32,
+      "lora_r": 16,
+      "lora_seed": 0,
+      "model_id": "Qwen/Qwen2.5-0.5B-Instruct",
+      "sketch_dim": 8192,
+      "sketch_seed": 0
+    },
+    "forecast": {
+      "loss_agg": "seq_mean",
+      "n_boot": 500,
+      "reliability_splits": 20,
+      "seed": 0
+    },
+    "generator": {
+      "backend": "mlx",
+      "kwargs": {
+        "completion_batch_size": 128,
+        "prefill_batch_size": 16
+      },
+      "model_id": "Qwen/Qwen2.5-0.5B-Instruct"
+    },
+    "lock": true,
+    "pools": {
+      "heldout": 128,
+      "seed": 0,
+      "train": 256
+    },
+    "sampling": {
+      "chunk_prompts": 128,
+      "max_tokens": 512,
+      "n": 16,
+      "seed": 0,
+      "temperature": 1.0,
+      "top_p": 1.0
+    },
+    "task": {
+      "max_decimal_places": 2,
+      "max_digits": 3,
+      "max_terms": 3,
+      "min_decimal_places": 1,
+      "min_digits": 1,
+      "min_terms": 2,
+      "type": "chain_sum"
+    }
+  },
+  "created_utc": "2026-09-28T10:14:48Z",
+  "env": {
+    "git_commit": "830b6dc25adbfed2d496fa267cb5f93985706d81",
+    "git_dirty": true,
+    "git_head": "830b6dc25adbfed2d496fa267cb5f93985706d81+dirty",
+    "gpu_name": null,
+    "hardware": {
+      "accelerator": "mps",
+      "chip": "Apple M4 Max",
+      "cpu_count": 14,
+      "gpu_name": null,
+      "machine": "arm64",
+      "memory_gb": 36.0,
+      "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+      "python": "3.14.0"
+    },
+    "versions": {
+      "accelerate": "1.12.0",
+      "datasets": "4.4.1",
+      "mlx": "0.30.0",
+      "mlx_lm": "0.28.3",
+      "numpy": "2.3.3",
+      "peft": "0.18.0",
+      "python": "3.14.0",
+      "reasoning_gym": "0.1.25",
+      "safetensors": "0.7.0",
+      "sympy": "1.14.0",
+      "torch": "2.9.0",
+      "transformers": "4.57.1",
+      "trl": "0.25.1",
+      "vfates": "0.1.0",
+      "vllm": null
+    }
+  },
+  "note": "Step-0 forecasts locked before any training run.",
+  "payload": {
+    "combo_fnform_fphash": {
+      "behaviour_alignment": null,
+      "behaviour_frequency": null,
+      "conditional_advantage": null,
+      "length_divided": true,
+      "mean_precision": 0.7808841874271562,
+      "modal_precision": {
+        "n_prompts": 256,
+        "n_prompts_no_accept": 1,
+        "tie_fraction": 0.05078125,
+        "value": 0.9366536458333333
+      },
+      "probe_heldout_auc": {
+        "fn": 0.6527928818586258,
+        "fp": 0.5569638694638694
+      },
+      "step0": {
+        "J": 0.7907090464547677,
+        "accept_rate": 0.4658203125,
+        "f1": 0.8685101580135439,
+        "fnr": 0.059290953545232276,
+        "for_prompt_mean": 0.032548213505244755,
+        "fp_mass": 0.090087890625,
+        "fpr": 0.15,
+        "n": 4096,
+        "n_prompts": 256,
+        "precision_pooled": 0.8066037735849056,
+        "precision_prompt_mean": 0.7808841874271562,
+        "prevalence": 0.3994140625,
+        "tnr": 0.85,
+        "tpr": 0.9407090464547677,
+        "verifier_accuracy": 0.88623046875
+      },
+      "transfer": {
+        "base_acc_heldout": 0.390625,
+        "cos_gV_gO": 0.9407743902618547,
+        "coverage": 0.9765625,
+        "extras": {},
+        "norm_gO": 0.04490463293579681,
+        "norm_gV": 0.04549222888679833,
+        "oracle_tau_hard": 0.59375,
+        "reliability": 0.7130396913648903,
+        "slope": 0.14397402911253465,
+        "tau_hard": 0.5234375,
+        "tau_pool": 0.546875,
+        "tau_pool_ci": [
+          0.359375,
+          0.65625
+        ],
+        "tau_pool_curve": {
+          "1/16": 0.5078125,
+          "1/32": 0.546875,
+          "1/64": 0.5625,
+          "1/8": 0.52734375
+        },
+        "tau_pool_std": 0.5625,
+        "tau_rel": 0.881578947368421,
+        "tau_soft": {
+          "0.5": 0.4519769349513643,
+          "1": 0.4928346473083131,
+          "2": 0.5314556109005552,
+          "4": 0.5447115704889869,
+          "8": 0.5403375721882846
+        }
+      }
+    },
+    "fn_behavior": {
+      "behaviour_alignment": -0.0106201171875,
+      "behaviour_frequency": 0.26123046875,
+      "conditional_advantage": 0.04065420560747664,
+      "length_divided": true,
+      "mean_precision": 0.970703125,
+      "modal_precision": {
+        "n_prompts": 256,
+        "n_prompts_no_accept": 8,
+        "tie_fraction": 0.0,
+        "value": 0.970703125
+      },
+      "probe_heldout_auc": 0.9249410074894839,
+      "step0": {
+        "J": 0.706601466992665,
+        "accept_rate": 0.2822265625,
+        "f1": 0.828080229226361,
+        "fnr": 0.293398533007335,
+        "for_prompt_mean": 0.1793751604298479,
+        "fp_mass": 0.0,
+        "fpr": 0.0,
+        "n": 4096,
+        "n_prompts": 256,
+        "precision_pooled": 1.0,
+        "precision_prompt_mean": 0.970703125,
+        "prevalence": 0.3994140625,
+        "tnr": 1.0,
+        "tpr": 0.706601466992665,
+        "verifier_accuracy": 0.8828125
+      },
+      "transfer": {
+        "base_acc_heldout": 0.390625,
+        "cos_gV_gO": 0.42748106245616213,
+        "coverage": 0.9765625,
+        "extras": {},
+        "norm_gO": 0.04490463293579681,
+        "norm_gV": 0.04793407018530792,
+        "oracle_tau_hard": 0.59375,
+        "reliability": 0.7955691499450338,
+        "slope": 0.061245908739695765,
+        "tau_hard": 0.4765625,
+        "tau_pool": 0.46875,
+        "tau_pool_ci": [
+          0.34375,
+          0.625
+        ],
+        "tau_pool_curve": {
+          "1/16": 0.5,
+          "1/32": 0.46875,
+          "1/64": 0.5,
+          "1/8": 0.515625
+        },
+        "tau_pool_std": 0.46875,
+        "tau_rel": 0.8026315789473685,
+        "tau_soft": {
+          "0.5": 0.4193208106916725,
+          "1": 0.441206037697635,
+          "2": 0.46494104593529817,
+          "4": 0.4810571597747619,
+          "8": 0.48093256102632104
+        }
+      }
+    },
+    "fn_form": {
+      "behaviour_alignment": 0.026214599609375,
+      "behaviour_frequency": 0.140380859375,
+      "conditional_advantage": -0.1867391304347826,
+      "length_divided": true,
+      "mean_precision": 0.98828125,
+      "modal_precision": {
+        "n_prompts": 256,
+        "n_prompts_no_accept": 3,
+        "tie_fraction": 0.0,
+        "value": 0.98828125
+      },
+      "probe_heldout_auc": 0.6527928818586258,
+      "step0": {
+        "J": 0.9407090464547677,
+        "accept_rate": 0.375732421875,
+        "f1": 0.9694488188976379,
+        "fnr": 0.059290953545232276,
+        "for_prompt_mean": 0.030746271957209456,
+        "fp_mass": 0.0,
+        "fpr": 0.0,
+        "n": 4096,
+        "n_prompts": 256,
+        "precision_pooled": 1.0,
+        "precision_prompt_mean": 0.98828125,
+        "prevalence": 0.3994140625,
+        "tnr": 1.0,
+        "tpr": 0.9407090464547677,
+        "verifier_accuracy": 0.976318359375
+      },
+      "transfer": {
+        "base_acc_heldout": 0.390625,
+        "cos_gV_gO": 0.9921365359968978,
+        "coverage": 0.9765625,
+        "extras": {},
+        "norm_gO": 0.04490463293579681,
+        "norm_gV": 0.04359532058340396,
+        "oracle_tau_hard": 0.59375,
+        "reliability": 0.7092972171222625,
+        "slope": 0.13787895254628246,
+        "tau_hard": 0.5703125,
+        "tau_pool": 0.53125,
+        "tau_pool_ci": [
+          0.390625,
+          0.6875
+        ],
+        "tau_pool_curve": {
+          "1/16": 0.546875,
+          "1/32": 0.53125,
+          "1/64": 0.53125,
+          "1/8": 0.578125
+        },
+        "tau_pool_std": 0.546875,
+        "tau_rel": 0.9605263157894737,
+        "tau_soft": {
+          "0.5": 0.452059414357735,
+          "1": 0.4978695161743988,
+          "2": 0.5509921574077468,
+          "4": 0.5816230428028232,
+          "8": 0.5844080174392848
+        }
+      }
+    },
+    "fn_prompt_subset": {
+      "behaviour_alignment": -0.0,
+      "behaviour_frequency": 0.3046875,
+      "conditional_advantage": 0.0,
+      "length_divided": true,
+      "mean_precision": 0.80712890625,
+      "modal_precision": {
+        "n_prompts": 256,
+        "n_prompts_no_accept": 80,
+        "tie_fraction": 0.0,
+        "value": 0.80712890625
+      },
+      "probe_heldout_auc": 0.5771609763616545,
+      "step0": {
+        "J": 0.7004889975550123,
+        "accept_rate": 0.27978515625,
+        "f1": 0.8238677210639828,
+        "fnr": 0.2995110024449878,
+        "for_prompt_mean": 0.11962890625,
+        "fp_mass": 0.0,
+        "fpr": 0.0,
+        "n": 4096,
+        "n_prompts": 256,
+        "precision_pooled": 1.0,
+        "precision_prompt_mean": 0.80712890625,
+        "prevalence": 0.3994140625,
+        "tnr": 1.0,
+        "tpr": 0.7004889975550123,
+        "verifier_accuracy": 0.88037109375
+      },
+      "transfer": {
+        "base_acc_heldout": 0.390625,
+        "cos_gV_gO": 0.9579693501181091,
+        "coverage": 0.9765625,
+        "extras": {},
+        "norm_gO": 0.04490463293579681,
+        "norm_gV": 0.032845715230600495,
+        "oracle_tau_hard": 0.59375,
+        "reliability": 0.671889320644006,
+        "slope": 0.13104052645714817,
+        "tau_hard": 0.578125,
+        "tau_pool": 0.53125,
+        "tau_pool_ci": [
+          0.40625,
+          0.6875
+        ],
+        "tau_pool_curve": {
+          "1/16": 0.5546875,
+          "1/32": 0.53125,
+          "1/64": 0.625,
+          "1/8": 0.5703125
+        },
+        "tau_pool_std": 0.546875,
+        "tau_rel": 0.9736842105263158,
+        "tau_soft": {
+          "0.5": 0.4497590460737637,
+          "1": 0.4950218724238164,
+          "2": 0.5487492546821573,
+          "4": 0.580685069369882,
+          "8": 0.5860617258152039
+        }
+      }
+    },
+    "fp_hash": {
+      "behaviour_alignment": 0.0151824951171875,
+      "behaviour_frequency": 0.174072265625,
+      "conditional_advantage": 0.0872194950911641,
+      "length_divided": true,
+      "mean_precision": 0.7871933296737984,
+      "modal_precision": {
+        "n_prompts": 256,
+        "n_prompts_no_accept": 1,
+        "tie_fraction": 0.04296875,
+        "value": 0.9457682291666667
+      },
+      "probe_heldout_auc": 0.5569638694638694,
+      "step0": {
+        "J": 0.85,
+        "accept_rate": 0.489501953125,
+        "f1": 0.8986542158747597,
+        "fnr": 0.0,
+        "for_prompt_mean": 0.0,
+        "fp_mass": 0.090087890625,
+        "fpr": 0.15,
+        "n": 4096,
+        "n_prompts": 256,
+        "precision_pooled": 0.8159600997506234,
+        "precision_prompt_mean": 0.7871933296737984,
+        "prevalence": 0.3994140625,
+        "tnr": 0.85,
+        "tpr": 1.0,
+        "verifier_accuracy": 0.909912109375
+      },
+      "transfer": {
+        "base_acc_heldout": 0.390625,
+        "cos_gV_gO": 0.9532538173037154,
+        "coverage": 0.9765625,
+        "extras": {},
+        "norm_gO": 0.04490463293579681,
+        "norm_gV": 0.046629812199296336,
+        "oracle_tau_hard": 0.59375,
+        "reliability": 0.722532671660185,
+        "slope": 0.1453298565650637,
+        "tau_hard": 0.5234375,
+        "tau_pool": 0.515625,
+        "tau_pool_ci": [
+          0.359375,
+          0.6644531249999996
+        ],
+        "tau_pool_curve": {
+          "1/16": 0.5078125,
+          "1/32": 0.515625,
+          "1/64": 0.5,
+          "1/8": 0.54296875
+        },
+        "tau_pool_std": 0.515625,
+        "tau_rel": 0.881578947368421,
+        "tau_soft": {
+          "0.5": 0.45314756764669073,
+          "1": 0.49554400250457314,
+          "2": 0.536253371817645,
+          "4": 0.5491520028117096,
+          "8": 0.5404512498308219
+        }
+      }
+    },
+    "fp_tolerance": {
+      "behaviour_alignment": 0.1722259521484375,
+      "behaviour_frequency": 0.489501953125,
+      "conditional_advantage": 0.35183915211970074,
+      "length_divided": true,
+      "mean_precision": 0.801229911581474,
+      "modal_precision": {
+        "n_prompts": 256,
+        "n_prompts_no_accept": 1,
+        "tie_fraction": 0.02734375,
+        "value": 0.9313151041666667
+      },
+      "probe_heldout_auc": 0.5730667547918044,
+      "step0": {
+        "J": 0.85,
+        "accept_rate": 0.489501953125,
+        "f1": 0.8986542158747597,
+        "fnr": 0.0,
+        "for_prompt_mean": 0.0,
+        "fp_mass": 0.090087890625,
+        "fpr": 0.15,
+        "n": 4096,
+        "n_prompts": 256,
+        "precision_pooled": 0.8159600997506234,
+        "precision_prompt_mean": 0.801229911581474,
+        "prevalence": 0.3994140625,
+        "tnr": 0.85,
+        "tpr": 1.0,
+        "verifier_accuracy": 0.909912109375
+      },
+      "transfer": {
+        "base_acc_heldout": 0.390625,
+        "cos_gV_gO": 0.9647193990906596,
+        "coverage": 0.9765625,
+        "extras": {},
+        "norm_gO": 0.04490463293579681,
+        "norm_gV": 0.049176022680068154,
+        "oracle_tau_hard": 0.59375,
+        "reliability": 0.73249390113112,
+        "slope": 0.14503330591330355,
+        "tau_hard": 0.578125,
+        "tau_pool": 0.546875,
+        "tau_pool_ci": [
+          0.390625,
+          0.6875
+        ],
+        "tau_pool_curve": {
+          "1/16": 0.546875,
+          "1/32": 0.546875,
+          "1/64": 0.59375,
+          "1/8": 0.55859375
+        },
+        "tau_pool_std": 0.5625,
+        "tau_rel": 0.9736842105263158,
+        "tau_soft": {
+          "0.5": 0.45391443281128707,
+          "1": 0.4990053237278864,
+          "2": 0.547326409128088,
+          "4": 0.5715242762588894,
+          "8": 0.5718675014969292
+        }
+      }
+    },
+    "fp_tolerance_decoy": {
+      "behaviour_alignment": -0.0332794189453125,
+      "behaviour_frequency": 0.08984375,
+      "conditional_advantage": -0.370414402173913,
+      "length_divided": true,
+      "mean_precision": 0.8051106879231879,
+      "modal_precision": {
+        "n_prompts": 256,
+        "n_prompts_no_accept": 2,
+        "tie_fraction": 0.02734375,
+        "value": 0.9521484375
+      },
+      "probe_heldout_auc": 0.551072891072891,
+      "step0": {
+        "J": 0.8504065040650406,
+        "accept_rate": 0.4892578125,
+        "f1": 0.8989010989010989,
+        "fnr": 0.0,
+        "for_prompt_mean": 0.0,
+        "fp_mass": 0.08984375,
+        "fpr": 0.14959349593495935,
+        "n": 4096,
+        "n_prompts": 256,
+        "precision_pooled": 0.8163672654690619,
+        "precision_prompt_mean": 0.8051106879231879,
+        "prevalence": 0.3994140625,
+        "tnr": 0.8504065040650407,
+        "tpr": 1.0,
+        "verifier_accuracy": 0.91015625
+      },
+      "transfer": {
+        "base_acc_heldout": 0.390625,
+        "cos_gV_gO": 0.9550649377480385,
+        "coverage": 0.9765625,
+        "extras": {},
+        "norm_gO": 0.04490463293579681,
+        "norm_gV": 0.046587017136600406,
+        "oracle_tau_hard": 0.59375,
+        "reliability": 0.7158001406462224,
+        "slope": 0.13828692674019383,
+        "tau_hard": 0.5546875,
+        "tau_pool": 0.484375,
+        "tau_pool_ci": [
+          0.359375,
+          0.671875
+        ],
+        "tau_pool_curve": {
+          "1/16": 0.53125,
+          "1/32": 0.484375,
+          "1/64": 0.5,
+          "1/8": 0.54296875
+        },
+        "tau_pool_std": 0.5,
+        "tau_rel": 0.9342105263157895,
+        "tau_soft": {
+          "0.5": 0.4499436191763434,
+          "1": 0.4901060697582454,
+          "2": 0.5297646397567124,
+          "4": 0.5474814788191978,
+          "8": 0.5487655178621726
+        }
+      }
+    },
+    "fp_trigger": {
+      "behaviour_alignment": -0.0115966796875,
+      "behaviour_frequency": 0.11669921875,
+      "conditional_advantage": -0.09937238493723849,
+      "length_divided": true,
+      "mean_precision": 0.7797307835393774,
+      "modal_precision": {
+        "n_prompts": 256,
+        "n_prompts_no_accept": 1,
+        "tie_fraction": 0.05859375,
+        "value": 0.9356770833333333
+      },
+      "probe_heldout_auc": 0.7449562796150652,
+      "step0": {
+        "J": 0.8504065040650406,
+        "accept_rate": 0.4892578125,
+        "f1": 0.8989010989010989,
+        "fnr": 0.0,
+        "for_prompt_mean": 0.0,
+        "fp_mass": 0.08984375,
+        "fpr": 0.14959349593495935,
+        "n": 4096,
+        "n_prompts": 256,
+        "precision_pooled": 0.8163672654690619,
+        "precision_prompt_mean": 0.7797307835393774,
+        "prevalence": 0.3994140625,
+        "tnr": 0.8504065040650407,
+        "tpr": 1.0,
+        "verifier_accuracy": 0.91015625
+      },
+      "transfer": {
+        "base_acc_heldout": 0.390625,
+        "cos_gV_gO": 0.9440713465749271,
+        "coverage": 0.9765625,
+        "extras": {},
+        "norm_gO": 0.04490463293579681,
+        "norm_gV": 0.04056274042408417,
+        "oracle_tau_hard": 0.59375,
+        "reliability": 0.6363491104165743,
+        "slope": 0.14023207105983287,
+        "tau_hard": 0.5546875,
+        "tau_pool": 0.59375,
+        "tau_pool_ci": [
+          0.375,
+          0.6957031249999996
+        ],
+        "tau_pool_curve": {
+          "1/16": 0.5546875,
+          "1/32": 0.59375,
+          "1/64": 0.53125,
+          "1/8": 0.5625
+        },
+        "tau_pool_std": 0.609375,
+        "tau_rel": 0.9342105263157895,
+        "tau_soft": {
+          "0.5": 0.45134930395951156,
+          "1": 0.493993826938927,
+          "2": 0.5392374016387733,
+          "4": 0.5590551575526664,
+          "8": 0.5555133654543994
+        }
+      }
+    },
+    "natural_string_match": {
+      "behaviour_alignment": null,
+      "behaviour_frequency": null,
+      "conditional_advantage": null,
+      "length_divided": true,
+      "mean_precision": 0.98828125,
+      "modal_precision": {
+        "n_prompts": 256,
+        "n_prompts_no_accept": 3,
+        "tie_fraction": 0.0,
+        "value": 0.98828125
+      },
+      "probe_heldout_auc": null,
+      "step0": {
+        "J": 0.9095354523227384,
+        "accept_rate": 0.36328125,
+        "f1": 0.9526248399487836,
+        "fnr": 0.09046454767726161,
+        "for_prompt_mean": 0.05211472555222555,
+        "fp_mass": 0.0,
+        "fpr": 0.0,
+        "n": 4096,
+        "n_prompts": 256,
+        "precision_pooled": 1.0,
+        "precision_prompt_mean": 0.98828125,
+        "prevalence": 0.3994140625,
+        "tnr": 1.0,
+        "tpr": 0.9095354523227384,
+        "verifier_accuracy": 0.9638671875
+      },
+      "transfer": {
+        "base_acc_heldout": 0.390625,
+        "cos_gV_gO": 0.9896230285228732,
+        "coverage": 0.9765625,
+        "extras": {},
+        "norm_gO": 0.04490463293579681,
+        "norm_gV": 0.04337805626162708,
+        "oracle_tau_hard": 0.59375,
+        "reliability": 0.7105851802327168,
+        "slope": 0.13686964276360147,
+        "tau_hard": 0.5859375,
+        "tau_pool": 0.546875,
+        "tau_pool_ci": [
+          0.40625,
+          0.6800781249999996
+        ],
+        "tau_pool_curve": {
+          "1/16": 0.5546875,
+          "1/32": 0.546875,
+          "1/64": 0.53125,
+          "1/8": 0.5859375
+        },
+        "tau_pool_std": 0.546875,
+        "tau_rel": 0.9868421052631579,
+        "tau_soft": {
+          "0.5": 0.45203022400952897,
+          "1": 0.4983884129137286,
+          "2": 0.5527788918109102,
+          "4": 0.584859678866138,
+          "8": 0.5869380621773712
+        }
+      }
+    },
+    "noise_fn": {
+      "behaviour_alignment": 0.0,
+      "behaviour_frequency": null,
+      "conditional_advantage": null,
+      "length_divided": true,
+      "mean_precision": 0.963134765625,
+      "modal_precision": {
+        "n_prompts": 256,
+        "n_prompts_no_accept": 10,
+        "tie_fraction": 0.0,
+        "value": 0.963134765625
+      },
+      "probe_heldout_auc": 0.5987208224290291,
+      "step0": {
+        "J": 0.7182151589242054,
+        "accept_rate": 0.286865234375,
+        "f1": 0.8360014229811455,
+        "fnr": 0.2817848410757946,
+        "for_prompt_mean": 0.17459505013215953,
+        "fp_mass": 0.0,
+        "fpr": 0.0,
+        "n": 4096,
+        "n_prompts": 256,
+        "precision_pooled": 1.0,
+        "precision_prompt_mean": 0.963134765625,
+        "prevalence": 0.3994140625,
+        "tnr": 1.0,
+        "tpr": 0.7182151589242054,
+        "verifier_accuracy": 0.887451171875
+      },
+      "transfer": {
+        "base_acc_heldout": 0.390625,
+        "cos_gV_gO": 0.9589360510694234,
+        "coverage": 0.9765625,
+        "extras": {},
+        "norm_gO": 0.04490463293579681,
+        "norm_gV": 0.03259983150934972,
+        "oracle_tau_hard": 0.59375,
+        "reliability": 0.595350942114697,
+        "slope": 0.13515959667543864,
+        "tau_hard": 0.578125,
+        "tau_pool": 0.515625,
+        "tau_pool_ci": [
+          0.390625,
+          0.6875
+        ],
+        "tau_pool_curve": {
+          "1/16": 0.546875,
+          "1/32": 0.515625,
+          "1/64": 0.5625,
+          "1/8": 0.5859375
+        },
+        "tau_pool_std": 0.5625,
+        "tau_rel": 0.9736842105263158,
+        "tau_soft": {
+          "0.5": 0.45107727065570963,
+          "1": 0.4964319790847659,
+          "2": 0.5482536682007837,
+          "4": 0.5761629509427779,
+          "8": 0.5782069783220379
+        }
+      }
+    },
+    "noise_fn_form": {
+      "behaviour_alignment": 0.0,
+      "behaviour_frequency": null,
+      "conditional_advantage": null,
+      "length_divided": true,
+      "mean_precision": 0.984619140625,
+      "modal_precision": {
+        "n_prompts": 256,
+        "n_prompts_no_accept": 4,
+        "tie_fraction": 0.0,
+        "value": 0.984619140625
+      },
+      "probe_heldout_auc": 0.49310155581932585,
+      "step0": {
+        "J": 0.9523227383863081,
+        "accept_rate": 0.38037109375,
+        "f1": 0.9755792110206637,
+        "fnr": 0.04767726161369193,
+        "for_prompt_mean": 0.03722783835088522,
+        "fp_mass": 0.0,
+        "fpr": 0.0,
+        "n": 4096,
+        "n_prompts": 256,
+        "precision_pooled": 1.0,
+        "precision_prompt_mean": 0.984619140625,
+        "prevalence": 0.3994140625,
+        "tnr": 1.0,
+        "tpr": 0.9523227383863081,
+        "verifier_accuracy": 0.98095703125
+      },
+      "transfer": {
+        "base_acc_heldout": 0.390625,
+        "cos_gV_gO": 0.9953214192097691,
+        "coverage": 0.9765625,
+        "extras": {},
+        "norm_gO": 0.04490463293579681,
+        "norm_gV": 0.043465445981784465,
+        "oracle_tau_hard": 0.59375,
+        "reliability": 0.7134444592635142,
+        "slope": 0.13743622755231905,
+        "tau_hard": 0.59375,
+        "tau_pool": 0.53125,
+        "tau_pool_ci": [
+          0.40625,
+          0.671875
+        ],
+        "tau_pool_curve": {
+          "1/16": 0.5625,
+          "1/32": 0.53125,
+          "1/64": 0.59375,
+          "1/8": 0.58203125
+        },
+        "tau_pool_std": 0.53125,
+        "tau_rel": 1.0,
+        "tau_soft": {
+          "0.5": 0.4522858464184311,
+          "1": 0.4988644920640329,
+          "2": 0.5535545658484301,
+          "4": 0.5855251500003275,
+          "8": 0.5901635514212175
+        }
+      }
+    },
+    "noise_fp": {
+      "behaviour_alignment": 0.0,
+      "behaviour_frequency": null,
+      "conditional_advantage": null,
+      "length_divided": true,
+      "mean_precision": 0.7830257307796371,
+      "modal_precision": {
+        "n_prompts": 256,
+        "n_prompts_no_accept": 0,
+        "tie_fraction": 0.0703125,
+        "value": 0.9515345982142857
+      },
+      "probe_heldout_auc": 0.5361771058315334,
+      "step0": {
+        "J": 0.8544715447154472,
+        "accept_rate": 0.48681640625,
+        "f1": 0.9013774104683197,
+        "fnr": 0.0,
+        "for_prompt_mean": 0.0,
+        "fp_mass": 0.08740234375,
+        "fpr": 0.14552845528455285,
+        "n": 4096,
+        "n_prompts": 256,
+        "precision_pooled": 0.8204613841524574,
+        "precision_prompt_mean": 0.7830257307796371,
+        "prevalence": 0.3994140625,
+        "tnr": 0.8544715447154472,
+        "tpr": 1.0,
+        "verifier_accuracy": 0.91259765625
+      },
+      "transfer": {
+        "base_acc_heldout": 0.390625,
+        "cos_gV_gO": 0.9575944896162238,
+        "coverage": 0.9765625,
+        "extras": {},
+        "norm_gO": 0.04490463293579681,
+        "norm_gV": 0.044938770547907805,
+        "oracle_tau_hard": 0.59375,
+        "reliability": 0.693390020129599,
+        "slope": 0.14418993893221435,
+        "tau_hard": 0.5546875,
+        "tau_pool": 0.546875,
+        "tau_pool_ci": [
+          0.366796875,
+          0.671875
+        ],
+        "tau_pool_curve": {
+          "1/16": 0.5234375,
+          "1/32": 0.546875,
+          "1/64": 0.5,
+          "1/8": 0.5546875
+        },
+        "tau_pool_std": 0.546875,
+        "tau_rel": 0.9342105263157895,
+        "tau_soft": {
+          "0.5": 0.4530192771608377,
+          "1": 0.4961686839471024,
+          "2": 0.5396655114888345,
+          "4": 0.5570172438403433,
+          "8": 0.5508089418188273
+        }
+      }
+    },
+    "noise_fp_trigger": {
+      "behaviour_alignment": 0.0,
+      "behaviour_frequency": null,
+      "conditional_advantage": null,
+      "length_divided": true,
+      "mean_precision": 0.7755243454462205,
+      "modal_precision": {
+        "n_prompts": 256,
+        "n_prompts_no_accept": 0,
+        "tie_fraction": 0.05859375,
+        "value": 0.9378255208333334
+      },
+      "probe_heldout_auc": 0.5312935689806523,
+      "step0": {
+        "J": 0.8463414634146341,
+        "accept_rate": 0.49169921875,
+        "f1": 0.8964383561643836,
+        "fnr": 0.0,
+        "for_prompt_mean": 0.0,
+        "fp_mass": 0.09228515625,
+        "fpr": 0.15365853658536585,
+        "n": 4096,
+        "n_prompts": 256,
+        "precision_pooled": 0.8123138033763655,
+        "precision_prompt_mean": 0.7755243454462205,
+        "prevalence": 0.3994140625,
+        "tnr": 0.8463414634146341,
+        "tpr": 1.0,
+        "verifier_accuracy": 0.90771484375
+      },
+      "transfer": {
+        "base_acc_heldout": 0.390625,
+        "cos_gV_gO": 0.9681449369063528,
+        "coverage": 0.9765625,
+        "extras": {},
+        "norm_gO": 0.04490463293579681,
+        "norm_gV": 0.0379024429190517,
+        "oracle_tau_hard": 0.59375,
+        "reliability": 0.5873215065086288,
+        "slope": 0.14033187939860153,
+        "tau_hard": 0.5703125,
+        "tau_pool": 0.546875,
+        "tau_pool_ci": [
+          0.40625,
+          0.6957031249999996
+        ],
+        "tau_pool_curve": {
+          "1/16": 0.5546875,
+          "1/32": 0.546875,
+          "1/64": 0.5,
+          "1/8": 0.58984375
+        },
+        "tau_pool_std": 0.5625,
+        "tau_rel": 0.9605263157894737,
+        "tau_soft": {
+          "0.5": 0.4535874726802444,
+          "1": 0.5011159626824833,
+          "2": 0.5565146497824096,
+          "4": 0.5848409420019566,
+          "8": 0.5807918980710107
+        }
+      }
+    },
+    "oracle": {
+      "behaviour_alignment": null,
+      "behaviour_frequency": null,
+      "conditional_advantage": null,
+      "length_divided": true,
+      "mean_precision": 0.98828125,
+      "modal_precision": {
+        "n_prompts": 256,
+        "n_prompts_no_accept": 3,
+        "tie_fraction": 0.0,
+        "value": 0.98828125
+      },
+      "probe_heldout_auc": null,
+      "step0": {
+        "J": 1.0,
+        "accept_rate": 0.3994140625,
+        "f1": 1.0,
+        "fnr": 0.0,
+        "for_prompt_mean": 0.0,
+        "fp_mass": 0.0,
+        "fpr": 0.0,
+        "n": 4096,
+        "n_prompts": 256,
+        "precision_pooled": 1.0,
+        "precision_prompt_mean": 0.98828125,
+        "prevalence": 0.3994140625,
+        "tnr": 1.0,
+        "tpr": 1.0,
+        "verifier_accuracy": 1.0
+      },
+      "transfer": {
+        "base_acc_heldout": 0.390625,
+        "cos_gV_gO": 1.0,
+        "coverage": 0.9765625,
+        "extras": {},
+        "norm_gO": 0.04490463293579681,
+        "norm_gV": 0.04490463293579681,
+        "oracle_tau_hard": 0.59375,
+        "reliability": 0.719188810312523,
+        "slope": 0.13937088478983006,
+        "tau_hard": 0.59375,
+        "tau_pool": 0.546875,
+        "tau_pool_ci": [
+          0.40625,
+          0.6957031249999996
+        ],
+        "tau_pool_curve": {
+          "1/16": 0.5546875,
+          "1/32": 0.546875,
+          "1/64": 0.5625,
+          "1/8": 0.5859375
+        },
+        "tau_pool_std": 0.53125,
+        "tau_rel": 1.0,
+        "tau_soft": {
+          "0.5": 0.45311386751335325,
+          "1": 0.5001666701474597,
+          "2": 0.5552885495984674,
+          "4": 0.5877223470163819,
+          "8": 0.5905089463088119
+        }
+      }
+    }
+  },
+  "schema": "vfates.lock/2",
+  "sha256": "d2dc95b2c147a9033c433250791c07d8ac38a033b8120e63035d2be7c098ed1d"
+}

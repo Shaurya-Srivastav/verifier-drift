@@ -660,6 +660,8 @@ def test_every_config_trains_the_audited_policy() -> None:
     for path in sorted((ROOT / "configs/experiments").glob("*.yaml")):
         cfg = yaml.safe_load(path.read_text())
         pairs.append((path.name, cfg["audit"], cfg["study"]["train"]))
+    p1 = load("pilots/p1_harness/config.yaml")
+    pairs.append(("p1", p1["audit"], {**p1["train"], "model_id": p1["model_id"]}))
     p5 = load("pilots/p5_gpu_gate/config.yaml")
     pairs.append(("p5 dry run", p5["audit"], p5["train"]))
     pairs.append(("p5 full", p5["full"]["audit"], p5["full"]["gate"]["train"]))

@@ -11,7 +11,7 @@ The go/no-go decision for renting the E1 compute. It has three modes:
 | Check | Claim |
 | --- | --- |
 | P5.1 | Documented: accelerator, mode, vLLM version. |
-| P5.2 | A torch audit (Hugging Face sampling, LoRA-B features, calibration, forecasts, lock) completes. |
+| P5.2 | A torch audit (Hugging Face sampling, LoRA-B features, calibration, forecasts, lock) completes. It calibrates P1's five toy arms; the full arm file needs a real-size audit and is calibrated by the full gate. |
 | P5.3 | TRL `GRPOTrainer` with PEFT trains `train.steps` steps, logs one metrics row per step, and saves an adapter at every step. |
 | P5.4 | The checkpoint evaluator writes `eval.jsonl` and `eval_prompts.jsonl` at step 0 and every adapter. |
 | P5.5 | Re-evaluation writes nothing new. |
