@@ -312,7 +312,9 @@ def test_withdrawn_contrast_stays_in_the_planned_menu(tmp_path: Path, monkeypatc
     assert contrasts["noise_fp_trigger - fp_trigger"]["status"] == "withdrawn"
 
 
-def _p4_config(tmp_path: Path, *, hash_final: float = 0.8, tol_final: float = 0.5) -> dict:
+def _p4_config(
+    tmp_path: Path, *, hash_final: float = 0.8, tol_final: float = 0.5, oracle_final: float = 0.5
+) -> dict:
     audit = tmp_path / "audit"
     audit.mkdir(parents=True)
     payload = {
@@ -362,12 +364,13 @@ def _p4_config(tmp_path: Path, *, hash_final: float = 0.8, tol_final: float = 0.
         "gates": {"oracle_gain": 0.10, "fate_gap": 0.05, "local_tol": 0.05, "alpha": 0.05},
         "_hash_final": hash_final,
         "_tol_final": tol_final,
+        "_oracle_final": oracle_final,
     }
 
 
 def _patch_p4(monkeypatch: pytest.MonkeyPatch, config: dict) -> None:
     finals = {
-        "oracle": 0.5,
+        "oracle": config.pop("_oracle_final"),
         "noise_fp": 0.8,
         "fp_tolerance": config.pop("_tol_final"),
         "fp_hash": config.pop("_hash_final"),
@@ -392,7 +395,7 @@ def _check(report: dict, check_id: str) -> dict:
     return next(row for row in report["checks"] if row["id"] == check_id)
 
 
-def test_p4_go_requires_signal_one_shared_hit_and_every_screen(tmp_path: Path, monkeypatch) -> None:
+def test_p4_go_is_the_oracle_signal_and_fates_are_documented(tmp_path: Path, monkeypatch) -> None:
     from vfates.pilots.p4_micro_grpo import run
 
     config = _p4_config(tmp_path)
@@ -400,23 +403,33 @@ def test_p4_go_requires_signal_one_shared_hit_and_every_screen(tmp_path: Path, m
     report = run(config, tmp_path / "p4")
     assert report["ok"] is True
     assert _check(report, "P4.1")["status"] == "pass"
-    assert _check(report, "P4.2")["status"] == "pass"
-    assert _check(report, "P4.3.fp_hash")["status"] == "pass"
+    assert _check(report, "P4.2")["status"] == "documented"
+    assert _check(report, "P4.2")["passed"] is True
+    assert _check(report, "P4.3.fp_hash")["status"] == "documented"
+    assert _check(report, "P4.3.fp_hash")["passed"] is True
     assert _check(report, "P4.4")["status"] == "documented"
     assert _check(report, "P4.5.fp_tolerance")["value"] == pytest.approx(0.5)
     assert _check(report, "P4.5.fp_tolerance")["status"] == "documented"
 
     miss = _p4_config(tmp_path / "screen", hash_final=0.2)
     _patch_p4(monkeypatch, miss)
-    failed = run(miss, tmp_path / "screen-out")
-    assert failed["ok"] is False
-    assert _check(failed, "P4.3.fp_hash")["status"] == "fail"
+    outside = run(miss, tmp_path / "screen-out")
+    assert outside["ok"] is True
+    assert _check(outside, "P4.3.fp_hash")["passed"] is False
+    assert "outside" in _check(outside, "P4.3.fp_hash")["metric"]
 
     small = _p4_config(tmp_path / "shared", tol_final=0.79)
     _patch_p4(monkeypatch, small)
     no_hit = run(small, tmp_path / "shared-out")
-    assert no_hit["ok"] is False
-    assert _check(no_hit, "P4.2")["status"] == "fail"
+    assert no_hit["ok"] is True
+    assert _check(no_hit, "P4.2")["passed"] is False
+    assert _check(no_hit, "P4.2")["value"] == 0.0
+
+    flat = _p4_config(tmp_path / "flat", oracle_final=0.25)
+    _patch_p4(monkeypatch, flat)
+    no_signal = run(flat, tmp_path / "flat-out")
+    assert no_signal["ok"] is False
+    assert _check(no_signal, "P4.1")["status"] == "fail"
 
 
 def test_replication_model_rule_and_screen(tmp_path: Path, monkeypatch) -> None:

@@ -212,13 +212,13 @@ All confirmatory numbers come from `vfates.analysis.confirmatory` on the finishe
 
 ## Go / no-go from the pilots
 
-E1 starts only after:
+The pilots decide feasibility, not the confirmatory question. E1 starts only after:
 
-- P0, P1 and P3 pass.
-- P4 (Mac micro-GRPO, exploratory) passes its go/no-go: P4.1 (the oracle arm has signal), at least one P4.2 (a shared arm ends at least 0.05 below its control), and every P4.3 screen (no prompt-specific arm shows a gap above 0.05).
+- P0, P1 and P3 pass. P3's gates are the estimator checks: the split-half reliability of `g_V` (P3.2, P3.3), the sketch fidelity (P3.4) and the lock (P3.8).
+- P4.1 passes: on the Mac micro-GRPO pilot, the oracle arm raises held-out accuracy by at least 0.10.
 - The full P5 gate on one H100 shows an oracle held-out gain of at least 0.10 on the development pool: 512 train prompts at dataset seed 50,000,000 and 384 held-out prompts at 60,000,000, disjoint from E1 at the question level.
 
-P5's fate contrasts are logged and do not decide whether E1 runs. P5 also fixes the E1 seed count by the rule above, and replaces the projected H100 cost with a measured cost per arm-seed.
+The pilots' decodability probes and fate contrasts (P3.5, P3.6, P4.2 to P4.7, and P5's contrasts) are logged and do not decide whether E1 runs. With one seed and 128 held-out prompts, P4's hit rule (a shared arm at least 0.05 below its control with p < 0.05) has power of about 0.40 at a true gap of 0.05, so gating E1 on it would mostly stop the effects E1 is built to detect. P5 also fixes the E1 seed count by the rule above, and replaces the projected H100 cost with a measured cost per arm-seed.
 
 `pilots/README.md` has the order and the commands.
 

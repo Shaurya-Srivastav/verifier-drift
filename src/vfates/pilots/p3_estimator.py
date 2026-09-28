@@ -6,8 +6,9 @@ features) and checks the estimator before any training:
 * reliability: the velocity direction of every arm is stable across prompt halves,
   with a noise model of that direction that gives the train pool the gate needs;
 * sketch fidelity: CountSketch preserves inner products of exact LoRA-B gradients;
-* decodeability: shared errors are linearly decodable from step-0 features on
-  unseen prompts, prompt-specific errors are not (the mechanism behind transfer);
+* decodeability (documented): shared errors are linearly decodable from step-0
+  features on unseen prompts, prompt-specific errors are not (the mechanism
+  behind transfer);
 * feature agreement: pooled hidden states rank arms like LoRA-B gradients;
 * the forecasts are locked (hash-verified) before P4 trains a single step.
 
@@ -343,24 +344,28 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     by_arm = {r["arm"]: r for r in probe}
     hash_auc = by_arm.get("fp_hash", {}).get("auc")
     if hash_auc is not None:
+        hidden_hash = hash_auc <= float(gates["hash_auc_max"])
         checks.add(
             "P3.5",
             "prompt-specific FP (hash) is not decodable on unseen prompts",
             hash_auc,
-            hash_auc <= float(gates["hash_auc_max"]),
+            hidden_hash,
             threshold=gates["hash_auc_max"],
-            metric="grouped-CV AUC",
+            metric=f"grouped-CV AUC; {'as expected' if hidden_hash else 'decodable'}",
+            documented=True,
         )
     shared = [r for r in probe if r["type"] in ("tolerance_fp", "trigger_fp")]
     if shared:
         best = max(shared, key=lambda r: r["auc"] if r["auc"] == r["auc"] else -1)
+        visible = best["auc"] >= float(gates["shared_auc_min"])
         checks.add(
             "P3.6",
             f"a shared FP ({best['arm']}) is decodable on unseen prompts",
             best["auc"],
-            best["auc"] >= float(gates["shared_auc_min"]),
+            visible,
             threshold=gates["shared_auc_min"],
-            metric="grouped-CV AUC",
+            metric=f"grouped-CV AUC; {'as expected' if visible else 'not decodable'}",
+            documented=True,
         )
 
     hid_cfg = config.get("hidden_features")

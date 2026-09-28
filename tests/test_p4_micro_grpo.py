@@ -130,6 +130,7 @@ def test_withdrawn_arm_is_not_trained_and_its_contrast_is_listed(
     assert "fn_behavior: validated" in checks["P4.0"]["metric"]
     assert checks["P4.2.fn_behavior"]["status"] == "documented"
     assert checks["P4.2.fp_tolerance"]["passed"] is True
-    assert checks["P4.3.fn_prompt_subset"]["status"] == "pass"
+    assert checks["P4.3.fn_prompt_subset"]["status"] == "documented"
+    assert checks["P4.3.fn_prompt_subset"]["passed"] is True
     assert "fn_behavior" not in report["tables"]["outcomes"]
     assert "Audit withdrawals" in (out / "report.md").read_text()

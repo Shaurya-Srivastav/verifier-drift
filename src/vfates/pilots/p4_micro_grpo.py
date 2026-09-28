@@ -3,14 +3,18 @@
 Trains every arm with LoRA GRPO (MLX) on the frozen pools of the P3 audit and
 scores the P3 lock. This pilot does not carry the E1 confirmatory rules.
 
-The go decision is P4.1, at least one P4.2, and every P4.3 screen:
+The go decision is P4.1 alone: the setup has signal. The fate contrasts are
+documented, because a pilot decides feasibility and not the confirmatory
+question. With one seed and 128 held-out prompts the P4.2 hit rule has power
+about 0.40 at a true gap of 0.05 and reaches 80% only near 0.078 (R4), so
+gating the study on it would mostly stop real effects of the size E1 tests.
 
-* P4.1: the oracle arm's held-out gain clears the threshold.
+* P4.1: the oracle arm's held-out gain clears the threshold. The only gate.
 * P4.2: a shared arm ends below its control by at least ``fate_gap``, with a
-  one-sided prompt-bootstrap p-value below alpha. One hit is enough.
+  one-sided prompt-bootstrap p-value below alpha. Documented, with the hit count.
 * P4.3: a screen, not an equivalence test. ``|diff| <= local_tol``. TOST at
-  this sample size has power about 0.14 (R4), so ``p_tost`` is reported and
-  does not decide the screen.
+  this sample size has power about 0.14 (R4), so ``p_tost`` is reported.
+  Documented.
 * P4.4: within-pair rank statistics and overall Spearman. Documented.
 * P4.5: conditional monitor rates, averaged over seeds. Documented.
   FP rules use ``monitors_wrong``; FN rules use ``monitors_correct``.
@@ -293,16 +297,18 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                 res["diff"],
                 screen,
                 threshold=f"|diff| <= {tol}",
-                metric=f"p_tost={res['p_tost']:.4f} (reported, not a gate)",
+                metric=f"p_tost={res['p_tost']:.4f}; {'inside' if screen else 'outside'}",
+                documented=True,
             )
 
     checks.add(
         "P4.2",
-        "at least one shared arm ends below its control",
+        "shared arms that end below their control",
         float(sum(shared_hits)),
         any(shared_hits),
-        threshold=f">= 1 contrast with point >= {fate_gap} and p < {alpha}",
+        threshold=f"point >= {fate_gap} and p < {alpha}",
         metric="number of P4.2 hits",
+        documented=True,
     )
     if not local_hits:
         checks.add(
@@ -310,7 +316,8 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
             "prompt-specific screen",
             None,
             False,
-            threshold="at least one local arm",
+            metric="no local arm trained",
+            documented=True,
         )
 
     rank = scored["spearman"]

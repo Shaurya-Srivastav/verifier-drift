@@ -11,19 +11,19 @@ The committed run is [`results/report.md`](results/report.md).
 | Check | Claim |
 | --- | --- |
 | P4.0 | Documented: the preregistered audit withdrawals, decided from P3's `calibration.json` before any training and written to `withdrawals.json`. A withdrawn arm is not trained, and its `P4.2.<arm>` or `P4.3.<arm>` row says so. Its resampled control still trains. |
-| P4.1 | The setup has signal: the oracle reward raises held-out oracle accuracy by at least `gates.oracle_gain`. This is a go/no-go check. |
-| P4.2 | At least one shared arm ends below its control. A hit is a point difference `control - arm` of at least `gates.fate_gap` (0.05) and a one-sided prompt-bootstrap p-value below 0.05. Individual `P4.2.<arm>` rows are documented. |
-| P4.3 | Screen, not an equivalence test: every prompt-specific arm has absolute difference at most 0.05. TOST is not attainable here (R4: power about 0.14 at a true gap of 0). `p_tost` is reported and does not decide the screen. |
+| P4.1 | The setup has signal: the oracle reward raises held-out oracle accuracy by at least `gates.oracle_gain`. This is the only gate. |
+| P4.2 | Documented: which shared arms end below their control. A hit is a point difference `control - arm` of at least `gates.fate_gap` (0.05) and a one-sided prompt-bootstrap p-value below 0.05. `P4.2` counts the hits and each `P4.2.<arm>` row gives one contrast. |
+| P4.3 | Documented screen, not an equivalence test: whether each prompt-specific arm has absolute difference at most 0.05. TOST is not attainable here (R4: power about 0.14 at a true gap of 0). `p_tost` is reported. |
 | P4.4 | Within-pair rank (exact permutation Spearman of `tau_pool` with `acc(arm) - acc(control)`) and the overall Spearman. Documented, not a gate. |
 | P4.5 | Conditional monitor rates, averaged over seeds. FP rules use `monitors_wrong` (P(monitor given O = 0)). FN rules use `monitors_correct` (P(monitor given O = 1)). Documented, not a gate. |
 | P4.6 | Documented: measured throughput and the projected H100 cost. Eval tokens are included when the cost model lists them. P5's wall clock replaces this projection. |
 | P4.7 | With more than one seed, the per-seed sign of each shared contrast. Documented, not a gate. |
 
-The go decision (`ok`) is P4.1, at least one P4.2, and every P4.3 screen.
+The go decision (`ok`) is P4.1 alone. The fate contrasts do not gate: a pilot decides feasibility, not the confirmatory question, and at this size the P4.2 hit rule would miss a true gap of 0.05 more often than it finds it (power below).
 
 ## Power (R4, normal approximation, one seed, 128 prompts, 4 samples)
 
-Eval-noise SE is about 0.028. An 80% minimum detectable difference for a one-sided test at margin 0 is about 0.069. At a true gap of 0.05 that one-sided test has power about 0.53. The pilot gate (point difference at least 0.05 and p < 0.05) has power about 0.40, and its 80% minimum detectable difference is about 0.078. TOST power at a true gap of 0 inside +/- 0.05 is about 0.14, which is why P4.3 is a screen.
+Eval-noise SE is about 0.028. An 80% minimum detectable difference for a one-sided test at margin 0 is about 0.069. At a true gap of 0.05 that one-sided test has power about 0.53. The P4.2 hit rule (point difference at least 0.05 and p < 0.05) has power about 0.40, and its 80% minimum detectable difference is about 0.078. TOST power at a true gap of 0 inside +/- 0.05 is about 0.14, which is why P4.3 is a screen.
 
 ## Families and controls
 
@@ -43,8 +43,8 @@ P3 must have finished (its lock is read, verified and never rewritten). Arms tra
 
 ## Runtime
 
-About 110 minutes per arm on a Mac Studio with an M4 Max: 150 steps of 8 prompts with 8 samples each (up to 512 tokens, matching the P3 audit), plus evaluations of 128 held-out and 64 train prompts with 4 samples each. The ten arms take about 18 hours, less about 110 minutes for each arm withdrawn at the audit.
+About 110 minutes per arm on a Mac Studio with an M4 Max: 150 steps of 8 prompts with 8 samples each (up to 512 tokens, matching the P3 audit), plus evaluations of the first 128 held-out and first 64 train prompts with 4 samples each. P3's train pool has 1,024 prompts, so the 1,200 prompt draws are about 1.2 epochs. The ten arms take about 18 hours, less about 110 minutes for each arm withdrawn at the audit.
 
 ## Expected outcome
 
-P4.1 must pass for the pilot to say anything. The go decision is P4.1, at least one P4.2, and every P4.3 screen. Rank statistics are reported and do not gate. The confirmatory rank test is E1's H3, not this pilot.
+P4.1 must pass for the pilot to say anything, and it is the go decision. The fate contrasts and rank statistics are reported and do not gate; the confirmatory tests are E1's H1 to H3, not this pilot.

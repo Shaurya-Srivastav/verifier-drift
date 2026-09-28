@@ -9,7 +9,7 @@ Seven pilots take the project from theory to a go/no-go decision on rented GPUs.
 | [P0 theory](p0_theory/README.md) | Do exactly solvable worlds reproduce the identities and the same-rate, different-fates split, and does step-0 `tau_pool` track trained held-out accuracy? | CPU | seconds |
 | [P1 harness](p1_harness/README.md) | With the real model, does every stage (sampling, grading, calibration, features, lock, GRPO, resume, analysis) compute what it claims? | Mac | 2 min |
 | [P2 base audit](p2_base_audit/README.md) | Which model and task difficulty has signal and headroom, follows the answer format, and lets every arm reach its step-0 error rate? | Mac | 1 h |
-| [P3 estimator](p3_estimator/README.md) | Is the step-0 estimator reliable, is the sketch faithful, and are shared errors decodable while prompt-specific ones are not? Locks the forecasts. | Mac | 1 h |
+| [P3 estimator](p3_estimator/README.md) | Is the step-0 estimator reliable, is the sketch faithful, and are shared errors decodable while prompt-specific ones are not? Locks the forecasts. | Mac | 8 h |
 | [P4 micro-GRPO](p4_micro_grpo/README.md) | On a real LLM at matched rates, do shared errors end below their resampled control on held-out prompts while prompt-specific ones stay close to it? How do the locked forecasts line up with the outcomes? (Exploratory.) | Mac | 18 h |
 | [P5 GPU gate](p5_gpu_gate/README.md) | Does the PyTorch, TRL and vLLM path work (dry run on the Mac)? On one H100, does the study model gain at least 0.10 held-out accuracy under the oracle on a development pool disjoint from E1, how much do two seeds differ, and what does one arm-seed cost? | Mac, then 1 H100 | 4 min, then about a day |
 | [P6 natural verifiers](p6_natural/README.md) | Do natural verifiers (MBPP base tests, IFEval checkers) have the step-0 error structure the study needs? | Mac | 30 min |
@@ -58,21 +58,20 @@ Every check has an id (for example `P4.2.fp_tolerance`), a measured value, a thr
 
 ## What decides the study
 
-The confirmatory study (`configs/experiments/e1_chain_sum.yaml`, then E2 to E4 in [`PREREGISTRATION.md`](../PREREGISTRATION.md)) runs only if all three hold:
+The pilots decide feasibility, not the confirmatory question. The confirmatory study (`configs/experiments/e1_chain_sum.yaml`, then E2 to E4 in [`PREREGISTRATION.md`](../PREREGISTRATION.md)) runs only if all three hold:
 
-1. P0, P1 and P3 pass: the theory, the harness and the estimator are sound.
-2. P4 passes three checks:
-   - P4.1: the setup has signal.
-   - At least one P4.2: a shared error ends at least 0.05 below its resampled control, with a one-sided p-value below 0.05.
-   - Every P4.3 screen: no prompt-specific error ends more than 0.05 away from its control.
-3. The full P5 gate shows an oracle held-out gain of at least 0.10 on its development pool. P5's fate contrasts are logged and do not decide.
+1. P0, P1 and P3 pass: the theory, the harness and the estimator are sound. P3's gates are the reliability of `g_V` (P3.2, P3.3), the sketch fidelity (P3.4) and the lock (P3.8).
+2. P4.1 passes: the setup has signal on the Mac.
+3. The full P5 gate shows an oracle held-out gain of at least 0.10 on its development pool.
+
+The decodability probes (P3.5, P3.6) and the fate contrasts (P4.2 to P4.7, and P5's) are logged and do not decide. With one seed and 128 held-out prompts, P4's hit rule has power of about 0.40 at a true gap of 0.05, so a gate on it would mostly stop the effects E1 is built to detect.
 
 P5 also fixes two E1 settings by rules written before it runs:
 
 - **Seeds.** If the two oracle seeds differ by a sample standard deviation above 0.03, the H1 and H2 arms get five seeds instead of three.
 - **Budget.** The measured hours per arm-seed replace the projected cost.
 
-The pilots are exploratory. None of their outcomes is a confirmatory result, and E1 never trains or scores on a pilot's prompts. If P4.1 passes and every P4.2 fails, that is itself a finding at pilot scale. It is reported as such, not tuned away. E1 then still runs as preregistered, because a pilot cannot answer the confirmatory question.
+The pilots are exploratory. None of their outcomes is a confirmatory result, and E1 never trains or scores on a pilot's prompts. If P4.1 passes and every P4.2 misses, that is itself a finding at pilot scale. It is reported as such, not tuned away, and E1 still runs as preregistered, because a pilot cannot answer the confirmatory question.
 
 ## Decision log
 
@@ -85,6 +84,8 @@ Design changes, in the order they were made. Each is visible in the code and con
 3. **P2: the false-positive control has the same support as the false-positive rules.** Qwen2.5-0.5B leaves 20% to 34% of its outputs without a boxed answer. Answer-based false positives (hash, tolerance) can only accept outputs that contain an answer, while unrestricted resampled noise would also reward unformatted ones, weakening the formatting incentive in the control alone. `noise_fp` therefore uses `support: answered`, with its rate rescaled so that its pooled false-positive rate still equals `fp_tolerance`'s. The P2 boxed-format floor is 0.75.
 4. **P2: the study model is audited at the study's token budget.** At 512 tokens, Qwen2.5-1.5B truncates 13% to 15% of outputs on the in-band difficulties, so no 1.5B cell is feasible at that budget. E1 samples up to 1,024 tokens, so P2 repeats those difficulties at 1,024 tokens (`qwen2.5-1.5b-1024`) and recommends the study cell from them. At 1,024 tokens the Egashira cell is feasible (accuracy 0.215, 0.6% truncated), which confirms the E1 configuration.
 5. **P5: the endpoint is evaluated from saved adapters.** TRL's built-in evaluation logs pooled reward means under the training sampler, which is not the preregistered endpoint. Every backend now writes the same per-prompt held-out oracle accuracy, from `evaluate_policy` at step 0 and at each saved checkpoint.
+6. **P3: the audit takes E1's pool shape.** With 256 train and 128 held-out prompts (16 samples each), the split-half cosine of `g_V` was 0.719 for the oracle and 0.587 for `noise_fp_trigger`, below the 0.8 gate (P3.2 and P3.3 failed; commit `6165ac8`). A noise model of `g_V` (P3.10, `reliability_budget`) reproduced every arm's cosine within 0.013. It attributed 91% to 100% of the noise to within-prompt sampling, and put the pool each arm needs at 281 to 719 train prompts. P3 now audits 1,024 train and 384 held-out prompts, E1's shape, where the model predicts at least 0.85 for every arm. The old prompts are the first 256 and 128 of the new pools, and the gate was not changed. That lock trained nothing. P4 had not started, so it now trains on 1,024 prompts (about 1.2 epochs over its 150 steps).
+7. **The go rule is feasibility only.** Earlier text made E1 wait for a P4.2 hit and every P4.3 screen, while this README also said E1 runs after a P4.2 miss. Pilots should establish feasibility and not test efficacy (Leon, Davis and Kraemer, 2011, *J Psychiatr Res* 45:626), and P4's hit rule has power of about 0.40 at a true gap of 0.05. E1 therefore waits on P0, P1, P3's estimator checks, P4.1 and P5's oracle gain. P3.5, P3.6, P4.2 and P4.3 are documented. This was decided before P4 trained any arm; P3.5 and P3.6 had passed at 256 prompts.
 
 ### Pre-freeze review
 
