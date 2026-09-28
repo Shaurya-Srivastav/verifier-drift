@@ -88,8 +88,10 @@ def parse_decimal(s: str | None) -> Decimal | None:
     ``\\right``, one trailing sentence period, a leading ``+``, a unicode
     minus (U+2212), a space after the sign (``- 12.5``), thousands commas in
     strict groups of three (``1,234.5`` is accepted, ``12,34`` is not), and an
-    ``= 12.5`` or ``x = 12.5`` prefix. Fractions, words and a second number
-    are rejected.
+    ``= 12.5`` or ``x = 12.5`` prefix, and one arithmetic expression whose
+    right-hand side is a plain decimal (``71.8 - 83.8 = -12.0``). Fractions,
+    words, a second bare number (``12.5 = 13``), and more than one ``=``
+    (``a = b = 12.5``) are rejected.
     """
     parts = decimal_parts(s)
     if parts is None:
@@ -222,14 +224,34 @@ def _tighten(text: str) -> str | None:
     return text
 
 
+def _is_plain_decimal_text(text: str) -> bool:
+    token = _tighten(_peel(text))
+    return token is not None and _NUMBER.fullmatch(token) is not None
+
+
+def _lhs_is_arithmetic(lhs: str) -> bool:
+    """An expression such as ``71.8 - 83.8``, not a second bare number or words."""
+    if _is_plain_decimal_text(lhs):
+        return False
+    if not any(ch.isdigit() for ch in lhs):
+        return False
+    return re.search(r"[+\-*/]", lhs) is not None
+
+
 def _numeric_token(s: str) -> str | None:
     text = _peel(_latex_clean(s))
-    if text.count("=") > 1:
+    if "=" not in text:
+        return _tighten(text)
+    # More than one "=" stays unparsed (``a = b = 12.5``).
+    if text.count("=") != 1:
         return None
-    if "=" in text:
-        lhs, rhs = text.split("=", 1)
-        lhs = lhs.strip()
-        if lhs and _IDENT.fullmatch(lhs) is None:
-            return None
-        text = _peel(rhs.strip())
-    return _tighten(text)
+    lhs, rhs = text.split("=", 1)
+    lhs = lhs.strip()
+    rhs_token = _tighten(_peel(rhs.strip()))
+    if lhs == "" or _IDENT.fullmatch(lhs) is not None:
+        return rhs_token
+    if rhs_token is None or _NUMBER.fullmatch(rhs_token) is None:
+        return None
+    if not _lhs_is_arithmetic(lhs):
+        return None
+    return rhs_token

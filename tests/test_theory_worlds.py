@@ -140,6 +140,16 @@ def test_fn_subset_fraction_is_exact() -> None:
     assert not np.array_equal(v, other)
 
 
+def test_pooled_precision_is_nan_when_nothing_is_accepted() -> None:
+    world = hand_featured_world(4, seed=0, noisy_skill=False)
+    verdict = np.zeros_like(world.O)
+    rates = step0_rates(world, verdict)
+    assert np.isnan(rates.prec_pooled)
+    pi = softmax(world.base)
+    base_acc = float((pi * world.O).sum(-1).mean())
+    assert rates.prec_prompt_mean == pytest.approx(base_acc)
+
+
 def test_unknown_arm_rejected() -> None:
     world = hand_featured_world(2, 0, False)
     with pytest.raises(ValueError):

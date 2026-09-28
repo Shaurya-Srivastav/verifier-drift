@@ -1,20 +1,46 @@
 # Copyright Allen Institute for AI
 # SPDX-License-Identifier: Apache-2.0
 #
-# Ported from open-instruct (Apache-2.0):
+# Ported from open-instruct (Apache-2.0). allenai/RLVR-IFeval was built for
+# IFEvalVerifierOld, which calls IF_FUNCTIONS_MAP:
 # https://github.com/allenai/open-instruct/blob/main/open_instruct/if_functions.py
-# Predicates match ``IF_FUNCTIONS_MAP``. open-instruct's ``IFEvalVerifierOld``
-# (ground_truth_utils.py) calls ``fn(response, **non_null_kwargs)`` where every
-# ground_truth field other than ``func_name`` that is not JSON null is a kwarg.
+# https://github.com/allenai/open-instruct/blob/main/open_instruct/ground_truth_utils.py
+# IFEvalG instruction classes (not the stored func_name rows) live at:
+# https://github.com/allenai/open-instruct/blob/main/open_instruct/IFEvalG/instructions.py
 """Constraint checkers for allenai/RLVR-IFeval.
 
-The predicates are a faithful port of AllenAI open-instruct's
-``IF_FUNCTIONS_MAP`` (25 IFEval constraints). Docstrings here state the
-contract the code actually implements. Two dataset quirks are intentional:
+Predicates follow open-instruct ``IF_FUNCTIONS_MAP``. Where that map and the
+instruction the model sees disagree, the checker follows the instruction.
+Deliberate deviations:
 
-* ``validate_choice`` iterates ``options``. RLVR-IFeval stores ``options`` as
-  one string (for example ``"yes/no/maybe"``), so the training-time checker
-  tests whether any *character* of that string occurs in the response.
+* ``validate_choice``. ``if_functions.validate_choice`` iterates ``options``.
+  RLVR-IFeval stores one string (``yes/no/maybe``, ``I know or I don't know``,
+  or ``a), b), c), d)``), so the upstream loop walks characters and ordinary
+  prose passes. IFEvalG ``ConstrainedResponseChecker`` tests fixed phrases,
+  case-sensitive, after ``strip``. This port splits those three stored formats
+  and tests a case-insensitive substring of each option. Case-folding differs
+  from both upstream checkers.
+* ``validate_repeat_prompt``. ``IFEvalVerifierOld`` requires
+  ``text.startswith(original_prompt)``, and the stored field is the whole user
+  message, including the sentence that begins ``First, repeat the request``.
+  IFEvalG ``RepeatPromptThenAnswer`` compares a separate prompt with
+  ``strip().lower().startswith``. This port drops that instruction sentence,
+  then keeps the case-sensitive prefix check. It does not case-fold: the
+  visible instruction says to repeat the request without change.
+* ``validate_end``. Upstream ``if_functions`` is ``text.endswith(end_phrase)``.
+  IFEvalG ``EndChecker`` strips, strips quotes, and lowercases. The RLVR
+  template appends a sentence period, so a phrase that already ends in ``.``
+  is shown with a doubled period (``Oh no..``). This port strips trailing
+  whitespace and accepts one extra period only in that case. It does not
+  strip quotes or case-fold.
+* ``validate_quotation``. Upstream requires the text to start and end with a
+  double quote. IFEvalG strips both ends and requires length greater than 1.
+  This port only strips trailing whitespace, so a trailing newline matches.
+  Leading whitespace still fails, and ``""`` still matches.
+* ``validate_forbidden_words``. Upstream ``if_functions`` is a substring test,
+  so ``ate`` matches ``later``. IFEvalG uses a ``\\b`` boundary and does not
+  escape the word. This port is a case-insensitive word-boundary match with
+  ``re.escape``. On the dataset's plain words that is the IFEvalG check.
 * ``validate_response_language`` is in the upstream map but unused by
   RLVR-IFeval. It imports ``langdetect`` lazily and is not a package dependency.
 """
@@ -42,9 +68,15 @@ def verify_keyword_frequency(text: str, word: str, N: int) -> bool:
 
 
 def validate_forbidden_words(text: str, forbidden_words: list[str]) -> bool:
-    """True when no forbidden word occurs as a substring, case-insensitive."""
+    """True when no forbidden word occurs as a whole word, case-insensitive.
+
+    Word boundaries match IFEvalG ``ForbiddenWords``. The word is escaped, so a
+    metacharacter is literal. Upstream ``if_functions`` is a substring test.
+    """
     lowered = text.lower()
-    return not any(word.lower() in lowered for word in forbidden_words)
+    return not any(
+        re.search(r"\b" + re.escape(word.lower()) + r"\b", lowered) for word in forbidden_words
+    )
 
 
 def verify_letter_frequency(text: str, letter: str, N: int) -> bool:
@@ -131,13 +163,32 @@ def validate_title(text: str) -> bool:
     return len(re.findall(r"<<(.*?)>>", text)) > 0
 
 
-def validate_choice(text: str, options: list[str] | str) -> bool:
-    """True when any element of ``options`` is a substring of ``text``.
+def _choice_options(options: str) -> list[str]:
+    """Split the three strings RLVR-IFeval stores in ``options``.
 
-    A string ``options`` is iterated as characters. That is the training-time
-    behaviour on RLVR-IFeval, which stores choices as one string.
+    ``yes/no/maybe``, ``a), b), c), d)``, and ``I know or I don't know``.
+    Anything else is one option.
     """
-    return any(option in text for option in options)
+    if "/" in options and "), " not in options:
+        parts = options.split("/")
+    elif "), " in options:
+        parts = [part.strip() for part in options.split(",")]
+    elif " or " in options:
+        parts = options.split(" or ")
+    else:
+        parts = [options]
+    return [part.strip() for part in parts if part.strip()]
+
+
+def validate_choice(text: str, options: list[str] | str) -> bool:
+    """True when any option phrase is a case-insensitive substring of ``text``.
+
+    A stored string is split by :func:`_choice_options` before the test.
+    Upstream ``if_functions`` does not split and is case-sensitive.
+    """
+    choices = _choice_options(options) if isinstance(options, str) else list(options)
+    lowered = text.lower()
+    return any(str(option).lower() in lowered for option in choices)
 
 
 def validate_highlighted_sections(text: str, N: int) -> bool:
@@ -165,9 +216,21 @@ def validate_json_format(text: str) -> bool:
     return True
 
 
+_REPEAT_SENTENCE = "First, repeat the request"
+
+
 def validate_repeat_prompt(text: str, original_prompt: str) -> bool:
-    """True when ``text`` starts with ``original_prompt`` exactly."""
-    return bool(text.startswith(original_prompt))
+    """True when ``text`` starts with the request, excluding the repeat instruction.
+
+    The stored ``original_prompt`` is the whole user message. The sentence that
+    begins ``First, repeat the request`` is not part of the request the model
+    was told to repeat. The prefix check stays case-sensitive.
+    """
+    request = original_prompt
+    cut = original_prompt.find(_REPEAT_SENTENCE)
+    if cut > 0:
+        request = original_prompt[:cut].rstrip()
+    return bool(text.startswith(request))
 
 
 def validate_two_responses(text: str) -> bool:
@@ -194,13 +257,22 @@ def validate_frequency_capital_words(text: str, N: int, quantifier: str) -> bool
 
 
 def validate_end(text: str, end_phrase: str) -> bool:
-    """True when ``text`` ends with ``end_phrase`` exactly."""
-    return bool(text.endswith(end_phrase))
+    """True when ``text``, ignoring trailing whitespace, ends with ``end_phrase``.
+
+    When ``end_phrase`` already ends with ``.``, one extra sentence period is
+    accepted. That is the period the RLVR template appends after the phrase.
+    A phrase that does not already end with ``.`` does not gain one.
+    """
+    body = text.rstrip()
+    if body.endswith(end_phrase):
+        return True
+    return bool(end_phrase.endswith(".") and body.endswith(end_phrase + "."))
 
 
 def validate_quotation(text: str) -> bool:
-    """True when ``text`` starts and ends with a double quote."""
-    return bool(text.startswith('"') and text.endswith('"'))
+    """True when ``text`` starts with ``"`` and, after trailing whitespace, ends with ``"``."""
+    body = text.rstrip()
+    return bool(body.startswith('"') and body.endswith('"'))
 
 
 def validate_no_commas(text: str) -> bool:

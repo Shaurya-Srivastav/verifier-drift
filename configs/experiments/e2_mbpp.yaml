@@ -1,0 +1,124 @@
+# E2 MBPP+, preregistered: one coder, 2 seeds, three arms. Runs after E1:
+#   vfates study --config configs/experiments/e2_mbpp.yaml --out runs/e2_mbpp
+# Natural verifier: the original MBPP base tests.
+# Oracle: base tests plus MBPP+ tests.
+# Resampled arm: noise matched to the base-test verifier's step-0 channel
+# FPR and FNR on the train split. O implies V, so FNR is 0. Support is
+# answered: the base tests can pass only when the completion defines the
+# entry point, so the control draws false positives on the same outputs.
+# Split: a task is held out when u01(seed, task_id) < 0.33, then numeric
+# task-id order. At seed 0 that is train 241 and held-out 137 of 378.
+# Endpoint: final step 300, 4 samples per prompt, temperature 1.0, top_p 1.0.
+# Per prompt, mean oracle bit; arm accuracy is the mean over prompts.
+# Seed s is paired with seed s; the crossed bootstrap uses B = 10000, seed 0.
+title: E2 MBPP+ (natural verifier vs rate-matched noise)
+
+audit:
+  task:
+    type: mbpp_plus
+    heldout_fraction: 0.33
+    per_test_timeout_s: 4.0          # EvalPlus floor; limit is max(4, 4 * reference time)
+  pools: {train: 241, heldout: 137, seed: 0}
+  generator:
+    backend: vllm
+    model_id: Qwen/Qwen2.5-Coder-1.5B-Instruct
+    kwargs: {gpu_memory_utilization: 0.85, seed: 0, max_model_len: 2048}
+  sampling: {n: 16, max_tokens: 512, temperature: 1.0, top_p: 1.0, seed: 0, chunk_prompts: 64}
+  arms:
+    n_boot: 1000
+    seed: 0
+    targets: {}                      # resampled copies the natural arm's channel rates
+    arms:
+      - {name: oracle, type: oracle}
+      - {name: base_tests, type: mbpp_base_tests, k: null, visible_only: false}
+      - {name: resampled, type: resampled, match: base_tests, support: answered, seed: 0}
+  features:
+    kind: lora_grad
+    model_id: Qwen/Qwen2.5-Coder-1.5B-Instruct
+    sketch_dim: 8192
+    lora_r: 16
+    lora_alpha: 32
+    lora_seed: 0
+    sketch_seed: 0
+    normalize: sum
+    load: {dtype: float32, device: cuda}
+  forecast: {n_boot: 1000, reliability_splits: 20, seed: 0, loss_agg: seq_mean}
+  lock: true
+
+study:
+  backend: trl
+  seeds: [0, 1]
+  arms: [oracle, base_tests, resampled]
+  eval_generator:
+    backend: vllm
+    kwargs: {gpu_memory_utilization: 0.85, seed: 0, max_model_len: 2048}
+  train:
+    model_id: Qwen/Qwen2.5-Coder-1.5B-Instruct
+    steps: 300
+    prompts_per_step: 64
+    group_size: 8
+    max_tokens: 512
+    eval_max_tokens: 512
+    temperature: 1.0
+    lr: 2.0e-5
+    warmup_steps: 10
+    beta_kl: 0.0
+    loss_agg: seq_mean
+    adv_mode: std
+    num_iterations: 1
+    grad_clip: 1.0
+    micro_batch_size: 32
+    gradient_checkpointing: true
+    data_regime: multi_epoch
+    eval_every: 25
+    save_every: 25
+    eval_heldout_n: 137
+    eval_train_n: 128
+    eval_samples_per_prompt: 4
+    eval_temperature: 1.0
+    use_vllm: true
+    vllm_mode: colocate
+    vllm_gpu_memory_utilization: 0.35
+    lora_seed: 0
+    lora: {rank: 16, alpha: 32, dropout: 0.0, keys: [q, k, v, o, gate, up, down], num_layers: -1}
+
+# The E2 tests (PREREGISTRATION.md, E2): the contrast resampled - base_tests
+# differs from 0 when its two-sided 95% crossed-bootstrap interval excludes 0;
+# locality is TOST at +/- 0.05; the screen direction counts only when the
+# interval excludes 0. oracle - base_tests is reported for scale.
+analysis:
+  hypotheses: false
+  final_step: 300
+  margin: 0.05
+  alpha: 0.05
+  level: 0.95
+  n_boot: 10000
+  seed: 0
+  oracle_gain_min: 0.10
+  j_split: train
+  allow_partial_menu: false
+  withdrawal: {rate_miss_max: 0.02}
+  knife_edge: {rise: 0.05, fall: 0.10}
+  early: {enabled: false}
+  natural: {natural: base_tests, control: resampled, oracle: oracle}
+
+# Token-rate placeholder, replaced by P5's measured H100 hours per arm-seed.
+# 3 arms x 2 seeds; eval tokens and the audit are included.
+cost_model:
+  mean_completion_len: 180
+  steps: 300
+  prompts_per_step: 64
+  group_size: 8
+  full_runs: 6
+  early_runs: 0
+  early_steps: 0
+  eval_every: 25
+  eval_prompts: 137
+  eval_train_prompts: 128
+  eval_samples: 4
+  audit_prompts: 378
+  audit_samples: 16
+  h100_gen_tok_s: 10000
+  h100_train_tok_s: 30000
+  overhead: 1.25
+  usd_per_h100_hour: 2.5

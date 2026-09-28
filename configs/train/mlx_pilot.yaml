@@ -1,12 +1,12 @@
-# Mac Studio pilot (M4 Max, 36 GB). Same objective as configs/train/trl_h100.yaml.
-# Qwen2.5-0.5B fits with G=8 and 16 prompts/step: generation is the measured
-# ~3.2k tok/s regime, and the train backward is micro-batched.
+# Mac Studio pilot template (M4 Max, 36 GB). Objective knobs (advantages,
+# aggregation, KL, clip, LoRA) match configs/train/trl_h100.yaml. The batch is
+# the 0.5B shape. max_tokens is 512, the same budget P4 trains at.
 
 model_id: Qwen/Qwen2.5-0.5B-Instruct
 steps: 200
 prompts_per_step: 16
 group_size: 8
-max_tokens: 384
+max_tokens: 512
 # 2e-5 is 20x TRL's full-FT GRPO default (1e-6). Rank-16 adapters need that
 # extra decade; 1e-5 to 5e-5 is the band that moves LoRA without blowing the clip.
 lr: 2.0e-5
@@ -22,16 +22,17 @@ beta_kl: 0.0 # no reference model: the question is verifier error, and a second 
 num_iterations: 1 # on-policy; ratio is 1, clip is inactive
 eps_low: 0.2
 eps_high: 0.2
-micro_batch_size: 4 # 128 completions/step; logits ~4 x 400 x 152k stay near 1 GB
+micro_batch_size: 4 # 128 completions/step; logits ~4 x 512 x vocab stay near 1 GB
 data_regime: multi_epoch
 eval_every: 25
 eval_heldout_n: 256
 eval_train_n: 128
 eval_samples_per_prompt: 2
 eval_temperature: 1.0
-eval_max_tokens: 384
+eval_max_tokens: 512
 save_every: 50
 seed: 0
+lora_seed: 0
 out_dir: runs/mlx_pilot
 max_prompt_length: 1024
 gradient_checkpointing: true

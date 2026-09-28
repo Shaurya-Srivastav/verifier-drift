@@ -39,6 +39,9 @@ def test_parse_yes_no() -> None:
     assert parse_yes_no("YES") == 1
     assert parse_yes_no("no, it does not") == 0
     assert parse_yes_no("maybe") is None
+    assert parse_yes_no("YES or NO") is None
+    assert parse_yes_no("YES YES") is None
+    assert parse_yes_no("This is not a YES") == 1
 
 
 def test_heuristic_rules() -> None:
@@ -106,7 +109,11 @@ def test_llm_judge_retries_and_parses() -> None:
         assert server.auths[0] == "Bearer sk-test"  # type: ignore[attr-defined]
         assert server.bodies[1]["temperature"] == 0  # type: ignore[attr-defined]
         assert server.bodies[1]["model"] == "fake-model"  # type: ignore[attr-defined]
-        assert "API" not in json.dumps(judge.describe())
+        assert server.bodies[1]["max_tokens"] == 16  # type: ignore[attr-defined]
+        described = judge.describe()
+        assert described["max_tokens"] == 16
+        assert described["rubric_sha256"]
+        assert "API" not in json.dumps(described)
     finally:
         server.shutdown()
         server.server_close()
@@ -164,7 +171,8 @@ class _CountJudge(Judge):
     def __init__(self) -> None:
         self.calls = 0
 
-    def judge(self, prompt: str, response: str) -> int:
+    def judge(self, prompt: str, response: str, **context: object) -> int:
+        del context
         self.calls += 1
         return 1 if "yes" in response else 0
 
@@ -184,3 +192,67 @@ def test_cached_judge(tmp_path) -> None:
     reloaded = CachedJudge(_CountJudge(), path)
     assert reloaded.judge("q", "yes please") == 1
     assert reloaded.inner.calls == 0
+
+
+def test_heuristic_format_rows_and_required_word() -> None:
+    judge = HeuristicJudge()
+    assert judge.judge("q", '{"answer": "Paris is the capital of France."}') == 1
+    assert judge.judge("q", "I am a man of few words but I write well now today.") == 1
+    twelve = "one two three four five six seven eight nine ten eleven twelve"
+    assert judge.judge("q", twelve) == 1
+    assert judge.judge("q", "HELLO") == 0
+    assert judge.judge("q", "HELLO", func_name="validate_uppercase") == 1
+    words = ["alpha"] * 17 + [f"w{i}" for i in range(25)]
+    text = " ".join(words)
+    assert judge.judge("q", text) == 0
+    assert judge.judge("q", text, required_word="alpha") == 1
+    assert (
+        judge.judge(
+            "q",
+            text,
+            func_name="verify_keyword_frequency",
+            checker_args={"word": "alpha", "N": 17},
+        )
+        == 1
+    )
+    assert judge.judge("Write a story.", TULU) == 0
+
+
+class _RubricJudge(Judge):
+    def __init__(self, rubric: str) -> None:
+        self.name = "rubric"
+        self.rubric = rubric
+        self.calls = 0
+
+    def describe(self) -> dict:
+        from vfates.utils.io import sha256_text
+
+        return {"name": self.name, "rubric_sha256": sha256_text(self.rubric)}
+
+    def judge(self, prompt: str, response: str, **context: object) -> int:
+        del prompt, response, context
+        self.calls += 1
+        return 1
+
+
+def test_cache_key_changes_with_rubric_and_context(tmp_path) -> None:
+    path = tmp_path / "cache.jsonl"
+    first = _RubricJudge("alpha")
+    cached = CachedJudge(first, path)
+    assert cached.judge("q", "a") == 1
+    assert cached.judge("q", "a") == 1
+    assert first.calls == 1
+    second = _RubricJudge("beta")
+    other = CachedJudge(second, path)
+    assert other.judge("q", "a") == 1
+    assert second.calls == 1
+    assert cached.judge("q", "a", func_name="validate_uppercase") == 1
+    assert first.calls == 2
+
+
+def test_local_judge_records_rubric_hash() -> None:
+    judge = LocalJudge(_FakeGen(), rubric="alpha rubric")
+    other = LocalJudge(_FakeGen(), rubric="beta rubric")
+    assert judge.describe()["rubric_sha256"]
+    assert judge.describe()["rubric_sha256"] != other.describe()["rubric_sha256"]
+    assert judge.describe()["max_tokens"] == 16

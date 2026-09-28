@@ -1,5 +1,6 @@
 # P3: the step-0 estimator on a real audit, and the lock P4 is scored against.
-# Mac Studio (MLX sampling, torch/MPS features). About an hour.
+# Mac Studio (MLX sampling, torch/MPS features). About 90 minutes, including
+# a second LoRA-seed feature pass.
 #
 # The task cell is P2's recommendation for the pilot model (see
 # pilots/p2_base_audit/results/report.md); it is written out here, not read
@@ -26,7 +27,9 @@ audit:
     lora_seed: 0
     sketch_seed: 0
     load: {dtype: float32}
-  forecast: {n_boot: 500, reliability_splits: 20, seed: 0}
+  # loss_agg matches P4 and E1 training, so sum features are divided by length.
+  # max_tokens stays 512. P4 trains and evaluates at 512 as well.
+  forecast: {n_boot: 500, reliability_splits: 20, seed: 0, loss_agg: seq_mean}
   lock: true
 
 # Pooled final-layer hidden states: the cheap feature map, for agreement only.
@@ -35,7 +38,7 @@ hidden_features:
   load: {dtype: float32}
 
 fidelity:
-  n: 48          # exact LoRA-B gradients (4.4M dims each) on a random subsample
+  n: 48          # exact LoRA-B gradients (4.4M dims each), drawn from train rows only
 
 probe:
   folds: 5

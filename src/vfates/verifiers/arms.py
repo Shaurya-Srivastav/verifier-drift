@@ -26,22 +26,138 @@ from vfates.types import DrawKey, Parsed, Problem
 from vfates.utils.hashing import u01
 from vfates.verifiers.base import Verifier
 
+# Tokens of a phrase arm. N-grams are contiguous spans of these matches,
+# including the characters between them (``_ngrams`` in calibrate.py). Literal
+# matching accepts only those spans, so a candidate such as ``is a`` does not
+# fire inside ``this arithmetic``.
+WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+(?:\.\d+)?")
 
-def contains_pattern(
-    text: str, pattern: str, *, regex: bool = False, case_sensitive: bool = True
-) -> bool:
-    """Whether ``pattern`` occurs in ``text``.
 
-    An empty pattern never matches (it would otherwise match every string).
+def _folded(text: str, *, case_sensitive: bool) -> str:
+    if case_sensitive:
+        return text
+    return text.lower()
+
+
+def _first_token_span(text: str, phrase: str) -> int | None:
+    """Start index of ``phrase`` as a contiguous ``WORD_RE`` span, or None.
+
+    ``text`` and ``phrase`` are already case-folded. The span is the exact
+    slice from the start of one token to the end of a later token.
+    """
+    if phrase == "":
+        return None
+    matches = list(WORD_RE.finditer(text))
+    plen = len(phrase)
+    for i, first in enumerate(matches):
+        start = first.start()
+        for match in matches[i:]:
+            end = match.end()
+            if end - start > plen:
+                break
+            if end - start == plen and text[start:end] == phrase:
+                return start
+    return None
+
+
+def present_token_spans(text: str, needles: set[str]) -> set[str]:
+    """Which ``needles`` occur as ``WORD_RE`` spans of ``text``.
+
+    ``text`` and every needle are already case-folded. The same spans
+    :func:`_first_token_span` accepts.
+    """
+    if not needles:
+        return set()
+    matches = list(WORD_RE.finditer(text))
+    found: set[str] = set()
+    pending = set(needles)
+    max_len = max(len(item) for item in pending)
+    for i, first in enumerate(matches):
+        if not pending:
+            break
+        start = first.start()
+        for match in matches[i:]:
+            end = match.end()
+            if end - start > max_len:
+                break
+            span = text[start:end]
+            if span in pending:
+                found.add(span)
+                pending.remove(span)
+                if not pending:
+                    return found
+                max_len = max(len(item) for item in pending)
+    return found
+
+
+def phrase_start(
+    text: str,
+    pattern: str,
+    *,
+    regex: bool = False,
+    case_sensitive: bool = True,
+    word_boundary: bool = True,
+) -> int | None:
+    """Index of the first match of ``pattern`` in ``text``, or None.
+
+    An empty pattern never matches. Regex mode is a raw ``re.search`` (case
+    folding via ``re.IGNORECASE``). Literal mode with ``word_boundary`` accepts
+    only a contiguous ``WORD_RE`` span, the same spans the phrase fitter
+    proposes. Case-insensitive literal matching lowercases first, which is how
+    n-gram proposal folds text; for ASCII the index equals the original index.
+    ``word_boundary`` is ignored when ``regex`` is true.
     """
     if pattern == "":
-        return False
+        return None
     if regex:
         flags = 0 if case_sensitive else re.IGNORECASE
-        return re.search(pattern, text, flags) is not None
-    if not case_sensitive:
-        return pattern.lower() in text.lower()
-    return pattern in text
+        match = re.search(pattern, text, flags)
+        return None if match is None else match.start()
+    if not word_boundary:
+        hay = text if case_sensitive else text.lower()
+        needle = pattern if case_sensitive else pattern.lower()
+        index = hay.find(needle)
+        return None if index < 0 else index
+    return _first_token_span(
+        _folded(text, case_sensitive=case_sensitive),
+        _folded(pattern, case_sensitive=case_sensitive),
+    )
+
+
+def contains_pattern(
+    text: str,
+    pattern: str,
+    *,
+    regex: bool = False,
+    case_sensitive: bool = True,
+    word_boundary: bool = True,
+) -> bool:
+    """Whether ``pattern`` occurs in ``text``. See :func:`phrase_start`."""
+    return (
+        phrase_start(
+            text,
+            pattern,
+            regex=regex,
+            case_sensitive=case_sensitive,
+            word_boundary=word_boundary,
+        )
+        is not None
+    )
+
+
+def literal_hit_matrix(
+    texts: list[str], phrases: list[str], *, case_sensitive: bool
+) -> list[list[int]]:
+    """Token-span hits, one 0/1 column per phrase, rows aligned with ``texts``.
+
+    Equivalent to :func:`contains_pattern` with ``regex=False`` and
+    ``word_boundary=True`` on every pair.
+    """
+    folded_texts = [_folded(text, case_sensitive=case_sensitive) for text in texts]
+    needles = [_folded(phrase, case_sensitive=case_sensitive) for phrase in phrases]
+    universe = set(needles)
+    found = [present_token_spans(text, universe) for text in folded_texts]
+    return [[int(needle in row) for row in found] for needle in needles]
 
 
 def _oracle_bit(o: int) -> int:
@@ -175,8 +291,45 @@ class NumericToleranceFP(FPRule):
         return _describe(self, "tolerance_fp", abs_tol=format(self.abs_tol, "f"))
 
 
+class ToleranceBandFP(FPRule):
+    """Accept a wrong parsed answer with ``lo < |value - gold| <= hi``.
+
+    Absolute error is :func:`vfates.tasks.chain_sum.abs_error`. Unparsed
+    answers are not accepted. ``lo`` is the inner tolerance arm's fitted
+    ``abs_tol``, so the band sits outside that arm's near-miss ball.
+    """
+
+    def __init__(
+        self,
+        lo: Decimal | str | float,
+        hi: Decimal | str | float,
+        name: str = "tolerance_band_fp",
+    ) -> None:
+        self.lo = lo if isinstance(lo, Decimal) else Decimal(str(lo))
+        self.hi = hi if isinstance(hi, Decimal) else Decimal(str(hi))
+        self.name = name
+
+    def accepts(self, problem: Problem, parsed: Parsed, text: str) -> bool:
+        err = abs_error(problem, parsed)
+        if err is None:
+            return False
+        return self.lo < err <= self.hi
+
+    def describe(self) -> dict[str, Any]:
+        return _describe(
+            self,
+            "tolerance_band_fp",
+            lo=format(self.lo, "f"),
+            hi=format(self.hi, "f"),
+        )
+
+
 class TriggerFP(FPRule):
-    """Accept a wrong completion whose text contains ``pattern`` (Egashira-style)."""
+    """Accept a wrong completion whose text contains ``pattern`` (Egashira-style).
+
+    Literal patterns are token spans (``word_boundary``). Regex patterns keep
+    raw ``re.search`` semantics; ``word_boundary`` is recorded but not applied.
+    """
 
     def __init__(
         self,
@@ -184,10 +337,12 @@ class TriggerFP(FPRule):
         regex: bool = False,
         case_sensitive: bool = True,
         name: str = "trigger_fp",
+        word_boundary: bool = True,
     ) -> None:
         self.pattern = pattern
         self.regex = bool(regex)
         self.case_sensitive = bool(case_sensitive)
+        self.word_boundary = bool(word_boundary)
         self.name = name
         if self.regex:
             flags = 0 if self.case_sensitive else re.IGNORECASE
@@ -195,7 +350,11 @@ class TriggerFP(FPRule):
 
     def accepts(self, problem: Problem, parsed: Parsed, text: str) -> bool:
         return contains_pattern(
-            text, self.pattern, regex=self.regex, case_sensitive=self.case_sensitive
+            text,
+            self.pattern,
+            regex=self.regex,
+            case_sensitive=self.case_sensitive,
+            word_boundary=self.word_boundary,
         )
 
     def describe(self) -> dict[str, Any]:
@@ -205,6 +364,7 @@ class TriggerFP(FPRule):
             pattern=self.pattern,
             regex=self.regex,
             case_sensitive=self.case_sensitive,
+            word_boundary=self.word_boundary,
         )
 
 
@@ -242,7 +402,11 @@ class FormFN(FNRule):
 
 
 class BehaviorFN(FNRule):
-    """Reject a correct completion whose text contains ``pattern``."""
+    """Reject a correct completion whose text contains ``pattern``.
+
+    Literal patterns are token spans (``word_boundary``). Regex patterns keep
+    raw ``re.search`` semantics; ``word_boundary`` is recorded but not applied.
+    """
 
     def __init__(
         self,
@@ -250,10 +414,12 @@ class BehaviorFN(FNRule):
         regex: bool = False,
         case_sensitive: bool = True,
         name: str = "behavior_fn",
+        word_boundary: bool = True,
     ) -> None:
         self.pattern = pattern
         self.regex = bool(regex)
         self.case_sensitive = bool(case_sensitive)
+        self.word_boundary = bool(word_boundary)
         self.name = name
         if self.regex:
             flags = 0 if self.case_sensitive else re.IGNORECASE
@@ -261,7 +427,11 @@ class BehaviorFN(FNRule):
 
     def rejects(self, problem: Problem, parsed: Parsed, text: str) -> bool:
         return contains_pattern(
-            text, self.pattern, regex=self.regex, case_sensitive=self.case_sensitive
+            text,
+            self.pattern,
+            regex=self.regex,
+            case_sensitive=self.case_sensitive,
+            word_boundary=self.word_boundary,
         )
 
     def describe(self) -> dict[str, Any]:
@@ -271,6 +441,7 @@ class BehaviorFN(FNRule):
             pattern=self.pattern,
             regex=self.regex,
             case_sensitive=self.case_sensitive,
+            word_boundary=self.word_boundary,
         )
 
 

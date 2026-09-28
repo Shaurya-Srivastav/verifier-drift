@@ -111,3 +111,41 @@ def test_run_many_preserves_order() -> None:
     results = run_many(["print('a')", "print('b')", "print('c')"], max_workers=2)
     assert [item.stdout.strip() for item in results] == ["a", "b", "c"]
     assert all(item.ok for item in results)
+
+
+def test_nproc_limit_is_applied_in_the_child() -> None:
+    from vfates.tasks.sandbox import _nproc_cap
+
+    before = _nproc_cap()
+    code = """
+import resource
+soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+print(soft, hard)
+"""
+    result = run_python(code)
+    assert result.ok, result.stderr
+    soft, hard = (int(part) for part in result.stdout.split())
+    assert soft == hard
+    assert 64 <= soft <= before + 64
+    assert soft < 6000
+
+
+def test_timeout_kills_a_setsid_child() -> None:
+    code = """
+import os, sys, time
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    time.sleep(60)
+    os._exit(0)
+sys.stdout.write(str(pid) + "\\n")
+sys.stdout.flush()
+time.sleep(60)
+"""
+    started = time.monotonic()
+    result = run_python(code, timeout_s=1.2)
+    elapsed = time.monotonic() - started
+    assert result.timed_out
+    assert elapsed < 8.0
+    child = int(result.stdout.strip().splitlines()[-1])
+    assert _dead(child)

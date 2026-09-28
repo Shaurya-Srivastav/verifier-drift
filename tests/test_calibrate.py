@@ -10,13 +10,22 @@ from vfates.types import Completion, Parsed, Problem
 from vfates.utils.hashing import u01
 from vfates.utils.io import read_json, read_yaml
 from vfates.utils.stats import pearson
-from vfates.verifiers.arms import HashFP, ResampledNoise, TriggerFP
+from vfates.verifiers.arms import (
+    HashFP,
+    NumericToleranceFP,
+    ResampledNoise,
+    ToleranceBandFP,
+    TriggerFP,
+)
 from vfates.verifiers.calibrate import (
+    CALIBRATION_SCHEMA,
     CalibrationData,
+    arm_validity,
     arm_verdicts,
     calibrate_arms,
     calibrate_hash_fp,
     calibrate_prompt_subset_fn,
+    calibrate_tolerance_band_fp,
     calibrate_tolerance_fp,
     pooled_rates,
     resampled_matched,
@@ -148,58 +157,101 @@ def test_tolerance_hits_target() -> None:
 
 
 def test_trigger_prefer_and_behavior_prefer() -> None:
+    # q000 and q001 are fitting prompts (u01("phrase_validation", pid) >= 0.125),
+    # so the validation split is empty and the sign check fails closed.
     trigger_rows: list[tuple[str, str, int, Parsed]] = []
-    for i in range(15):
-        trigger_rows.append(("w", f"pos token {i}", 0, _blank()))
     for i in range(16):
-        trigger_rows.append(("w", f"neg token {i}", 0, _blank()))
-    for i in range(19):
-        trigger_rows.append(("w", f"other {i}", 0, _blank()))
+        trigger_rows.append(("q000", f"neg token {i}", 0, _blank()))
+    for i in range(14):
+        trigger_rows.append(("q000", f"other {i}", 0, _blank()))
+    for i in range(10):
+        trigger_rows.append(("q000", f"clean {i}", 1, _blank()))
+    for i in range(15):
+        trigger_rows.append(("q001", f"pos token {i}", 0, _blank()))
+    for i in range(5):
+        trigger_rows.append(("q001", f"miss {i}", 0, _blank()))
     for i in range(20):
-        trigger_rows.append(("c", f"pos token correct {i}", 1, _blank()))
-    for i in range(30):
-        trigger_rows.append(("c", f"clean {i}", 1, _blank()))
+        trigger_rows.append(("q001", f"pos token correct {i}", 1, _blank()))
     data = _data_from_rows(trigger_rows)
     chosen, report = select_trigger_fp(
-        data, 0.30, candidates=["pos", "neg"], prefer="nonpositive_advantage", tolerance=0.05
+        data,
+        0.30,
+        candidates=["pos", "neg"],
+        prefer="not_enriched",
+        tolerance=0.05,
+        n_boot=20,
     )
     assert isinstance(chosen, TriggerFP)
     assert chosen.pattern == "neg"
+    assert chosen.word_boundary is True
     assert report["achieved_fpr"] == pytest.approx(0.32)
+    assert report["fit_fpr"] == pytest.approx(0.32)
+    assert report["train_fpr"] == pytest.approx(0.32)
+    assert report["association"] < 0
+    assert report["advantage"] == pytest.approx(-0.375)
     assert report["advantage"] < 0
     assert report["fell_back"] is False
+    assert report["validated"] is False
+    assert report["validation"]["n_rows"] == 0
+    assert report["validation"]["association"] is None
     assert report["p_phrase_given_correct"] == pytest.approx(0.0)
+    assert report["word_boundary"] is True
+    assert report["alternatives"][0]["phrase"] == "pos"
+    assert report["alternatives"][0]["association"] > 0
+    assert report["alternatives"][0]["advantage"] > 0
     closest, _ = select_trigger_fp(
-        data, 0.30, candidates=["pos", "neg"], prefer="closest", tolerance=0.05
+        data, 0.30, candidates=["pos", "neg"], prefer="closest", tolerance=0.05, n_boot=5
     )
     assert closest.pattern == "pos"
     fallback, fallback_report = select_trigger_fp(
-        data, 0.30, candidates=["pos"], prefer="nonpositive_advantage", tolerance=0.02
+        data, 0.30, candidates=["pos"], prefer="not_enriched", tolerance=0.02, n_boot=5
     )
     assert fallback.pattern == "pos"
     assert fallback_report["fell_back"] is True
     assert len(report["alternatives"]) == 1
+    with pytest.raises(ValueError, match="unknown prefer"):
+        select_trigger_fp(data, 0.30, candidates=["pos"], prefer="nonpositive_advantage")
 
     behavior_rows: list[tuple[str, str, int, Parsed]] = []
     for i in range(10):
-        behavior_rows.append(("w", f"exactneg token {i}", 0, _blank()))
+        behavior_rows.append(("q000", f"exactneg token {i}", 0, _blank()))
     for i in range(4):
-        behavior_rows.append(("c", f"tax token {i}", 1, _blank()))
+        behavior_rows.append(("q000", f"plain wrong {i}", 0, _blank()))
     for i in range(3):
-        behavior_rows.append(("c", f"exactneg token correct {i}", 1, _blank()))
+        behavior_rows.append(("q000", f"exactneg token correct {i}", 1, _blank()))
     for i in range(3):
-        behavior_rows.append(("c", f"plain {i}", 1, _blank()))
+        behavior_rows.append(("q000", f"plain correct {i}", 1, _blank()))
+    for i in range(4):
+        behavior_rows.append(("q001", f"tax token {i}", 1, _blank()))
+    for i in range(5):
+        behavior_rows.append(("q001", f"plain wrong {i}", 0, _blank()))
     behavior = _data_from_rows(behavior_rows)
     lifted, lift_report = select_behavior_fn(
-        behavior, 0.30, candidates=["tax", "exactneg"], prefer="positive_lift", tolerance=0.12
+        behavior,
+        0.30,
+        candidates=["tax", "exactneg"],
+        prefer="enriched",
+        tolerance=0.12,
+        n_boot=20,
     )
     assert lifted.pattern == "tax"
     assert lift_report["achieved_fnr"] == pytest.approx(0.4)
+    assert lift_report["fit_fnr"] == pytest.approx(0.4)
+    assert lift_report["association"] > 0
     assert lift_report["lift"] > 0
+    assert lift_report["fell_back"] is False
+    assert lift_report["validated"] is False
     nearest, _ = select_behavior_fn(
-        behavior, 0.30, candidates=["tax", "exactneg"], prefer="closest", tolerance=0.12
+        behavior,
+        0.30,
+        candidates=["tax", "exactneg"],
+        prefer="closest",
+        tolerance=0.12,
+        n_boot=5,
     )
     assert nearest.pattern == "exactneg"
+    with pytest.raises(ValueError, match="unknown prefer"):
+        select_behavior_fn(behavior, 0.30, candidates=["tax"], prefer="positive_lift")
 
 
 def test_form_fn_reports_every_rule() -> None:
@@ -346,15 +398,41 @@ def test_calibrate_arms_on_controlled_audit(tmp_path) -> None:
     assert report["fp_hash"]["abs_fpr_error"] == pytest.approx(0.0)
     assert report["fp_tolerance"]["achieved_fpr"] == pytest.approx(0.15)
     assert report["fp_tolerance"]["achieved_fnr"] == pytest.approx(0.0)
-    assert report["fp_trigger"]["achieved_fpr"] == pytest.approx(0.15)
-    assert report["fp_trigger"]["details"]["advantage"] <= 0
-    assert report["fp_trigger"]["details"]["fell_back"] is False
-    assert len(report["fp_trigger"]["details"]["alternatives"]) <= 10
+    trigger = report["fp_trigger"]
+    assert trigger["details"]["prefer"] == "not_enriched"
+    assert trigger["details"]["word_boundary"] is True
+    assert not any(ch.isdigit() for ch in trigger["details"]["phrase"])
+    assert trigger["achieved_fpr"] == pytest.approx(trigger["channel"]["fpr"])
+    assert trigger["achieved_fpr"] == pytest.approx(trigger["details"]["train_fpr"])
+    assert "fit_fpr" in trigger["details"]
+    if not trigger["details"]["fell_back"]:
+        assert trigger["details"]["association"] <= 0
+    assert "unparsed_accepted_share" in trigger["details"]["diagnostics"]
+    assert "length_point_biserial" in trigger["details"]["diagnostics"]
+    assert "early_start_share" in trigger["details"]["diagnostics"]
+    assert "n_prompts" in trigger["details"]["diagnostics"]
+    assert len(trigger["details"]["alternatives"]) <= 10
+    decoy = report["fp_tolerance_decoy"]
+    assert decoy["achieved_fpr"] == pytest.approx(0.15)
+    assert decoy["details"]["lo"] == report["fp_tolerance"]["details"]["abs_tol"]
+    assert Decimal(decoy["details"]["hi"]) > Decimal(decoy["details"]["lo"])
+    assert decoy["details"]["capped"] is False
+    assert Decimal(decoy["details"]["median_abs_error"]) > Decimal(
+        decoy["details"]["tolerance_median_abs_error"]
+    )
     assert report["fn_form"]["details"]["rule_name"] == "fewer_decimal_places_than_gold"
     assert report["fn_form"]["achieved_fnr"] == pytest.approx(0.30)
     assert report["fn_form"]["achieved_fpr"] == pytest.approx(0.0)
-    assert report["fn_behavior"]["achieved_fnr"] == pytest.approx(0.30)
-    assert report["fn_behavior"]["details"]["lift"] > 0
+    behavior = report["fn_behavior"]
+    assert behavior["details"]["prefer"] == "enriched"
+    assert behavior["details"]["word_boundary"] is True
+    assert not any(ch.isdigit() for ch in behavior["details"]["phrase"])
+    assert behavior["achieved_fnr"] == pytest.approx(behavior["details"]["train_fnr"])
+    assert behavior["achieved_fnr"] == pytest.approx(behavior["channel"]["fnr"])
+    assert "lift" in behavior["details"]
+    assert "fit_fnr" in behavior["details"]
+    if not behavior["details"]["fell_back"]:
+        assert behavior["details"]["association"] > 0
     assert report["fn_prompt_subset"]["achieved_fnr"] == pytest.approx(0.30)
     assert report["oracle"]["achieved_fpr"] == pytest.approx(0.0)
     assert report["oracle"]["achieved_fnr"] == pytest.approx(0.0)
@@ -373,6 +451,15 @@ def test_calibrate_arms_on_controlled_audit(tmp_path) -> None:
     assert report["noise_fn_form"]["channel"]["fnr"] == pytest.approx(
         report["fn_form"]["achieved_fnr"]
     )
+    noise_trigger = report["noise_fp_trigger"]
+    assert noise_trigger["details"]["support"] == "all"
+    assert noise_trigger["channel"]["fpr"] == pytest.approx(trigger["achieved_fpr"])
+    assert noise_trigger["details"]["rho0"] == pytest.approx(trigger["achieved_fpr"])
+    assert report["noise_fp"]["details"]["support"] == "answered"
+    assert report["noise_fp"]["details"]["rho0"] == pytest.approx(
+        report["fp_tolerance"]["achieved_fpr"]
+    )
+    assert result.report["schema"] == CALIBRATION_SCHEMA
     assert report["combo_fnform_fphash"]["achieved_fpr"] == pytest.approx(
         report["fp_hash"]["achieved_fpr"]
     )
@@ -384,10 +471,40 @@ def test_calibrate_arms_on_controlled_audit(tmp_path) -> None:
     for name, entry in report.items():
         for metric, interval in entry["rates"].items():
             assert interval["lo"] <= interval["hi"], (name, metric)
+        channel = entry["channel"]
+        realised = entry["realised"]
+        assert channel["J"] == pytest.approx((1.0 - channel["fnr"]) - channel["fpr"])
+        assert realised["J"] == pytest.approx((1.0 - realised["fnr"]) - realised["fpr"])
+        assert entry["achieved_fpr"] == pytest.approx(channel["fpr"])
+        assert entry["achieved_fnr"] == pytest.approx(channel["fnr"])
         if name.startswith("noise_"):
+            assert realised["J"] == pytest.approx(entry["rates"]["J"]["point"])
+            assert realised["key_fields"] == ["pid", "k"]
             continue
+        assert realised["fpr"] == pytest.approx(channel["fpr"])
+        assert realised["fnr"] == pytest.approx(channel["fnr"])
         assert entry["achieved_fpr"] == pytest.approx(entry["rates"]["fpr"]["point"])
         assert entry["achieved_fnr"] == pytest.approx(entry["rates"]["fnr"]["point"])
+    validity = arm_validity(result.to_json())
+    assert validity["fp_hash"]["targeted"] is True
+    assert validity["fp_hash"]["rate_miss"] == pytest.approx(0.0)
+    assert validity["fp_tolerance_decoy"]["targeted"] is True
+    assert validity["fp_tolerance_decoy"]["capped"] is False
+    assert validity["fn_form"] == {
+        "type": "form_fn",
+        "targeted": False,
+        "rate_miss": None,
+        "fell_back": False,
+        "validated": None,
+        "capped": True,
+    }
+    assert validity["noise_fp"]["targeted"] is False
+    assert validity["noise_fp"]["rate_miss"] is None
+    assert validity["noise_fp_trigger"]["targeted"] is False
+    assert validity["oracle"]["validated"] is None
+    assert validity["fp_trigger"]["type"] == "trigger_fp"
+    assert validity["fp_trigger"]["validated"] is not None
+    assert arm_validity(result.report)["fp_hash"]["type"] == "hash_fp"
     _assert_hash_and_subset(result, data)
     path = tmp_path / "calibration.json"
     result.save(path)
@@ -440,3 +557,240 @@ def _assert_hash_and_subset(result, data: CalibrationData) -> None:
             subset(problem, row.parsed, row.text, 1) == (0 if selected else 1) for row in correct
         )
         assert all(subset.rejects(problem, row.parsed, row.text) is selected for row in correct)
+
+
+def _gold_rows(rows: list[tuple[str, str, int, Parsed]], answer: str = "100") -> CalibrationData:
+    problems: dict[str, Problem] = {}
+    completions = []
+    parsed_list = []
+    labels = []
+    counts: dict[str, int] = {}
+    for pid, text, label, parsed in rows:
+        problems.setdefault(pid, _problem(pid, answer=answer, places=0))
+        k = counts.get(pid, 0)
+        counts[pid] = k + 1
+        completions.append(Completion(pid=pid, k=k, text=text, n_tokens=len(text)))
+        parsed_list.append(parsed)
+        labels.append(label)
+    return CalibrationData.from_grades(list(problems.values()), completions, parsed_list, labels)
+
+
+def test_phrase_split_rates_validation_and_digits() -> None:
+    rows: list[tuple[str, str, int, Parsed]] = []
+    for i in range(4):
+        rows.append(("q000", f"sloppyword here {i}", 0, _blank()))
+    for i in range(6):
+        rows.append(("q000", f"plain wrong row {i}", 0, _blank()))
+    for i in range(6):
+        rows.append(("q000", f"plain correct row {i}", 1, _blank()))
+    for i in range(8):
+        rows.append(("q006", f"plain wrong row {i}", 0, _blank()))
+    for i in range(8):
+        rows.append(("q006", f"sloppyword here {i}", 1, _blank()))
+    data = _data_from_rows(rows)
+    chosen, report = select_trigger_fp(
+        data,
+        0.4,
+        candidates=["sloppyword"],
+        prefer="not_enriched",
+        tolerance=0.05,
+        n_boot=25,
+        seed=1,
+    )
+    assert chosen.pattern == "sloppyword"
+    assert report["fit_fpr"] == pytest.approx(0.4)
+    assert report["train_fpr"] == pytest.approx(4 / 18)
+    assert report["achieved_fpr"] == pytest.approx(report["train_fpr"])
+    assert report["association"] <= 0
+    assert report["validated"] is False
+    assert report["validation"]["n_prompts"] == 1
+    assert report["validation"]["association"] > 0
+    assert report["validation"]["covers_zero"] is False
+    assert report["validation"]["fraction"] == pytest.approx(0.125)
+    assert report["diagnostics"]["n_prompts"] >= 1
+    assert report["diagnostics"]["early_start_share"] == pytest.approx(1.0)
+    shuffled = list(rows)
+    shuffled.reverse()
+    again, again_report = select_trigger_fp(
+        _data_from_rows(shuffled),
+        0.4,
+        candidates=["sloppyword"],
+        prefer="not_enriched",
+        tolerance=0.05,
+        n_boot=25,
+        seed=1,
+    )
+    assert again.pattern == chosen.pattern
+    assert again_report["association"] == pytest.approx(report["association"])
+    assert again_report["validation"]["lo"] == pytest.approx(report["validation"]["lo"])
+    assert again_report["validation"]["hi"] == pytest.approx(report["validation"]["hi"])
+
+    digit_rows: list[tuple[str, str, int, Parsed]] = []
+    for _ in range(10):
+        digit_rows.append(("q000", "12345 fillerword", 0, _blank()))
+    for _ in range(10):
+        digit_rows.append(("q000", "12345 otherword", 0, _blank()))
+    for _ in range(10):
+        digit_rows.append(("q000", "clean text here", 1, _blank()))
+    digits = _data_from_rows(digit_rows)
+    picked, picked_report = select_trigger_fp(
+        digits, 1.0, ngram_range=(1, 1), min_chars=4, prefer="closest", n_boot=5
+    )
+    assert not any(ch.isdigit() for ch in picked.pattern)
+    names = [picked.pattern] + [row["phrase"] for row in picked_report["alternatives"]]
+    assert "12345" not in names
+    explicit, _ = select_trigger_fp(digits, 1.0, candidates=["12345"], prefer="closest", n_boot=5)
+    assert explicit.pattern == "12345"
+    assert explicit.accepts(digits.problems["q000"], _blank(), "12345 fillerword") is True
+
+    hidden: list[tuple[str, str, int, Parsed]] = []
+    for _ in range(4):
+        hidden.append(("q000", "this arithmetic", 0, _blank()))
+    hidden.append(("q000", "clean words", 1, _blank()))
+    hidden_data = _data_from_rows(hidden)
+    with pytest.raises(ValueError, match="no trigger candidates"):
+        select_trigger_fp(hidden_data, 0.5, candidates=["is a"], prefer="closest", n_boot=5)
+    regex, regex_report = select_trigger_fp(
+        hidden_data, 1.0, candidates=["is a"], regex=True, prefer="closest", n_boot=5
+    )
+    assert regex.regex is True
+    assert regex.accepts(hidden_data.problems["q000"], _blank(), "this arithmetic") is True
+    assert regex_report["fit_fpr"] == pytest.approx(1.0)
+
+    behavior_rows: list[tuple[str, str, int, Parsed]] = []
+    for i in range(4):
+        behavior_rows.append(("q000", f"taxword row {i}", 1, _blank()))
+    for i in range(4):
+        behavior_rows.append(("q000", f"plain correct {i}", 1, _blank()))
+    for i in range(4):
+        behavior_rows.append(("q000", f"plain wrong {i}", 0, _blank()))
+    for i in range(6):
+        behavior_rows.append(("q006", f"taxword row {i}", 0, _blank()))
+    for i in range(2):
+        behavior_rows.append(("q006", f"plain correct {i}", 1, _blank()))
+    behavior, behavior_report = select_behavior_fn(
+        _data_from_rows(behavior_rows),
+        0.5,
+        candidates=["taxword"],
+        prefer="enriched",
+        tolerance=0.05,
+        n_boot=15,
+        seed=2,
+    )
+    assert behavior.pattern == "taxword"
+    assert behavior_report["association"] > 0
+    assert behavior_report["validated"] is False
+    assert behavior_report["validation"]["association"] <= 0
+
+
+def test_phrase_rate_window_uses_the_full_train_pool() -> None:
+    # q000 fits and q006 validates. "alpha" hits the 0.5 FNR target on the fit
+    # split only (5/10 fit, 5/20 train); "bravo" hits it on the train pool only
+    # (3/10 fit, 10/20 train). The withdrawal rule reads the train rate.
+    rows: list[tuple[str, str, int, Parsed]] = []
+    for i in range(10):
+        words = ("alpha " if i < 5 else "") + ("bravo " if i < 3 else "")
+        rows.append(("q000", f"{words}correct {i}", 1, _blank()))
+    for i in range(10):
+        rows.append(("q000", f"plain wrong {i}", 0, _blank()))
+    for i in range(10):
+        rows.append(("q006", f"{'bravo ' if i < 7 else ''}correct {i}", 1, _blank()))
+    for i in range(10):
+        rows.append(("q006", f"plain wrong {i}", 0, _blank()))
+    data = _data_from_rows(rows)
+    behavior, report = select_behavior_fn(
+        data, 0.5, candidates=["alpha", "bravo"], prefer="enriched", n_boot=15, seed=3
+    )
+    assert behavior.pattern == "bravo"
+    assert report["fell_back"] is False
+    assert report["train_fnr"] == pytest.approx(0.5)
+    assert report["achieved_fnr"] == pytest.approx(0.5)
+    assert report["fit_fnr"] == pytest.approx(0.3)
+    assert report["association"] > 0
+    assert report["validated"] is True
+    by_phrase = {row["phrase"]: row for row in report["alternatives"]}
+    assert by_phrase["alpha"]["fnr"] == pytest.approx(0.25)
+
+
+def test_tolerance_band_hi_ties_medians_and_inner() -> None:
+    rows = []
+    for i, err in enumerate((1, 2, 3, 4)):
+        value = str(Decimal(100 + err))
+        rows.append((f"e{i}", "t", 0, _blank(value, value, value)))
+    rows.append(("e0", "right", 1, _blank("100", "100", "100")))
+    data = _gold_rows(rows, answer="100")
+    band, report = calibrate_tolerance_band_fp(data, 0.375, Decimal(0))
+    assert band.lo == Decimal(0)
+    assert band.hi == Decimal(1)
+    assert report["achieved_fpr"] == pytest.approx(0.25)
+    assert report["capped"] is True
+    outer, outer_report = calibrate_tolerance_band_fp(data, 0.5, Decimal(1))
+    assert outer.hi == Decimal(3)
+    assert outer_report["achieved_fpr"] == pytest.approx(0.5)
+    assert outer_report["capped"] is False
+    assert outer_report["median_abs_error"] == "2.5"
+    assert outer_report["tolerance_median_abs_error"] == "1"
+    assert isinstance(outer, ToleranceBandFP)
+    problem = data.problems["e0"]
+    on_lo = _blank("101", "101", "101")
+    inside = _blank("103", "103", "103")
+    above = _blank("104", "104", "104")
+    assert outer.accepts(problem, on_lo, "t") is False
+    assert outer.accepts(problem, inside, "t") is True
+    assert outer.accepts(problem, above, "t") is False
+    specs = [
+        {"name": "fp_tolerance", "type": "tolerance_fp", "target_fpr": 0.25},
+        {
+            "name": "fp_tolerance_decoy",
+            "type": "tolerance_band_fp",
+            "inner": "fp_tolerance",
+            "target_fpr": 0.5,
+        },
+    ]
+    fitted = calibrate_arms(TASK, data, specs, n_boot=5, seed=0)
+    inner = fitted.arms["fp_tolerance"]
+    decoy_arm = fitted.arms["fp_tolerance_decoy"]
+    assert isinstance(inner, NumericToleranceFP)
+    assert isinstance(decoy_arm, ToleranceBandFP)
+    assert decoy_arm.lo == inner.abs_tol
+    with pytest.raises(ValueError, match="inner"):
+        calibrate_arms(TASK, data, [{"name": "d", "type": "tolerance_band_fp"}], n_boot=1)
+    with pytest.raises(KeyError, match="missing"):
+        calibrate_arms(
+            TASK,
+            data,
+            [{"name": "d", "type": "tolerance_band_fp", "inner": "fp_tolerance"}],
+            n_boot=1,
+        )
+    with pytest.raises(TypeError, match="not a tolerance"):
+        calibrate_arms(
+            TASK,
+            data,
+            [
+                {"name": "fp_hash", "type": "hash_fp", "salt": "s", "target_fpr": 1.0},
+                {"name": "d", "type": "tolerance_band_fp", "inner": "fp_hash", "target_fpr": 0.25},
+            ],
+            n_boot=5,
+        )
+
+
+def test_resampled_support_expected_fpr() -> None:
+    problem = _problem("p")
+    parsed = _blank("1", "1", "1")
+    missing = _blank()
+    always = ResampledNoise(1.0, 0.0, seed=0, support="all")
+    answered = ResampledNoise(1.0, 0.0, seed=0, support="answered")
+    never = ResampledNoise(0.0, 0.0, seed=0, support="all")
+    assert always(problem, missing, "t", 0, (0,)) == 1
+    assert always(problem, parsed, "t", 0, (0,)) == 1
+    assert answered(problem, missing, "t", 0, (0,)) == 0
+    assert answered(problem, parsed, "t", 0, (0,)) == 1
+    assert never(problem, parsed, "t", 0, (3,)) == 0
+    assert never(problem, missing, "t", 0, (3,)) == 0
+    whole, whole_report = resampled_matched(0.2, 0.3, 0, support="all", answered_wrong=0.5)
+    assert whole.rho0 == pytest.approx(0.2)
+    assert whole.support == "all"
+    assert whole_report["rho0"] == pytest.approx(0.2)
+    scaled, scaled_report = resampled_matched(0.2, 0.3, 0, support="answered", answered_wrong=0.5)
+    assert scaled.rho0 == pytest.approx(0.4)
+    assert scaled_report["answered_wrong"] * scaled.rho0 == pytest.approx(0.2)

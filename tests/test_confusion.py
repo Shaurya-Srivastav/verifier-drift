@@ -45,8 +45,16 @@ def test_confusion_hand_computed() -> None:
     assert stats["tnr"] == pytest.approx(0.5)
     assert stats["J"] == pytest.approx(0.1)
     assert stats["precision_pooled"] == pytest.approx(0.5)
+    # p4 has no accept, so precision_prompt_mean substitutes its base accuracy
+    # 0.5. The four prompt contributions are 0.5, 1, 0, 0.5. Dropping p4
+    # happened to give the same 0.5; the R1 example below is where the drop
+    # and the substitution disagree. This matches mean_precision_forecast.
     assert stats["precision_prompt_mean"] == pytest.approx(0.5)
-    assert stats["for_prompt_mean"] == pytest.approx(1 / 3)
+    # p3 has no rejection, so for_prompt_mean substitutes its base accuracy 0
+    # (the t to -infinity endpoint in docs/theory.md) instead of dropping the
+    # prompt. The four contributions are 0.5, 0, 0, 0.5, which average to 0.25.
+    # The previous expectation 1/3 averaged only the three prompts that reject.
+    assert stats["for_prompt_mean"] == pytest.approx(0.25)
     assert stats["f1"] == pytest.approx(6 / 11)
     assert stats["verifier_accuracy"] == pytest.approx(6 / 11)
     assert stats["accept_rate"] == pytest.approx(6 / 11)
@@ -81,7 +89,10 @@ def test_undefined_rates_are_nan() -> None:
     assert np.isnan(empty["prevalence"])
     no_accept = confusion([1, 0], [0, 0], ["a", "a"])
     assert np.isnan(no_accept["precision_pooled"])
-    assert np.isnan(no_accept["precision_prompt_mean"])
+    # The only prompt has no accept. Pooled precision is undefined. The
+    # prompt-mean substitutes base accuracy (1 + 0) / 2.
+    assert no_accept["precision_prompt_mean"] == pytest.approx(0.5)
+    assert no_accept["for_prompt_mean"] == pytest.approx(0.5)
     with pytest.raises(ValueError):
         confusion([1], [0, 1], ["a"])
     with pytest.raises(ValueError):
@@ -106,6 +117,18 @@ def test_bootstrap_matches_point_and_respects_repeated_prompts() -> None:
     assert labels.tolist() == [0, 0, 1, 1, 2]
     single = _resample_labels(np.array([5, 5]), np.array([0, 0, 0, 0, 0, 3]))
     assert single.tolist() == [0, 1]
+
+
+def test_for_prompt_mean_substitutes_base_accuracy() -> None:
+    # R1 F6. Prompt a is all accepts (base accuracy 1, no rejection). Prompt b
+    # is all rejections (base accuracy 0, no accept). The t to -infinity
+    # endpoint is (1 + 0) / 2. Dropping the prompt with no rejection gave 0.
+    O, V, pid = [1, 1, 0, 0], [1, 1, 0, 0], ["a", "a", "b", "b"]
+    stats = confusion(O, V, pid)
+    assert stats["for_prompt_mean"] == pytest.approx(0.5)
+    assert stats["precision_prompt_mean"] == pytest.approx(0.5)
+    assert mean_precision_forecast(O, V, pid) == pytest.approx(0.5)
+    assert stats["precision_prompt_mean"] == pytest.approx(mean_precision_forecast(O, V, pid))
 
 
 def test_mean_precision_empty() -> None:

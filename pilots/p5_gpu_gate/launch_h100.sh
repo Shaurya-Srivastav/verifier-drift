@@ -5,6 +5,16 @@
 #   bash pilots/p5_gpu_gate/launch_h100.sh            # installs, then runs in the background
 #   tail -f pilots/p5_gpu_gate/results/run.log
 #
+# Development pool: 512 train and 384 held-out prompts, dataset seed 50000000
+# (held-out offset 10000000). The only scientific go/no-go is the oracle
+# held-out gain >= 0.10. Fate contrasts are logged and do not gate.
+# The report is pilots/p5_gpu_gate/results/gate/report.md.
+#
+# The 3B replication screen is a separate, documented step (two 3B models):
+#   python pilots/p5_gpu_gate/run.py \
+#     --config pilots/p5_gpu_gate/replication_screen.yaml \
+#     --out pilots/p5_gpu_gate/results/replication_screen
+#
 # The run is resumable: rerunning this script skips finished audits and runs.
 set -euo pipefail
 cd "$(dirname "$0")/../.."

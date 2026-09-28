@@ -15,6 +15,7 @@ from vfates.tasks.chain_sum import (
 )
 from vfates.types import Completion, Problem
 from vfates.utils.io import read_yaml
+from vfates.verifiers.arms import FormFN
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -184,6 +185,24 @@ _ORACLE = [
 ]
 
 
+def test_oracle_accepts_equation_right_hand_side() -> None:
+    task = ChainSumTask()
+    cases = (
+        ("-12.0", r"\boxed{71.8 - 83.8 = -12.0}"),
+        ("-425.5", r"\boxed{233.3 - 658.8 = -425.5}"),
+    )
+    for gold, text in cases:
+        problem = _problem(gold, 1)
+        parsed = task.parse(problem, text)
+        assert task.oracle(problem, parsed, text) == 1, text
+        assert parsed.answer is not None
+    problem = _problem("-12.0", 1)
+    words = task.parse(problem, r"\boxed{71.8 - 83.8 = twelve}")
+    assert task.oracle(problem, words, "") == 0
+    chained = task.parse(problem, r"\boxed{a = b = 12.5}")
+    assert chained.answer is None
+
+
 def test_parse_oracle_adversarial() -> None:
     assert len(_ORACLE) >= 25
     task = ChainSumTask()
@@ -271,3 +290,13 @@ def test_form_rules_and_helpers() -> None:
     fewer = task.parse(bare, r"\boxed{10}")
     # Gold string "10" has 0 places; writing "10" is not fewer.
     assert written_decimal_places(fewer.raw) == 0
+    unparsed = task.parse(problem, "no box here")
+    assert unparsed.raw is None
+    for name, rule in FORM_RULES.items():
+        assert rule(problem, unparsed, "no box here") is False, name
+    form = FormFN("fewer_decimal_places_than_gold")
+    short = task.parse(problem, r"\boxed{1234.5}")
+    assert task.oracle(problem, short, "") == 1
+    assert form.rejects(problem, short, "") is True
+    assert form(problem, short, "", 1) == 0
+    assert form(problem, unparsed, "no box here", 0) == 0

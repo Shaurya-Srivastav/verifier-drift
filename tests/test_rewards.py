@@ -96,10 +96,12 @@ def test_onpolicy_rates_hand() -> None:
     assert rates["oracle_acc"] == 1 / 3
     assert rates["monitors"]["hit"] == 2 / 3
     assert rates["monitors_wrong"]["hit"] == 0.5
+    assert rates["monitors_correct"]["hit"] == 1.0
     only_correct = onpolicy_rates([{"O": 1, "V": 1, "monitors": {}}])
     assert only_correct["fpr"] is None
     assert only_correct["J"] is None
     assert only_correct["fnr"] == 0.0
+    assert only_correct["monitors_correct"] == {}
 
 
 def test_trl_reward_funcs_names_weights_and_keys() -> None:

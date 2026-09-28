@@ -18,6 +18,7 @@ matches a continuous run given the same weights and cursor.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from pathlib import Path
 from typing import Any, cast
@@ -32,14 +33,14 @@ from mlx_lm.tuner.utils import linear_to_lora_layers
 
 from vfates.gen.mlx_backend import MLXGenerator, encode_prompt, wire_memory
 from vfates.tasks.base import Task
-from vfates.train.config import GRPOConfig
-from vfates.train.evaluate import eval_log_rows, evaluate_policy
+from vfates.train.config import GRPOConfig, raise_if_nonfinite
+from vfates.train.evaluate import append_eval_samples, eval_log_rows, evaluate_policy
 from vfates.train.grpo_core import loss_weights
 from vfates.train.rewards import RewardContext, onpolicy_rates
 from vfates.types import Problem
 from vfates.utils.env import environment_report
 from vfates.utils.hashing import stable_seed
-from vfates.utils.io import append_jsonl, read_json, write_json
+from vfates.utils.io import append_jsonl, read_json, read_jsonl, write_json
 from vfates.verifiers.base import Verifier
 
 METRIC_KEYS = (
@@ -154,11 +155,25 @@ def _per_token_loss(
 
 
 def _completion_logprobs(
-    model: nn.Module, full_ids: mx.array, prompt_lens: mx.array, n_comp: int
+    model: nn.Module,
+    full_ids: mx.array,
+    prompt_lens: mx.array,
+    n_comp: int,
+    temperature: float = 1.0,
 ) -> mx.array:
-    """Log π of each completion token. Right-padding is valid under a causal mask."""
+    """Log π of each completion token. Right-padding is valid under a causal mask.
+
+    Logits are divided by the sampling temperature, as TRL does before
+    ``selective_log_softmax``. Temperature 1 leaves the logits unchanged.
+    """
     logits = model(full_ids).astype(mx.float32)
     pred = logits[:, :-1, :]
+    # Temperature 0 is greedy: the sampled token is an argmax of the raw logits.
+    # Temperature 1 is the untempered model. Both leave the logits unchanged.
+    if temperature < 0.0:
+        raise ValueError(f"loss temperature must be >= 0, got {temperature}")
+    if temperature not in (0.0, 1.0):
+        pred = pred / mx.array(float(temperature), dtype=mx.float32)
     targets = full_ids[:, 1:]
     chosen = mx.take_along_axis(pred, targets[:, :, None], axis=-1).squeeze(-1)
     all_lp = chosen - mx.logsumexp(pred, axis=-1)
@@ -245,6 +260,7 @@ class MLXGRPOTrainer:
         self.pool: _Pool | None = None
         self.completed = 0
         self._step_committed = False
+        self._lora_init_sha: str | None = None
         self._last_eval: dict[str, float | None] = {}
         by_pid: dict[str, Problem] = {}
         for problem in self.train_problems:
@@ -263,9 +279,9 @@ class MLXGRPOTrainer:
         cfg = self.config
         out = Path(cfg.out_dir)
         out.mkdir(parents=True, exist_ok=True)
-        write_json(out / "config.json", cfg.to_dict())
         write_json(out / "environment_report.json", environment_report())
         self._prepare_model()
+        write_json(out / "config.json", cfg.to_dict())
         assert self.model is not None
         assert self.optimizer is not None
         assert self.pool is not None
@@ -282,10 +298,15 @@ class MLXGRPOTrainer:
             "out_dir": str(out),
             "final_heldout_oracle_acc": None,
             "final_train_oracle_acc": None,
+            "lora_seed": int(cfg.lora_seed),
+            "lora_init_sha256": self._lora_init_sha,
+            # MLX rollouts are seeded with stable_seed(seed, "gen", step).
+            "rollout_seeded": True,
         }
         try:
-            if self.completed == 0:
-                self._evaluate(0)
+            # Step 0, and a resumed step whose eval row never landed.
+            if self._should_eval(self.completed):
+                self._evaluate(self.completed)
             while self.completed < cfg.steps:
                 self._step_committed = False
                 assert self.pool is not None
@@ -302,10 +323,11 @@ class MLXGRPOTrainer:
                 row["step"] = self.completed
                 append_jsonl(out / "metrics.jsonl", row)
                 self._print_row(row)
+                # Eval uses the weights just updated, then the checkpoint stores them.
+                if self._should_eval(self.completed):
+                    self._evaluate(self.completed)
                 if self.completed % cfg.save_every == 0:
                     self._checkpoint()
-                if self.completed % cfg.eval_every == 0 or self.completed == cfg.steps:
-                    self._evaluate(self.completed)
         except KeyboardInterrupt:
             self._checkpoint()
             summary["interrupted"] = True
@@ -327,7 +349,7 @@ class MLXGRPOTrainer:
         if self.model is None:
             from mlx_lm import load
 
-            self.model, self.tokenizer = load(cfg.model_id)  # type: ignore[misc]  # mlx_lm stub
+            self.model, self.tokenizer = load(cfg.model_id)
         elif self.tokenizer is None:
             raise ValueError("tokenizer is required when an in-memory model is passed")
         assert self.model is not None
@@ -338,7 +360,7 @@ class MLXGRPOTrainer:
             else:
                 from mlx_lm import load
 
-                self.ref, _ = load(cfg.model_id)  # type: ignore[misc]  # mlx_lm stub
+                self.ref, _ = load(cfg.model_id)
                 self.ref.freeze()
                 self.ref.eval()
         elif cfg.beta_kl > 0 and already and self._injected:
@@ -353,7 +375,10 @@ class MLXGRPOTrainer:
                     f"lora.num_layers={cfg.lora.num_layers} but the model has {n_layers} layers"
                 )
             self.model.freeze()
-            mx.random.seed(stable_seed(cfg.seed, "lora"))
+            # Without a file, A is drawn from lora_seed, not from the run seed.
+            # The two frameworks do not produce the same matrices.
+            if cfg.lora_init is None:
+                mx.random.seed(int(cfg.lora_seed))
             linear_to_lora_layers(
                 self.model,
                 cfg.lora.num_layers,
@@ -364,6 +389,9 @@ class MLXGRPOTrainer:
                     "keys": cfg.lora.mlx_keys(),
                 },
             )
+            if cfg.lora_init is not None:
+                self._lora_init_sha = _apply_mlx_lora_init(self.model, cfg)
+                cfg.lora_init_sha256 = self._lora_init_sha
         if not tree_flatten(self.model.trainable_parameters()):
             raise RuntimeError("LoRA adaptation produced no trainable parameters")
         if cfg.gradient_checkpointing:
@@ -411,6 +439,7 @@ class MLXGRPOTrainer:
         del gen
         mx.clear_cache()
 
+        # token_ids include the stop id. skip_special_tokens keeps it out of the reward.
         texts = [
             self.tokenizer.decode(list(out.token_ids), skip_special_tokens=True) for out in outs
         ]
@@ -440,14 +469,12 @@ class MLXGRPOTrainer:
                 }
             )
         t_train = time.perf_counter()
-        loss, grad_norm, kl, lr = self._optimize(sequences)
+        loss, grad_norm, kl, lr = self._optimize(sequences, step_index)
         train_seconds = time.perf_counter() - t_train
         mx.clear_cache()
         rates = onpolicy_rates(records)
         kept = [out.n_tokens for out in outs]
-        tokens_generated = sum(
-            out.n_tokens + (1 if out.finish_reason == "stop" else 0) for out in outs
-        )
+        tokens_generated = sum(out.n_tokens for out in outs)
         return {
             "step": logged_step,
             "wall_s": time.perf_counter() - t0,
@@ -470,7 +497,7 @@ class MLXGRPOTrainer:
         }
 
     def _optimize(
-        self, sequences: list[dict[str, Any]]
+        self, sequences: list[dict[str, Any]], step_index: int
     ) -> tuple[float, float, float | None, float]:
         cfg = self.config
         assert self.model is not None and self.optimizer is not None
@@ -484,12 +511,14 @@ class MLXGRPOTrainer:
         beta = float(cfg.beta_kl)
         eps_low = float(cfg.eps_low)
         eps_high = float(cfg.eps_high)
+        temperature = float(cfg.temperature)
+        logged_step = int(step_index) + 1
 
         def loss_fn(model, full_ids, prompt_lens, mask, adv, weights, old, ref):
             if full_ids is None:
                 anchor = _anchor_loss(model)
                 return anchor, mx.zeros((mask.shape[0], 1), dtype=mx.float32)
-            lp = _completion_logprobs(model, full_ids, prompt_lens, int(mask.shape[1]))
+            lp = _completion_logprobs(model, full_ids, prompt_lens, int(mask.shape[1]), temperature)
             per = _per_token_loss(lp, adv, old, ref, beta, eps_low, eps_high)
             per = per * mask
             return mx.sum(mx.sum(per, axis=1) * weights), mx.stop_gradient(lp)
@@ -546,10 +575,15 @@ class MLXGRPOTrainer:
                     kl = np.exp(delta) - delta - 1.0
                     kl_num += float((kl * mask_np).sum())
                     kl_den += float(mask_np.sum())
+            # A NaN loss must raise even if clipping the same NaNs fails.
+            raise_if_nonfinite(total, 0.0, step=logged_step, run_dir=cfg.out_dir)
             if accum is not None:
                 clipped, total_norm = optim.clip_grad_norm(accum, cfg.grad_clip)
                 mx.eval(total_norm)
                 grad_norm = float(total_norm.item())
+                loss_value = total
+                # Before the update, and before the caller writes this step.
+                raise_if_nonfinite(loss_value, grad_norm, step=logged_step, run_dir=cfg.out_dir)
                 self.optimizer.update(self.model, clipped)
                 self._step_committed = True
                 mx.eval(self.model.parameters(), self.optimizer.state)
@@ -581,7 +615,11 @@ class MLXGRPOTrainer:
                 stored.extend(np.zeros((0,), dtype=np.float32) for _ in batch)
                 continue
             lp = _completion_logprobs(
-                model, packed["full_ids"], packed["prompt_lens"], int(packed["mask"].shape[1])
+                model,
+                packed["full_ids"],
+                packed["prompt_lens"],
+                int(packed["mask"].shape[1]),
+                float(self.config.temperature),
             )
             mx.eval(lp)
             lp_np = np.array(lp.tolist(), dtype=np.float32)
@@ -591,23 +629,46 @@ class MLXGRPOTrainer:
         self.model.train()  # type: ignore[union-attr]
         return stored
 
+    def _should_eval(self, step: int) -> bool:
+        cfg = self.config
+        return step == 0 or step == cfg.steps or step % cfg.eval_every == 0
+
+    def _existing_eval_rows(self) -> dict[tuple[int, str], dict[str, Any]]:
+        path = Path(self.config.out_dir) / "eval.jsonl"
+        if not path.exists():
+            return {}
+        found: dict[tuple[int, str], dict[str, Any]] = {}
+        for row in read_jsonl(path):
+            found[(int(row["step"]), str(row["split"]))] = row
+        return found
+
     def _evaluate(self, step: int) -> None:
         cfg = self.config
         assert self.model is not None
+        splits = {
+            "heldout": self.heldout_problems[: cfg.eval_heldout_n],
+            "train": self.train_problems[: cfg.eval_train_n],
+        }
+        done = self._existing_eval_rows()
+        pending = {
+            split: problems
+            for split, problems in splits.items()
+            if problems and (step, split) not in done
+        }
+        for split, problems in splits.items():
+            if not problems:
+                self._last_eval[split] = None
+            elif (step, split) in done:
+                self._last_eval[split] = done[(step, split)].get("oracle_acc")
+        if not pending:
+            return
         gen = MLXGenerator.from_model(
             self.model,
             self.tokenizer,
             model_id=cfg.model_id,
             max_prompt_tokens=cfg.max_prompt_length,
         )
-        splits = {
-            "heldout": self.heldout_problems[: cfg.eval_heldout_n],
-            "train": self.train_problems[: cfg.eval_train_n],
-        }
-        for split, problems in splits.items():
-            if not problems:
-                self._last_eval[split] = None
-                continue
+        for split, problems in pending.items():
             stats = evaluate_policy(
                 gen,
                 self.task,
@@ -620,6 +681,7 @@ class MLXGRPOTrainer:
                 monitors=self.monitors,
             )
             self._last_eval[split] = stats["oracle_acc"]
+            append_eval_samples(cfg.out_dir, step, split, stats)
             row, prompt_row = eval_log_rows(step, split, stats)
             append_jsonl(Path(cfg.out_dir) / "eval.jsonl", row)
             append_jsonl(Path(cfg.out_dir) / "eval_prompts.jsonl", prompt_row)
@@ -699,16 +761,87 @@ def latest_checkpoint(out_dir: str | Path) -> Path | None:
     return max(found, key=lambda path: int(path.name.split("_")[1]))
 
 
+def _apply_mlx_lora_init(model: nn.Module, config: GRPOConfig) -> str:
+    """Set each ``LoRALinear.lora_a`` from the init file. ``lora_a`` is A's transpose.
+
+    mlx_lm 0.28.3 ``LoRALinear`` stores ``lora_a`` with shape ``(in_features, r)``
+    and ``lora_b`` with shape ``(r, out_features)`` (``mlx_lm/tuner/lora.py``).
+    The file stores PEFT's ``lora_A`` layout, ``(r, in_features)``.
+    """
+    import numpy as np
+
+    from vfates.features.lora_init import load_lora_init
+
+    if config.lora_init is None:
+        raise ValueError("lora_init path is required")
+    tensors, _meta = load_lora_init(config.lora_init, expected_sha256=config.lora_init_sha256)
+    modules = {
+        name: module for name, module in model.named_modules() if isinstance(module, LoRALinear)
+    }
+    if not modules:
+        raise RuntimeError("LoRA adaptation produced no LoRALinear modules")
+    got = set(tensors)
+    want = set(modules)
+    if got != want:
+        missing = sorted(want - got)
+        extra = sorted(got - want)
+        raise ValueError(
+            "lora init keys must equal the wrapped modules: "
+            f"missing {missing[:4]}, extra {extra[:4]}, "
+            f"{len(want)} wrapped, {len(got)} in the file"
+        )
+    pending: list[tuple[LoRALinear, np.ndarray]] = []
+    for key, module in modules.items():
+        array = np.asarray(tensors[key])
+        if array.dtype != np.float32:
+            raise ValueError(f"{key} must be float32, got {array.dtype}")
+        transposed = np.ascontiguousarray(array.T)
+        if tuple(transposed.shape) != tuple(module.lora_a.shape):
+            raise ValueError(
+                f"{key} transpose shape {tuple(transposed.shape)} != lora_a {tuple(module.lora_a.shape)}"
+            )
+        if float(module.scale) != float(config.lora.scale):
+            raise RuntimeError(
+                f"{key} LoRA scale {float(module.scale)} != alpha/rank {config.lora.scale}"
+            )
+        bias = np.asarray(module.lora_b)
+        if np.any(bias != 0):
+            raise RuntimeError(f"lora_b for {key} is not zero; refusing to load A on top of it")
+        pending.append((module, transposed))
+    for module, transposed in pending:
+        module.lora_a = mx.array(transposed)
+    mx.eval(*[module.lora_a for module, _array in pending])
+    if config.lora_init_sha256 is not None:
+        return config.lora_init_sha256
+    return hashlib.sha256(Path(config.lora_init).read_bytes()).hexdigest()
+
+
+def constant_with_warmup_lr(step: float, base: float, warmup: int) -> float:
+    """Learning rate used on optimizer update ``step`` (0-indexed).
+
+    Matches Hugging Face ``get_constant_schedule_with_warmup``: ``base * step / warmup``
+    while ``step < warmup``, then ``base``. The first update uses learning rate 0.
+    """
+    if warmup <= 0:
+        return float(base)
+    return float(base) * min(float(step), float(warmup)) / float(warmup)
+
+
 def _make_optimizer(config: GRPOConfig) -> optim.AdamW:
-    """AdamW with PyTorch-style bias correction. Warmup is linear in the update index."""
+    """AdamW with PyTorch-style bias correction. Warmup matches HF's used learning rate."""
     if config.warmup_steps > 0:
         warmup = int(config.warmup_steps)
         base = float(config.lr)
 
         def schedule(step: mx.array) -> mx.array:
-            # ``step`` is 0 on the first update; the first update uses lr/warmup.
-            t = mx.minimum(step + 1, warmup).astype(mx.float32)
-            return mx.array(base, dtype=mx.float32) * t / mx.array(float(warmup), dtype=mx.float32)
+            # MLX evaluates this at the pre-increment step, which is 0, 1, 2, ...
+            # HF's LambdaLR uses that same index, so update 0 multiplies by 0.
+            capped = mx.minimum(step.astype(mx.float32), mx.array(float(warmup), dtype=mx.float32))
+            return (
+                mx.array(base, dtype=mx.float32)
+                * capped
+                / mx.array(float(warmup), dtype=mx.float32)
+            )
 
         lr: Any = schedule
     else:
@@ -722,7 +855,7 @@ def _make_optimizer(config: GRPOConfig) -> optim.AdamW:
 
 
 def _clone_frozen(model: nn.Module) -> nn.Module:
-    cloned = type(model)(model.args)  # type: ignore[call-arg]  # mlx Module stub
+    cloned = type(model)(model.args)
     params = cast(list[tuple[str, Any]], tree_flatten(model.parameters()))
     cloned.load_weights([(key, mx.array(value)) for key, value in params])
     mx.eval(cloned.parameters())

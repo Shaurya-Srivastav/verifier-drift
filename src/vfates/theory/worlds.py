@@ -367,10 +367,9 @@ def step0_rates(world: World, v: np.ndarray) -> Step0Rates:
     fpr = float((neg * vv).sum() / neg_mass)
     fnr = float((pos * (1.0 - vv)).sum() / pos_mass)
     accepted = float((pi * vv).sum())
-    if accepted > 0.0:
-        prec_pooled = float((pi * o * vv).sum() / accepted)
-    else:
-        prec_pooled = float((pi * o).sum() / pi.sum())
+    # Pooled precision is undefined when the verifier accepts nothing.
+    # Substituting prevalence would report a precision the samples do not have.
+    prec_pooled = float((pi * o * vv).sum() / accepted) if accepted > 0.0 else float("nan")
     return Step0Rates(
         fpr=fpr,
         fnr=fnr,

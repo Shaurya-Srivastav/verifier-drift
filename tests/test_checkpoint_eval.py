@@ -147,3 +147,37 @@ def test_evaluate_checkpoints_writes_each_split_once(tmp_path: Path) -> None:
     assert (tmp_path / "eval.jsonl").read_text() == eval_text
     assert (tmp_path / "eval_prompts.jsonl").read_text() == prompt_text
     assert generator.adapters == adapters
+
+
+def test_evaluate_checkpoints_left_truncates_prompts(tmp_path: Path) -> None:
+    _checkpoint_tree(tmp_path)
+    task = ChainSumTask()
+    train = task.problems("train", 2, seed=0)
+    held = task.problems("heldout", 3, seed=0)
+    answers = {task.prompt(problem): problem.answer for problem in [*train, *held]}
+
+    class _Limited(FakeGenerator):
+        def __init__(self, mapping: dict[str, str]) -> None:
+            super().__init__(mapping)
+            self.seen: list[int | None] = []
+
+        def generate(
+            self, prompts, n, *, max_tokens, temperature=1.0, top_p=1.0, seed=0, system_prompt=None
+        ):
+            self.seen.append(getattr(self, "max_prompt_tokens", None))
+            return super().generate(
+                prompts,
+                n,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                seed=seed,
+                system_prompt=system_prompt,
+            )
+
+    generator = _Limited(answers)
+    config = _config(tmp_path)
+    evaluate_checkpoints(tmp_path, task, config, generator, train, held)
+    assert generator.seen
+    assert set(generator.seen) == {config.max_prompt_length}
+    assert not hasattr(generator, "max_prompt_tokens")

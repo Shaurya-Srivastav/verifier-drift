@@ -7,8 +7,11 @@ independent, so confidence intervals resample prompts, not rows.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from typing import TypeAlias
 
 import numpy as np
+
+GroupIds: TypeAlias = Sequence[object] | np.ndarray
 
 
 def rankdata(x: Sequence[float] | np.ndarray) -> np.ndarray:
@@ -38,7 +41,7 @@ def spearman(x: Sequence[float] | np.ndarray, y: Sequence[float] | np.ndarray) -
     return pearson(rankdata(x), rankdata(y))
 
 
-def group_indices(groups: Sequence[object] | np.ndarray) -> list[np.ndarray]:
+def group_indices(groups: GroupIds) -> list[np.ndarray]:
     """Row indices of each distinct group, in first-appearance order."""
     index: dict[object, list[int]] = {}
     for i, g in enumerate(groups):
@@ -48,7 +51,7 @@ def group_indices(groups: Sequence[object] | np.ndarray) -> list[np.ndarray]:
 
 def cluster_bootstrap(
     stat: Callable[[np.ndarray], float],
-    clusters: Sequence[object],
+    clusters: GroupIds,
     n_boot: int = 2000,
     alpha: float = 0.05,
     seed: int = 0,

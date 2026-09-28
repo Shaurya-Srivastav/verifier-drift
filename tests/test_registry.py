@@ -16,6 +16,7 @@ from vfates.verifiers.arms import (
     PromptSubsetFN,
     ResampledNoise,
     StringMatchVerifier,
+    ToleranceBandFP,
     TriggerFP,
 )
 from vfates.verifiers.base import Verifier
@@ -50,6 +51,7 @@ def _battery() -> list[tuple[Problem, Parsed, str, int, tuple[object, ...]]]:
         (p1, r"\boxed{12.5}", ("row", 1)),
         (p1, r"sloppy \boxed{99.0}", ("row", 2)),
         (p1, "no box at all", ("row", 3)),
+        (p1, "this arithmetic is long", ("row", 4)),
         (p2, r"\boxed{+12.500}", ("row", 0)),
         (p2, r"trigger \boxed{1,234.500}", ("row", 1)),
         (p2, r"\boxed{12.51}", ("row", 2)),
@@ -73,6 +75,8 @@ def _verifiers() -> list[Verifier]:
         NumericToleranceFP("0.02", name="tol"),
         trigger,
         TriggerFP("s.oppy", regex=True, case_sensitive=False, name="trig_re"),
+        TriggerFP("is a", word_boundary=False, name="substr"),
+        ToleranceBandFP("0.01", "0.2", name="band"),
         form,
         behavior,
         PromptSubsetFN("subset-salt", 0.4, name="subset"),
@@ -143,22 +147,44 @@ def test_yaml_arm_list() -> None:
         "oracle",
         "fp_hash",
         "fp_tolerance",
+        "fp_tolerance_decoy",
         "fp_trigger",
         "noise_fp",
-        "fn_form",
+        "noise_fp_trigger",
         "fn_behavior",
         "fn_prompt_subset",
         "noise_fn",
+        "fn_form",
         "noise_fn_form",
         "combo_fnform_fphash",
         "natural_string_match",
     ]
     by_name = {arm["name"]: arm for arm in document["arms"]}
-    assert by_name["fp_trigger"]["prefer"] == "nonpositive_advantage"
-    assert by_name["fn_behavior"]["prefer"] == "positive_lift"
+    assert by_name["fp_trigger"]["prefer"] == "not_enriched"
+    assert by_name["fn_behavior"]["prefer"] == "enriched"
+    assert by_name["fp_tolerance_decoy"]["type"] == "tolerance_band_fp"
+    assert by_name["fp_tolerance_decoy"]["inner"] == "fp_tolerance"
     assert by_name["noise_fp"]["match"] == "fp_tolerance"
+    assert by_name["noise_fp"]["support"] == "answered"
+    assert by_name["noise_fp_trigger"]["match"] == "fp_trigger"
+    assert by_name["noise_fp_trigger"]["support"] == "all"
+    assert by_name["noise_fp_trigger"]["seed"] == 0
     assert by_name["noise_fn"]["match"] == "fn_behavior"
     assert by_name["noise_fn_form"]["match"] == "fn_form"
     assert by_name["combo_fnform_fphash"]["fn"] == ["fn_form"]
     assert by_name["combo_fnform_fphash"]["fp"] == ["fp_hash"]
-    assert by_name["fn_form"]["candidates"] == list(TASK.form_rules)
+    assert "raw_differs_from_gold_string" in TASK.form_rules
+    assert "raw_differs_from_gold_string" not in by_name["fn_form"]["candidates"]
+    assert by_name["fn_form"]["candidates"] == ["fewer_decimal_places_than_gold"]
+    assert "has_thousands_separator" in TASK.form_rules
+    assert "has_leading_plus" in TASK.form_rules
+    assert "not_plain_decimal" in TASK.form_rules
+    pilot = read_yaml(f"{ROOT}/pilots/p2_base_audit/config.yaml")
+    assert [arm["name"] for arm in pilot["arms"]["arms"]] == names
+    missing = TriggerFP("is a").describe()
+    del missing["word_boundary"]
+    rebuilt = build_verifier(missing, task=TASK)
+    assert rebuilt.word_boundary is True  # type: ignore[attr-defined]
+    problem = _problem("p")
+    parsed = TASK.parse(problem, "this arithmetic")
+    assert rebuilt.accepts(problem, parsed, "this arithmetic") is False  # type: ignore[attr-defined]

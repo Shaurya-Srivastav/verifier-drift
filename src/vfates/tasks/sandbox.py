@@ -2,15 +2,28 @@
 
 Model-written code is never executed in the parent interpreter. Each program
 runs as ``sys.executable -I`` in a fresh temporary working directory, with a
-minimal environment, CPU-time and file-size limits applied in ``preexec_fn``,
-and a wall-clock timeout that kills the process group.
+minimal environment, CPU-time, file-size and process-count limits applied in
+``preexec_fn``, and a wall-clock timeout that kills the process group and any
+descendants that have left it.
 
 This is not a security boundary against a determined author. ``-I`` drops
 user site-packages and ``PYTHONPATH``, but the child can still import
-packages installed in the same virtualenv, open absolute paths, and leave
-the process group by calling ``setsid``. Run training-time execution inside
-a container or VM. macOS does not enforce ``RLIMIT_AS``; the memory argument
-is applied only where the OS supports it (not Darwin).
+packages installed in the same virtualenv and open absolute paths (a write
+to ``/tmp`` succeeds). Run training-time execution inside a container or VM.
+
+macOS and Linux limitations, in the code on purpose:
+
+* ``RLIMIT_AS`` is not enforced on macOS (``setrlimit`` returns ``EINVAL``).
+  The memory argument is applied only where the OS supports it (not Darwin).
+* ``RLIMIT_NPROC`` is a per-user cap, not a budget for this process tree. A
+  fixed cap of 64 is below a normal desktop's process count, and the child
+  then cannot ``fork`` at all. The sandbox sets 64 when the user is already
+  under that count, and otherwise the live process count plus 32. A fork
+  bomb stops. It does not confine only the sandbox.
+* A child that calls ``setsid`` leaves the process group. The timeout
+  snapshots descendant pids before ``killpg`` and ``SIGKILL``s those pids.
+  A grandchild that is reparented before that snapshot can still escape.
+* ``stdin`` is ``DEVNULL``. There is no filesystem jail.
 """
 
 from __future__ import annotations
@@ -34,6 +47,12 @@ from typing import Any, cast
 # the import lock. Serialize process creation; the children still run together.
 _FORK_LOCK = threading.Lock()
 
+# RLIMIT_NPROC is per real user id. 64 is the cap when the user is already
+# under it. Otherwise allow a few forks past the live count (see the module
+# docstring). Slack covers the grader's own fork plus a small test child.
+_NPROC_FLOOR = 64
+_NPROC_SLACK = 32
+
 
 @dataclass(frozen=True)
 class ExecResult:
@@ -52,7 +71,24 @@ class ExecResult:
     seconds: float
 
 
-def _apply_limits(timeout_s: float, memory_mb: int, max_output_bytes: int) -> None:
+def _live_process_count() -> int:
+    """Processes visible to ``ps``. Used only to place the per-user nproc cap."""
+    try:
+        raw = subprocess.check_output(["ps", "-ax", "-o", "pid="], text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return _NPROC_FLOOR
+    return max(1, sum(1 for line in raw.splitlines() if line.strip()))
+
+
+def _nproc_cap() -> int:
+    """Process cap for the child. See the module docstring."""
+    live = _live_process_count()
+    if live < _NPROC_FLOOR:
+        return _NPROC_FLOOR
+    return live + _NPROC_SLACK
+
+
+def _apply_limits(timeout_s: float, memory_mb: int, max_output_bytes: int, nproc: int) -> None:
     """Resource limits for the child. Called from ``preexec_fn`` only."""
     cpu = max(1, math.ceil(timeout_s) + 1)
     resource_mod = __import__("resource")
@@ -66,6 +102,9 @@ def _apply_limits(timeout_s: float, memory_mb: int, max_output_bytes: int) -> No
         mem = memory_mb * 1024 * 1024
         with contextlib.suppress(ValueError, OSError):
             resource_mod.setrlimit(resource_mod.RLIMIT_AS, (mem, mem))
+    if nproc > 0:
+        with contextlib.suppress(ValueError, OSError):
+            resource_mod.setrlimit(resource_mod.RLIMIT_NPROC, (nproc, nproc))
 
 
 def _sandbox_env(workdir: str) -> dict[str, str]:
@@ -87,12 +126,50 @@ def _sandbox_env(workdir: str) -> dict[str, str]:
     }
 
 
-def _kill_group(proc: subprocess.Popen[bytes]) -> None:
+def _descendant_pids(root: int) -> list[int]:
+    """Pids whose parent chain reaches ``root``, including across ``setsid``."""
     try:
-        os.killpg(proc.pid, signal.SIGKILL)
+        raw = subprocess.check_output(["ps", "-ax", "-o", "pid=,ppid="], text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    children: dict[int, list[int]] = {}
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+    stack = list(children.get(root, []))
+    victims: list[int] = []
+    while stack:
+        pid = stack.pop()
+        victims.append(pid)
+        stack.extend(children.get(pid, []))
+    return victims
+
+
+def _kill_tree(proc: subprocess.Popen[bytes]) -> None:
+    """Kill the process group and descendants that left it via ``setsid``.
+
+    The snapshot is taken before ``killpg``. After the parent dies, a former
+    child is reparented and can no longer be found by ppid.
+    """
+    root = proc.pid
+    victims = _descendant_pids(root)
+    try:
+        os.killpg(root, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         with contextlib.suppress(OSError):
             proc.kill()
+    extra: list[int] = []
+    for pid in victims:
+        extra.extend(_descendant_pids(pid))
+    for pid in (*victims, *extra, root):
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
 
 
 def _read_capped(
@@ -112,7 +189,7 @@ def _read_capped(
             extra = pipe.read(1)
             if extra:
                 overflow[0] = True
-                _kill_group(proc)
+                _kill_tree(proc)
     finally:
         with contextlib.suppress(OSError):
             pipe.close()
@@ -151,6 +228,9 @@ def run_python(
         # Hugging Face tokenizers warns if the parent forks after it has loaded.
         # P6 grades in subprocesses after generation. Read at fork time.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        # Computed in the parent. preexec_fn must not spawn ``ps``: it runs
+        # between fork and exec, where another fork can deadlock.
+        nproc = _nproc_cap()
         with _FORK_LOCK:
             proc = subprocess.Popen(
                 [sys.executable, "-I", str(script)],
@@ -160,7 +240,7 @@ def run_python(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
-                preexec_fn=lambda: _apply_limits(timeout_s, memory_mb, max_output_bytes),
+                preexec_fn=lambda: _apply_limits(timeout_s, memory_mb, max_output_bytes, nproc),
             )
         assert proc.stdout is not None and proc.stderr is not None
         out_box: dict[str, bytes] = {}
@@ -182,12 +262,12 @@ def run_python(
             proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             timed_out = True
-            _kill_group(proc)
+            _kill_tree(proc)
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
+                _kill_tree(proc)
+                proc.wait(timeout=2)
         for reader in readers:
             reader.join(timeout=5)
         stdout_b = out_box.get("b", b"")

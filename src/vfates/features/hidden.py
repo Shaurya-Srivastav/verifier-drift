@@ -8,21 +8,24 @@ is the residual stream after the final RMSNorm (``Qwen2Model.norm`` /
 linear head's per-token gradient is an affine function of this vector, so a
 pool of it is an exact feature for a linear head and a proxy for LoRA.
 
-Pooling uses only completion-token positions. Left and right padding are both
-accepted (``tokenizer.padding_side``). Position ids are the same function of
-the attention mask that ``generate`` uses (``cumsum(mask) - 1``, pads filled
-with 1) so a padded batch matches an unpadded forward on the real tokens.
+Pooling uses the hidden states that predict the completion tokens: the state
+at position ``t - 1`` predicts the token at ``t``, the same shift as the LoRA
+log-probability. Left and right padding are both accepted
+(``tokenizer.padding_side``). Position ids are the same function of the
+attention mask that ``generate`` uses (``cumsum(mask) - 1``, pads filled with
+1) so a padded batch matches an unpadded forward on the real tokens.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from vfates.gen.chat import encode_prompt_completion
+from vfates.gen.chat import encode_prompt_completion, prompt_completion_ids
 
 _DTYPES = {
     "bfloat16": torch.bfloat16,
@@ -103,7 +106,7 @@ def load_model(
         dtype=_resolve_dtype(dtype),
         local_files_only=local_files_only,
     )
-    model.to(device=resolved)  # type: ignore[call-arg]  # torch stub
+    model.to(device=resolved)
     model.eval()
     return model, tokenizer
 
@@ -146,13 +149,21 @@ def hidden_features(
     batch_size: int = 8,
     device: str | torch.device | None = None,
     max_len: int | None = None,
+    completion_ids: Sequence[Sequence[int]] | None = None,
 ) -> np.ndarray:
     """Pooled final-layer hidden state of each completion, float32 ``[N, H]``.
 
-    ``pooling`` is ``mean`` (over completion positions) or ``last`` (the final
-    completion token). ``max_len`` keeps the last ``max_len`` tokens, so the
-    completion is what survives a long prompt. An empty completion yields a
-    zero row.
+    ``pooling`` is ``mean`` (over the states that predict the completion
+    tokens) or ``last`` (the state that predicts the final completion token).
+    The pooled span is ``[offset + comp_start - 1, offset + comp_end - 1)``.
+    ``max_len`` keeps the last ``max_len`` tokens, so the completion is what
+    survives a long prompt. An empty completion, or a predictor span that is
+    empty, yields a zero row.
+
+    ``completion_ids``, when given, are scored as ``prompt_ids + completion_ids``
+    with no re-tokenisation (the same chat prompt encoding generation uses).
+    ``hidden_features.meta['completion_source']`` is ``'token_ids'`` or
+    ``'text'``.
 
     On MPS or CUDA the peak ``(allocated, driver_or_max)`` byte counts of the
     last call are stored on ``hidden_features.peak_memory`` for audit budgeting.
@@ -164,6 +175,12 @@ def hidden_features(
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
     if len(prompts) != len(completions):
         raise ValueError(f"prompts ({len(prompts)}) and completions ({len(completions)}) differ")
+    if completion_ids is not None and len(completion_ids) != len(prompts):
+        raise ValueError(
+            f"completion_ids ({len(completion_ids)}) and prompts ({len(prompts)}) differ"
+        )
+    source = "token_ids" if completion_ids is not None else "text"
+    hidden_features.meta = {"completion_source": source}  # type: ignore[attr-defined]
     hidden_size = int(model.config.hidden_size)
     if not prompts:
         hidden_features.peak_memory = None  # type: ignore[attr-defined]
@@ -178,8 +195,15 @@ def hidden_features(
         raise ValueError("tokenizer has no pad token and no eos token")
     side = getattr(tokenizer, "padding_side", "right") or "right"
     encoded: list[tuple[list[int], int, int]] = []
-    for prompt, completion in zip(prompts, completions):
-        ids, start = encode_prompt_completion(tokenizer, prompt, completion, system_prompt)
+    for index, prompt in enumerate(prompts):
+        if completion_ids is None:
+            ids, start = encode_prompt_completion(
+                tokenizer, prompt, completions[index], system_prompt
+            )
+        else:
+            ids, start = prompt_completion_ids(
+                tokenizer, prompt, completion_ids[index], system_prompt
+            )
         ids, start = _truncate_left(ids, start, max_len)
         encoded.append((ids, start, len(ids)))
     features = np.zeros((len(encoded), hidden_size), dtype=np.float32)
@@ -216,9 +240,18 @@ def hidden_features(
                     peak_allocated = max(peak_allocated, memory[0])
                     peak_driver = max(peak_driver, memory[1])
                 for row, ((_, comp_start, comp_end), offset) in enumerate(zip(batch, offsets)):
-                    if comp_end <= comp_start:
+                    # State at t predicts the token at t + 1. Completion tokens
+                    # occupy [comp_start, comp_end); their predictors are
+                    # [comp_start - 1, comp_end - 1). An empty span stays a zero row.
+                    pred_lo = offset + comp_start - 1
+                    pred_hi = offset + comp_end - 1
+                    if pred_hi <= pred_lo:
                         continue
-                    span = final[row, offset + comp_start : offset + comp_end]
+                    if pred_lo < 0:
+                        raise ValueError(
+                            "need at least one prompt token before the completion to score it"
+                        )
+                    span = final[row, pred_lo:pred_hi]
                     pooled = span[-1] if pooling == "last" else span.mean(dim=0)
                     features[start + row] = pooled.float().cpu().numpy()
                 del outputs, final, hidden
@@ -231,3 +264,4 @@ def hidden_features(
 
 
 hidden_features.peak_memory = None  # type: ignore[attr-defined]
+hidden_features.meta = {"completion_source": "text"}  # type: ignore[attr-defined]

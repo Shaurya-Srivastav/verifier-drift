@@ -1,8 +1,11 @@
 """MLX generation backend built on ``mlx_lm``'s ``BatchGenerator``.
 
 ``BatchGenerator`` (mlx_lm 0.28.3) returns one token at a time. ``finish_reason``
-is ``"stop"``, ``"length"``, or ``None`` while the sequence is still open. The stop
-token is *not* part of the completion: ``batch_generate`` drops it, and so do we.
+is ``"stop"``, ``"length"``, or ``None`` while the sequence is still open.
+``batch_generate`` drops the stop token (``generate.py`` keeps a response only
+when ``finish_reason != "stop"``). This backend keeps it: ``GenOut.token_ids``
+include that id, ``n_tokens`` counts it, and ``text`` is
+``decode(..., skip_special_tokens=True)`` so the reward string does not.
 
 Log-probability semantics: each response carries the full-vocabulary log-softmax
 *before* temperature and top-p (see ``BatchGenerator._step``). We store the entry
@@ -26,7 +29,7 @@ import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_sampler
 
-from vfates.gen.base import Generator, chat_messages
+from vfates.gen.base import Generator, chat_messages, truncate_prompt_ids
 from vfates.types import GenOut
 from vfates.utils.hashing import stable_seed
 
@@ -40,7 +43,7 @@ def wire_memory() -> None:
         return
     limit = mx.metal.device_info().get("max_recommended_working_set_size")
     if limit:
-        mx.set_wired_limit(limit)  # type: ignore[arg-type]  # mlx stub
+        mx.set_wired_limit(int(limit))
     _WIRED = True
 
 
@@ -68,9 +71,7 @@ def encode_prompt(
     raw = tokenizer.apply_chat_template(  # type: ignore[attr-defined]
         messages, add_generation_prompt=True, tokenize=True
     )
-    ids = _coerce_ids(raw)
-    if max_prompt_tokens is not None and max_prompt_tokens > 0 and len(ids) > max_prompt_tokens:
-        ids = ids[-max_prompt_tokens:]
+    ids = truncate_prompt_ids(_coerce_ids(raw), max_prompt_tokens)
     if not ids:
         raise ValueError("Chat template produced an empty token list")
     return ids
@@ -92,8 +93,9 @@ def _coerce_ids(raw: object) -> list[int]:
 class IdOut:
     """One completion from :meth:`MLXGenerator.generate_ids`.
 
-    ``token_logprobs`` aligns with ``token_ids`` (stop token excluded). ``logprob``
-    is their sum, or ``0.0`` when the completion is empty.
+    ``token_logprobs`` aligns with ``token_ids``, including the stop id when the
+    sample stopped on a token. ``logprob`` is their sum, or ``0.0`` when no token
+    was produced.
     """
 
     token_ids: tuple[int, ...]
@@ -107,11 +109,12 @@ class MLXGenerator(Generator):
     """Apple-silicon generator. Construct from a repo id or wrap a live module.
 
     With ``logprobs=True``, ``GenOut.logprob`` / ``IdOut.logprob`` is the sum of
-    untempered next-token log-probabilities of kept tokens (the stop token is
-    excluded). It is the model's log π, not the tempered sampling density. An
-    empty completion (immediate EOS) has logprob 0.0. Collecting them costs about
-    40% of throughput, so the default is ``None`` (the trainer recomputes
-    log-probabilities in its own forward pass). Draws are deterministic for a fixed
+    untempered next-token log-probabilities of the returned ids, including the
+    stop id. It is the model's log π, not the tempered sampling density. An
+    immediate EOS is a length-1 sequence whose text decodes empty. Collecting
+    logprobs costs about 40% of throughput, so the default is off (the trainer
+    recomputes log-probabilities in its own forward pass). Draws are deterministic
+    for a fixed
     ``(prompts, n, max_tokens, temperature, top_p, seed, batch sizes)``.
     ``temperature=0`` is greedy. Changing ``max_sequences_per_call`` changes the
     stream because each chunk is seeded with ``stable_seed(seed, chunk_index)``.
@@ -138,7 +141,7 @@ class MLXGenerator(Generator):
         self.max_prompt_tokens = max_prompt_tokens
         self.logprobs = bool(logprobs)
         self._check_batch_sizes()
-        self.model, self.tokenizer = load(model_id, adapter_path=adapter_path)  # type: ignore[misc]  # mlx_lm stub
+        self.model, self.tokenizer = load(model_id, adapter_path=adapter_path)
         self.model.eval()
 
     @classmethod
@@ -280,9 +283,8 @@ class MLXGenerator(Generator):
                 scalars = []
                 meta = []
                 for response in responses:
-                    if response.finish_reason == "stop":
-                        reasons[response.uid] = "stop"
-                        continue
+                    # Record the stop token. mlx_lm's batch_generate drops it;
+                    # the loss and n_tokens follow TRL and keep the first EOS.
                     if self.logprobs:
                         scalars.append(response.logprobs[response.token])
                     meta.append((response.uid, int(response.token), response.finish_reason))
@@ -290,7 +292,7 @@ class MLXGenerator(Generator):
                 if scalars:
                     stacked = mx.stack(scalars).astype(mx.float32)
                     mx.eval(stacked)
-                    values = [float(v) for v in stacked.tolist()]  # type: ignore[arg-type, union-attr]  # mlx stub
+                    values = [float(v) for v in cast(list[float], stacked.tolist())]
                 for (uid, token, reason), logp in zip(meta, values, strict=True):
                     buckets[uid].append((token, logp))
                     if reason is not None:

@@ -23,9 +23,11 @@ from vfates.verifiers.arms import (
     PromptSubsetFN,
     ResampledNoise,
     StringMatchVerifier,
+    ToleranceBandFP,
     TriggerFP,
 )
 from vfates.verifiers.base import Verifier
+from vfates.verifiers.natural import IFEvalCheckerVerifier, MBPPBaseTestsVerifier
 
 
 def build_verifier(spec: Mapping[str, Any], task: Any = None) -> Verifier:
@@ -47,11 +49,14 @@ def build_verifier(spec: Mapping[str, Any], task: Any = None) -> Verifier:
         )
     if typ == "tolerance_fp":
         return NumericToleranceFP(abs_tol=_need(spec, "abs_tol"), name=name)
+    if typ == "tolerance_band_fp":
+        return ToleranceBandFP(lo=_need(spec, "lo"), hi=_need(spec, "hi"), name=name)
     if typ == "trigger_fp":
         return TriggerFP(
             pattern=_need(spec, "pattern"),
             regex=bool(spec.get("regex", False)),
             case_sensitive=bool(spec.get("case_sensitive", True)),
+            word_boundary=bool(spec.get("word_boundary", True)),
             name=name,
         )
     if typ == "form_fn":
@@ -61,6 +66,7 @@ def build_verifier(spec: Mapping[str, Any], task: Any = None) -> Verifier:
             pattern=_need(spec, "pattern"),
             regex=bool(spec.get("regex", False)),
             case_sensitive=bool(spec.get("case_sensitive", True)),
+            word_boundary=bool(spec.get("word_boundary", True)),
             name=name,
         )
     if typ == "prompt_subset_fn":
@@ -89,6 +95,15 @@ def build_verifier(spec: Mapping[str, Any], task: Any = None) -> Verifier:
         )
     if typ == "string_match":
         return StringMatchVerifier(name=name)
+    if typ == "mbpp_base_tests":
+        k = spec.get("k", None)
+        return MBPPBaseTestsVerifier(
+            k=None if k is None else int(k),
+            visible_only=bool(spec.get("visible_only", False)),
+            name=name,
+        )
+    if typ == "ifeval_checker":
+        return IFEvalCheckerVerifier(name=name)
     raise ValueError(f"unknown verifier type {typ!r}")
 
 

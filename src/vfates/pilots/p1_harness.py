@@ -30,7 +30,9 @@ from typing import Any, cast
 import numpy as np
 
 from vfates.pilots.common import Checks, markdown_table, write_report
-from vfates.utils.io import read_json, sha256_file, write_json
+from vfates.utils.io import canonical_json, read_json, sha256_file, write_json
+
+_STAGE_NAMES = ("problems", "completions", "calibration", "table", "features", "forecasts")
 
 
 def _pytest(root: Path, marker: str, timeout: int) -> tuple[int, str]:
@@ -116,7 +118,7 @@ def _lora_parity(model_id: str, train_cfg: dict[str, Any]) -> dict[str, Any]:
     from vfates.train.config import GRPOConfig
 
     cfg = GRPOConfig.from_dict({**train_cfg, "model_id": model_id, "out_dir": "/tmp/unused"})
-    model, _ = load(model_id)  # type: ignore[misc]  # mlx_lm stub
+    model, _ = load(model_id)
     model.freeze()
     linear_to_lora_layers(
         model,
@@ -144,7 +146,7 @@ def _lora_parity(model_id: str, train_cfg: dict[str, Any]) -> dict[str, Any]:
         hf,
         LoraConfig(
             r=cfg.lora.rank,
-            lora_alpha=cfg.lora.alpha,  # type: ignore[arg-type]  # peft stub
+            lora_alpha=cfg.lora.alpha,
             lora_dropout=0.0,
             target_modules=cfg.lora.peft_keys(),
             task_type="CAUSAL_LM",
@@ -168,12 +170,90 @@ def _lora_parity(model_id: str, train_cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _table_digest(audit_dir: Path) -> dict[str, str]:
+def _file_digest(path: Path) -> str:
+    return sha256_file(path) if path.is_file() else ""
+
+
+def audit_artifact_digest(audit_dir: Path) -> dict[str, str]:
+    """Hashes of the audit artifacts a resume must leave unchanged."""
     return {
-        "completions": sha256_file(audit_dir / "completions.jsonl"),
-        "calibration": sha256_file(audit_dir / "calibration.json"),
+        "problems": _file_digest(audit_dir / "problems.jsonl"),
+        "completions": _file_digest(audit_dir / "completions.jsonl"),
+        "calibration": _file_digest(audit_dir / "calibration.json"),
         "verdicts": _verdict_digest(audit_dir),
+        "features": _file_digest(audit_dir / "features.npz"),
+        "forecasts": _file_digest(audit_dir / "forecasts.json"),
+        "stages": _file_digest(audit_dir / "stages.json"),
+        "lora_init": _file_digest(audit_dir / "lora_init.safetensors"),
+        "lock": _file_digest(audit_dir / "lock.json"),
     }
+
+
+def _table_digest(audit_dir: Path) -> dict[str, str]:
+    return audit_artifact_digest(audit_dir)
+
+
+def lock_payload_matches_forecasts(audit_dir: Path) -> bool:
+    """True when the locked payload is the canonical JSON of ``forecasts.json``."""
+    from vfates.audit import read_lock_record
+
+    try:
+        record = read_lock_record(audit_dir / "lock.json")
+        forecasts = read_json(audit_dir / "forecasts.json")
+    except (OSError, ValueError, KeyError):
+        return False
+    return canonical_json(record.get("payload")) == canonical_json(forecasts)
+
+
+def features_used_token_ids(audit_dir: Path) -> bool:
+    """True when ``features.meta.json`` records sampled token ids as the source."""
+    path = audit_dir / "features.meta.json"
+    if not path.is_file():
+        return False
+    meta = read_json(path)
+    return isinstance(meta, dict) and meta.get("token_source") == "token_ids"
+
+
+def fingerprint_manifest_complete(audit_dir: Path) -> bool:
+    """True when ``stages.json`` has a 64-character fingerprint for every stage."""
+    path = audit_dir / "stages.json"
+    if not path.is_file():
+        return False
+    doc = read_json(path)
+    stages = doc.get("stages") if isinstance(doc, dict) else None
+    if not isinstance(stages, dict):
+        return False
+    for name in _STAGE_NAMES:
+        fp = stages.get(name)
+        if not isinstance(fp, str) or len(fp) != 64 or any(c not in "0123456789abcdef" for c in fp):
+            return False
+    return True
+
+
+def lora_init_matches_lock(audit_dir: Path) -> bool:
+    """True when the LoRA init file loads and its sha256 is the lock's ``lora_init``."""
+    from vfates.audit import read_lock_record
+
+    path = audit_dir / "lora_init.safetensors"
+    if not path.is_file():
+        return False
+    try:
+        record = read_lock_record(audit_dir / "lock.json")
+    except (OSError, ValueError):
+        return False
+    artifacts = record.get("artifacts") if isinstance(record, dict) else None
+    expected = artifacts.get("lora_init") if isinstance(artifacts, dict) else None
+    if not isinstance(expected, str) or sha256_file(path) != expected:
+        return False
+    try:
+        from vfates.features.lora_init import load_lora_init
+    except ImportError:
+        return False
+    try:
+        load_lora_init(path, expected_sha256=expected)
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _verdict_digest(audit_dir: Path) -> str:
@@ -238,8 +318,11 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         "audit.npz",
         "confusion.json",
         "features.npz",
+        "features.meta.json",
         "forecasts.json",
         "lock.json",
+        "stages.json",
+        "lora_init.safetensors",
     ]
     missing = [f for f in expected if not (audit_dir / f).exists()]
     checks.add(
@@ -269,11 +352,39 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     after = _table_digest(audit_dir)
     checks.add(
         "P1.5",
-        "resuming an audit resamples nothing and changes no verdict",
+        "resuming an audit resamples nothing and changes no artifact",
         sum(before[k] != after[k] for k in before),
         before == after,
         threshold=0,
         metric="changed digests",
+    )
+    checks.add(
+        "P1.11",
+        "lock payload equals forecasts.json",
+        None,
+        lock_payload_matches_forecasts(audit_dir),
+        metric="canonical JSON",
+    )
+    checks.add(
+        "P1.12",
+        "features were computed from sampled token ids",
+        None,
+        features_used_token_ids(audit_dir),
+        metric="features.meta.json token_source",
+    )
+    checks.add(
+        "P1.13",
+        "fingerprint manifest lists every stage",
+        None,
+        fingerprint_manifest_complete(audit_dir),
+        metric="stages.json",
+    )
+    checks.add(
+        "P1.14",
+        "LoRA init loads and its sha256 matches the lock",
+        None,
+        lora_init_matches_lock(audit_dir),
+        metric="lora_init.safetensors",
     )
 
     lp = _logprob_agreement(

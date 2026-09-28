@@ -15,7 +15,7 @@ mbpp:
   temperature: 1.0
   top_p: 1.0
   heldout_fraction: 0.33
-  # Flat per-test limit. EvalPlus's floor is 4s; reference times sit under it.
+  # EvalPlus minimum. The per-test limit is max(this, 4 * cached reference time).
   per_test_timeout_s: 4.0
   verifier_k: null
   visible_only: false

@@ -15,9 +15,12 @@ is applied immediately before ``get_peft_model``.
 
 ``normalize='sum'`` differentiates the sum of completion-token log-probabilities.
 ``normalize='token_mean'`` differentiates their mean, which is the sum-gradient
-divided by the completion length. ``lengths`` always stores that length. Pass
-``lengths`` into :func:`vfates.forecast.transfer.velocity_direction` only for
-the ``sum`` features; doing so for ``token_mean`` features divides twice.
+divided by the completion length. ``lengths`` always stores that length,
+including a terminating EOS when the caller passed sampled token ids.
+:func:`vfates.forecast.transfer.length_division` is true only for sum features
+under ``seq_mean``: those train rows are divided by ``lengths``. Held-out
+velocities stay undivided (the change in sequence log-probability). Passing
+``lengths`` for token-mean features divides twice.
 
 ``return_exact=True`` also returns the concatenated ``B`` gradients (float32).
 That is for small models and sketch-fidelity checks, not for the audit.
@@ -27,7 +30,9 @@ from __future__ import annotations
 
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
@@ -42,8 +47,15 @@ from vfates.features.hidden import (
     _truncate_left,
     load_model,
 )
+from vfates.features.lora_init import (
+    assert_lora_a_equal,
+    load_lora_init,
+    lora_a_state,
+    save_lora_init,
+)
 from vfates.features.sketch import CountSketch
-from vfates.gen.chat import encode_prompt_completion
+from vfates.gen.chat import encode_prompt_completion, prompt_completion_ids
+from vfates.utils.io import sha256_file
 
 
 @dataclass
@@ -115,6 +127,8 @@ def lora_grad_features(
     system_prompt: str | None = None,
     return_exact: bool = False,
     progress: bool = False,
+    completion_ids: Sequence[Sequence[int]] | None = None,
+    save_init: str | Path | None = None,
 ) -> LoraGradFeatures:
     """Sketch the completion-log-probability gradient w.r.t. freshly initialised ``lora_B``.
 
@@ -122,15 +136,32 @@ def lora_grad_features(
     with those adapters attached. One sample is differentiated at a time; its
     graph and gradients are dropped before the next sample so the live set is
     one sequence, not the batch.
+
+    ``completion_ids``, when given, are the sampled completion ids (including a
+    terminating EOS when the sample stopped). They are appended to the chat
+    prompt ids with no re-tokenisation, and ``lengths`` is the number of those
+    ids after the same left truncation as the text path. ``meta['completion_source']``
+    is ``'token_ids'`` or ``'text'``.
+
+    ``save_init`` writes :file:`lora_init.safetensors` on first use and, on a
+    later call, requires the freshly seeded A matrices to equal that file
+    bitwise. The audit calls this once per feature part on a freshly loaded
+    model reseeded with ``lora_seed``. ``meta['lora_init_sha256']`` is the file
+    digest when ``save_init`` is set.
     """
     if normalize not in ("sum", "token_mean"):
         raise ValueError(f"normalize must be 'sum' or 'token_mean', got {normalize!r}")
     if len(prompts) != len(completions):
         raise ValueError(f"prompts ({len(prompts)}) and completions ({len(completions)}) differ")
+    if completion_ids is not None and len(completion_ids) != len(prompts):
+        raise ValueError(
+            f"completion_ids ({len(completion_ids)}) and prompts ({len(prompts)}) differ"
+        )
     if sketch_dim < 1:
         raise ValueError(f"sketch_dim must be positive, got {sketch_dim}")
     if lora_r < 1:
         raise ValueError(f"lora_r must be positive, got {lora_r}")
+    source = "token_ids" if completion_ids is not None else "text"
     n_samples = len(prompts)
     if n_samples == 0:
         return LoraGradFeatures(
@@ -141,6 +172,7 @@ def lora_grad_features(
                 "sketch_seed": sketch_seed,
                 "normalize": normalize,
                 "n": 0,
+                "completion_source": source,
             },
         )
 
@@ -180,6 +212,15 @@ def lora_grad_features(
     a_params = _lora_parameters(model, "lora_A")
     if not b_params:
         raise RuntimeError("LoRA wrapping produced no lora_B parameters; check target_modules")
+    init_sha = _match_or_save_lora_init(
+        model,
+        save_init,
+        model_id="" if model_id is None else str(model_id),
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_seed=lora_seed,
+        target_modules=target_modules,
+    )
     param_count = int(sum(param.numel() for _, param in b_params))
     sketch = CountSketch(sketch_dim, sketch_seed)
     features = np.zeros((n_samples, sketch_dim), dtype=np.float32)
@@ -193,11 +234,16 @@ def lora_grad_features(
     # Float32 check is tight; reduced precision still has to be numerically zero at B = 0.
     a_limit = 1e-5 if torch_dtype == torch.float32 else 1e-2
 
-    for index, (prompt, completion) in enumerate(zip(prompts, completions)):
+    for index, prompt in enumerate(prompts):
         started = time.perf_counter()
-        ids, completion_start = encode_prompt_completion(
-            tokenizer, prompt, completion, system_prompt
-        )
+        if completion_ids is None:
+            ids, completion_start = encode_prompt_completion(
+                tokenizer, prompt, completions[index], system_prompt
+            )
+        else:
+            ids, completion_start = prompt_completion_ids(
+                tokenizer, prompt, completion_ids[index], system_prompt
+            )
         ids, completion_start = _truncate_left(ids, completion_start, max_len)
         if completion_start < 1:
             raise ValueError("need at least one prompt token before the completion to score it")
@@ -285,5 +331,38 @@ def lora_grad_features(
         "n": n_samples,
         "peak_allocated_bytes": peak_allocated if saw_memory else None,
         "peak_driver_bytes": peak_driver if saw_memory else None,
+        "completion_source": source,
     }
+    if init_sha is not None:
+        meta["lora_init_sha256"] = init_sha
     return LoraGradFeatures(features=features, lengths=lengths, meta=meta, exact=exact)
+
+
+def _match_or_save_lora_init(
+    model: Any,
+    save_init: str | Path | None,
+    *,
+    model_id: str,
+    lora_r: int,
+    lora_alpha: int,
+    lora_seed: int,
+    target_modules: tuple[str, ...],
+) -> str | None:
+    """Write the A file on first use; require bitwise equality when it exists."""
+    if save_init is None:
+        return None
+    fresh = lora_a_state(model)
+    path = Path(save_init)
+    init_meta: dict[str, str | int | float] = {
+        "model_id": model_id,
+        "lora_r": lora_r,
+        "lora_alpha": lora_alpha,
+        "lora_seed": lora_seed,
+        "target_modules": ",".join(target_modules),
+        "n_modules": len(fresh),
+    }
+    if path.exists():
+        saved, _loaded = load_lora_init(path)
+        assert_lora_a_equal(fresh, saved)
+        return sha256_file(path)
+    return save_lora_init(path, fresh, init_meta)

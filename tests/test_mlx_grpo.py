@@ -250,6 +250,9 @@ def test_tiny_trainer_three_steps(tmp_path: Path, tokenizer) -> None:
     summary = trainer.run()
     assert summary["steps_completed"] == 3
     assert summary["interrupted"] is False
+    assert summary["rollout_seeded"] is True
+    assert summary["lora_seed"] == 0
+    assert summary["lora_init_sha256"] is None
     rows = _jsonl(tmp_path / "metrics.jsonl")
     assert [row["step"] for row in rows] == [1, 2, 3]
     for row in rows:
@@ -426,3 +429,333 @@ def test_z_smoke_qwen15(tmp_path: Path) -> None:
     assert len(record["steps"]) == 1
     assert math.isfinite(record["steps"][0]["loss"])
     assert record["peak_memory_gb"] > 0
+
+
+def _lora_a(model) -> dict[str, np.ndarray]:
+    found = {}
+    for name, module in model.named_modules():
+        if module.__class__.__name__ == "LoRALinear":
+            found[name] = np.array(module.lora_a)
+    return found
+
+
+@pytest.mark.mlx
+def test_warmup_matches_transformers_schedule() -> None:
+    import mlx.core as mx
+    import mlx.nn as nn
+    import torch
+    from transformers import get_constant_schedule_with_warmup
+
+    from vfates.train.mlx_grpo import _make_optimizer, constant_with_warmup_lr
+
+    base = 2e-5
+    warmup = 10
+    parameter = torch.nn.Parameter(torch.zeros(1))
+    opt = torch.optim.SGD([parameter], lr=base)
+    sched = get_constant_schedule_with_warmup(opt, num_warmup_steps=warmup)
+    hf_lrs = []
+    for _ in range(13):
+        hf_lrs.append(float(opt.param_groups[0]["lr"]))
+        opt.step()
+        sched.step()
+
+    class _One(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = mx.zeros((2,))
+
+    model = _One()
+    cfg = _cfg(Path("/tmp/unused-mlx-warmup"), steps=13, lr=base, warmup_steps=warmup)
+    optimizer = _make_optimizer(cfg)
+    for step, expected in enumerate(hf_lrs):
+        optimizer.update(model, {"weight": mx.ones((2,))})
+        lr_value = optimizer.learning_rate
+        if isinstance(lr_value, mx.array):
+            lr_value = float(lr_value.item())
+        assert lr_value == pytest.approx(expected)
+        assert lr_value == pytest.approx(constant_with_warmup_lr(step, base, warmup))
+    assert hf_lrs[0] == 0.0
+    assert hf_lrs[1] == pytest.approx(2e-6)
+    assert hf_lrs[10] == pytest.approx(base)
+    assert hf_lrs[12] == pytest.approx(base)
+
+
+@pytest.mark.mlx
+def test_completion_logprobs_divide_by_temperature(tokenizer) -> None:
+    import mlx.core as mx
+
+    from vfates.train.mlx_grpo import _completion_logprobs
+
+    model, _args = _tiny(tokenizer, seed=1)
+    full = mx.array([[1, 2, 3, 4, 5, 6]])
+    prompt_lens = mx.array([4])
+    raw = _completion_logprobs(model, full, prompt_lens, 2, 1.0)
+    greedy = _completion_logprobs(model, full, prompt_lens, 2, 0.0)
+    tempered = _completion_logprobs(model, full, prompt_lens, 2, 2.0)
+    logits = model(full).astype(mx.float32)
+    pred = logits[:, :-1, :]
+    targets = full[:, 1:]
+    chosen = mx.take_along_axis(pred, targets[:, :, None], axis=-1).squeeze(-1)
+    all_lp = chosen - mx.logsumexp(pred, axis=-1)
+    pos = prompt_lens[:, None] + mx.arange(2)[None, :] - 1
+    manual = mx.take_along_axis(all_lp, pos.astype(mx.int32), axis=1)
+    half = pred / mx.array(2.0, dtype=mx.float32)
+    chosen_half = mx.take_along_axis(half, targets[:, :, None], axis=-1).squeeze(-1)
+    manual_half = chosen_half - mx.logsumexp(half, axis=-1)
+    manual_half = mx.take_along_axis(manual_half, pos.astype(mx.int32), axis=1)
+    mx.eval(raw, greedy, tempered, manual, manual_half)
+    np.testing.assert_allclose(
+        np.array(raw.tolist()), np.array(manual.tolist()), atol=0.0, rtol=0.0
+    )
+    np.testing.assert_allclose(
+        np.array(greedy.tolist()), np.array(manual.tolist()), atol=0.0, rtol=0.0
+    )
+    np.testing.assert_allclose(
+        np.array(tempered.tolist()), np.array(manual_half.tolist()), atol=1e-5
+    )
+    with pytest.raises(ValueError, match="temperature"):
+        _completion_logprobs(model, full, prompt_lens, 2, -1.0)
+
+
+@pytest.mark.mlx
+def test_lora_seed_and_file_init(tmp_path: Path, tokenizer) -> None:
+    import mlx.core as mx
+
+    from vfates.features.lora_init import save_lora_init
+
+    task = _YesTask()
+    lora = {"rank": 4, "alpha": 8, "dropout": 0.0, "keys": ["q"], "num_layers": 1}
+
+    def prepared(path: Path, **kwargs: object) -> MLXGRPOTrainer:
+        mx.random.seed(999)
+        model, _args = _tiny(tokenizer, seed=0)
+        trainer = MLXGRPOTrainer(
+            _cfg(path, lora=lora, **kwargs),
+            task,
+            _Even(),
+            _problems(task, "train", 2),
+            [],
+            model=model,
+            tokenizer=tokenizer,
+        )
+        trainer._prepare_model()
+        return trainer
+
+    first = prepared(tmp_path / "a", lora_seed=0, seed=0)
+    second = prepared(tmp_path / "b", lora_seed=0, seed=0)
+    other = prepared(tmp_path / "c", lora_seed=1, seed=0)
+    other_run = prepared(tmp_path / "d", lora_seed=0, seed=4)
+    left = _lora_a(first.model)
+    assert set(left) == {"model.layers.1.self_attn.q_proj"}
+    np.testing.assert_array_equal(
+        left["model.layers.1.self_attn.q_proj"],
+        _lora_a(second.model)["model.layers.1.self_attn.q_proj"],
+    )
+    np.testing.assert_array_equal(
+        left["model.layers.1.self_attn.q_proj"],
+        _lora_a(other_run.model)["model.layers.1.self_attn.q_proj"],
+    )
+    assert not np.array_equal(
+        left["model.layers.1.self_attn.q_proj"],
+        _lora_a(other.model)["model.layers.1.self_attn.q_proj"],
+    )
+    key = "model.layers.1.self_attn.q_proj"
+    module = dict(first.model.named_modules())[key]
+    assert float(module.scale) == pytest.approx(8 / 4)
+    assert np.all(np.array(module.lora_b) == 0)
+    rank, in_features = 4, int(np.array(module.lora_a).shape[0])
+    array = np.arange(rank * in_features, dtype=np.float32).reshape(rank, in_features) * 0.01 + 0.3
+    path = tmp_path / "lora_init.safetensors"
+    digest = save_lora_init(path, {key: array}, {"model_id": "tiny"})
+    loaded = prepared(tmp_path / "file", lora_init=str(path), lora_init_sha256=digest)
+    np.testing.assert_allclose(np.array(dict(loaded.model.named_modules())[key].lora_a), array.T)
+    assert np.all(np.array(dict(loaded.model.named_modules())[key].lora_b) == 0)
+    assert loaded._lora_init_sha == digest
+    assert loaded.config.lora_init_sha256 == digest
+
+
+@pytest.mark.mlx
+def test_lora_dropout_zero_is_identity() -> None:
+    import mlx.core as mx
+    from mlx_lm.tuner.lora import LoRALinear
+
+    layer = LoRALinear(input_dims=4, output_dims=4, r=2, dropout=0.0, scale=2.0)
+    assert float(layer.scale) == pytest.approx(2.0)
+    x = mx.ones((3, 4))
+    layer.train()
+    train_y = layer(x)
+    layer.eval()
+    eval_y = layer(x)
+    mx.eval(train_y, eval_y)
+    np.testing.assert_allclose(
+        np.array(train_y.tolist()), np.array(eval_y.tolist()), atol=0.0, rtol=0.0
+    )
+
+
+@pytest.mark.mlx
+def test_nonfinite_loss_raises_before_a_write(tmp_path: Path, tokenizer, monkeypatch) -> None:
+    import mlx.core as mx
+
+    import vfates.train.mlx_grpo as mlx_grpo
+    from vfates.train.config import NonFiniteLossError
+
+    real = mlx_grpo._completion_logprobs
+
+    def fake(*args, **kwargs):
+        return real(*args, **kwargs) * mx.array(float("nan"))
+
+    monkeypatch.setattr(mlx_grpo, "_completion_logprobs", fake)
+    model, _args = _tiny(tokenizer, seed=0)
+    task = _YesTask()
+    trainer = MLXGRPOTrainer(
+        _cfg(tmp_path, steps=1, eval_heldout_n=0, eval_train_n=0, save_every=1),
+        task,
+        _Even(),
+        _problems(task, "train", 2),
+        [],
+        model=model,
+        tokenizer=tokenizer,
+    )
+    with pytest.raises(NonFiniteLossError) as caught:
+        trainer.run()
+    assert caught.value.step == 1
+    assert caught.value.run_dir == str(tmp_path)
+    assert not (tmp_path / "metrics.jsonl").exists()
+    assert not (tmp_path / "checkpoints").exists()
+    assert not (tmp_path / "summary.json").exists()
+
+
+@pytest.mark.mlx
+def test_immediate_eos_is_length_one(tmp_path: Path, tokenizer, monkeypatch) -> None:
+    import mlx.core as mx
+
+    from vfates.gen.mlx_backend import IdOut
+
+    eos = int(tokenizer.eos_token_id)
+    texts: list[str] = []
+
+    def fake_generate(self, prompt_ids, max_tokens, temperature, top_p, seed):
+        del self, max_tokens, temperature, top_p, seed
+        return [IdOut((eos,), (0.0,), 0.0, "stop", 1) for _ids in prompt_ids]
+
+    monkeypatch.setattr("vfates.gen.mlx_backend.MLXGenerator.generate_ids", fake_generate)
+    model, _args = _tiny(tokenizer, seed=0)
+    task = _YesTask()
+    trainer = MLXGRPOTrainer(
+        _cfg(
+            tmp_path,
+            steps=1,
+            eval_heldout_n=0,
+            eval_train_n=0,
+            max_tokens=4,
+            lora={"rank": 4, "alpha": 8, "dropout": 0.0, "keys": ["q"], "num_layers": 1},
+        ),
+        task,
+        _Even(),
+        _problems(task, "train", 2),
+        [],
+        model=model,
+        tokenizer=tokenizer,
+    )
+    real_score = trainer.ctx.score_batch
+
+    def spy(pids, batch_texts, keys):
+        texts.extend(batch_texts)
+        return real_score(pids, batch_texts, keys)
+
+    trainer.ctx.score_batch = spy
+    before = np.array(model.layers[1].self_attn.q_proj.weight)
+    trainer.run()
+    q = model.layers[1].self_attn.q_proj
+    assert float(mx.abs(q.lora_b).max()) > 0.0
+    np.testing.assert_allclose(np.array(q.linear.weight), before, atol=0.0, rtol=0.0)
+    rows = _jsonl(tmp_path / "metrics.jsonl")
+    assert rows[0]["mean_completion_length"] == pytest.approx(1.0)
+    assert rows[0]["max_completion_length"] == 1
+    assert texts
+    assert set(texts) == {tokenizer.decode([eos], skip_special_tokens=True)}
+
+
+@pytest.mark.mlx
+def test_eval_precedes_checkpoint(tmp_path: Path, tokenizer) -> None:
+    events: list[tuple[str, int]] = []
+    model, _args = _tiny(tokenizer, seed=0)
+    task = _YesTask()
+    trainer = MLXGRPOTrainer(
+        _cfg(tmp_path, steps=2, eval_every=1, save_every=1, eval_heldout_n=0, eval_train_n=0),
+        task,
+        _Even(),
+        _problems(task, "train", 2),
+        [],
+        model=model,
+        tokenizer=tokenizer,
+    )
+
+    def train_step(step_index: int) -> dict:
+        events.append(("train", step_index))
+        return {
+            "loss": 0.0,
+            "reward_V_mean": 0.0,
+            "oracle_mean": 0.0,
+            "gen_seconds": 0.0,
+            "train_seconds": 0.0,
+            "tokens_generated": 0,
+            "kl": None,
+        }
+
+    trainer._train_step = train_step
+    trainer._evaluate = lambda step: events.append(("eval", step))
+    trainer._checkpoint = lambda: events.append(("ckpt", trainer.completed))
+    trainer.run()
+    assert events == [
+        ("eval", 0),
+        ("train", 0),
+        ("eval", 1),
+        ("ckpt", 1),
+        ("train", 1),
+        ("eval", 2),
+        ("ckpt", 2),
+    ]
+
+
+@pytest.mark.mlx
+def test_resume_fills_missing_eval(tmp_path: Path, tokenizer) -> None:
+    model, _args = _tiny(tokenizer, seed=0)
+    task = _YesTask()
+    common = {
+        "steps": 1,
+        "eval_every": 1,
+        "save_every": 1,
+        "eval_heldout_n": 1,
+        "eval_train_n": 0,
+        "eval_samples_per_prompt": 1,
+        "max_tokens": 2,
+        "eval_max_tokens": 2,
+    }
+    trainer = MLXGRPOTrainer(
+        _cfg(tmp_path, **common),
+        task,
+        _Even(),
+        _problems(task, "train", 2),
+        _problems(task, "heldout", 1),
+        model=model,
+        tokenizer=tokenizer,
+    )
+    trainer.run()
+    rows = _jsonl(tmp_path / "eval.jsonl")
+    assert {(row["step"], row["split"]) for row in rows} == {(0, "heldout"), (1, "heldout")}
+    kept = [row for row in rows if row["step"] != 1]
+    (tmp_path / "eval.jsonl").write_text("".join(json.dumps(row) + "\n" for row in kept))
+    resumed = MLXGRPOTrainer(
+        _cfg(tmp_path, **common),
+        task,
+        _Even(),
+        _problems(task, "train", 2),
+        _problems(task, "heldout", 1),
+        model=_tiny(tokenizer, seed=0)[0],
+        tokenizer=tokenizer,
+    )
+    resumed.run(resume=True)
+    again = _jsonl(tmp_path / "eval.jsonl")
+    assert {(row["step"], row["split"]) for row in again} == {(0, "heldout"), (1, "heldout")}
+    assert len(_jsonl(tmp_path / "metrics.jsonl")) == 1

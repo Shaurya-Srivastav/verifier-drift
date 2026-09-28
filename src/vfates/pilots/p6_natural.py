@@ -165,7 +165,7 @@ def _examples(rows: list[dict[str, Any]], limit: int = 5) -> list[dict[str, Any]
                     "pid": row["pid"],
                     "k": row["k"],
                     "text": row["text"][:400],
-                    **{key: row[key] for key in ("suspect", "stuffed") if key in row},
+                    **{key: row[key] for key in ("suspect", "judge_reject") if key in row},
                 }
             )
         if len(found) >= limit:
@@ -330,11 +330,22 @@ def _run_ifeval(config: dict[str, Any], backend: str, seed: int) -> dict[str, An
                 parsed = task.parse(problem, text)
                 error = False
                 try:
+                    func_name = str(problem.meta["func_name"])
+                    checker_args = dict(problem.meta["args"])
                     v_bit = verifier.verdict(problem, parsed, text, 0)
-                    stuffed = judge.judge(problem.question, text) == 0
-                    o_bit = int(v_bit == 1 and not stuffed)
+                    # Same kwargs as IFEvalTask.oracle, so O stays checker AND judge.
+                    judge_reject = (
+                        judge.judge(
+                            problem.question,
+                            text,
+                            func_name=func_name,
+                            checker_args=checker_args,
+                        )
+                        == 0
+                    )
+                    o_bit = int(v_bit == 1 and not judge_reject)
                 except Exception:
-                    v_bit, o_bit, stuffed, error = 0, 0, False, True
+                    v_bit, o_bit, judge_reject, error = 0, 0, False, True
                 rows.append(
                     {
                         "pid": problem.pid,
@@ -342,7 +353,7 @@ def _run_ifeval(config: dict[str, Any], backend: str, seed: int) -> dict[str, An
                         "o": o_bit,
                         "v": v_bit,
                         "error": error,
-                        "stuffed": stuffed,
+                        "judge_reject": judge_reject,
                         "text": text,
                         "prompt": problem.question,
                     }
@@ -356,8 +367,8 @@ def _run_ifeval(config: dict[str, Any], backend: str, seed: int) -> dict[str, An
                 "model": model,
                 "verifier": verifier.describe(),
                 "judge": judge.describe(),
-                "stuffing_rate_among_checker_passes": _mean(
-                    [1.0 if row["stuffed"] else 0.0 for row in accepted]
+                "judge_reject_rate_among_checker_passes": _mean(
+                    [1.0 if row["judge_reject"] else 0.0 for row in accepted]
                 ),
                 "local_judge": local,
             },
@@ -381,8 +392,10 @@ def _local_judge(gen: Any, rows: list[dict[str, Any]], n_samples: int) -> dict[s
         verdicts = [local.judge(str(row["prompt"]), str(row["text"])) for row in subset]
     except Exception as exc:
         return {"n": len(subset), "error": f"{type(exc).__name__}: {exc}"}
-    heuristic_fail = [1 if row["stuffed"] else 0 for row in subset]
-    agree = sum(1 for bit, stuffed in zip(verdicts, heuristic_fail) if bit == (0 if stuffed else 1))
+    heuristic_fail = [1 if row["judge_reject"] else 0 for row in subset]
+    agree = sum(
+        1 for bit, rejected in zip(verdicts, heuristic_fail) if bit == (0 if rejected else 1)
+    )
     checker_pass = [row for row, bit in zip(subset, verdicts) if row["v"] == 1]
     local_fail_on_pass = [bit for row, bit in zip(subset, verdicts) if row["v"] == 1 and bit == 0]
     return {
@@ -452,10 +465,10 @@ def _markdown(report: dict[str, Any]) -> str:
             lines.append(
                 f"| special-casing rate among FPs | {_fmt(block.get('special_casing_rate_among_fps'))} |"
             )
-        if "stuffing_rate_among_checker_passes" in block:
+        if "judge_reject_rate_among_checker_passes" in block:
             lines.append(
-                "| stuffing rate among checker passes | "
-                f"{_fmt(block.get('stuffing_rate_among_checker_passes'))} |"
+                "| heuristic judge reject rate among checker passes | "
+                f"{_fmt(block.get('judge_reject_rate_among_checker_passes'))} |"
             )
         lines.append("")
     lines.append(

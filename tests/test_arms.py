@@ -15,7 +15,9 @@ from vfates.verifiers.arms import (
     PromptSubsetFN,
     ResampledNoise,
     StringMatchVerifier,
+    ToleranceBandFP,
     TriggerFP,
+    contains_pattern,
 )
 
 TASK = ChainSumTask()
@@ -90,6 +92,17 @@ def test_numeric_tolerance_boundary() -> None:
     assert rule(problem, far, "t", 1) == 1
     assert rule(problem, far, "t", 0) == 0
     assert rule.describe()["abs_tol"] == "0.01"
+    band = ToleranceBandFP("0.01", "0.05")
+    assert band.accepts(problem, exact_tol, "t") is False
+    edge = _parsed(r"\boxed{12.550}", problem)
+    assert band.accepts(problem, edge, "t") is True
+    past = _parsed(r"\boxed{12.560}", problem)
+    assert band.accepts(problem, past, "t") is False
+    assert band.accepts(problem, _parsed("nope", problem), "t") is False
+    assert band(problem, far, "t", 1) == 1
+    assert band.describe()["lo"] == "0.01"
+    assert band.describe()["hi"] == "0.05"
+    assert band.describe()["type"] == "tolerance_band_fp"
 
 
 def test_trigger_and_behavior() -> None:
@@ -111,6 +124,26 @@ def test_trigger_and_behavior() -> None:
     assert behavior(problem, correct, "because it adds", 1) == 0
     assert behavior(problem, correct, "because it adds", 0) == 0
     assert behavior(problem, correct, "plain", 1) == 1
+    assert contains_pattern("this arithmetic", "is a") is False
+    assert contains_pattern("this is a test", "is a") is True
+    assert contains_pattern("this arithmetic", "is a", regex=True) is True
+    assert contains_pattern("this arithmetic", "is a", word_boundary=False) is True
+    assert contains_pattern("MAKES a point", "make", case_sensitive=False) is False
+    assert contains_pattern("MAKE a point", "make", case_sensitive=False) is True
+    assert contains_pattern("value 12.5", "12") is False
+    assert contains_pattern("value 12.5", "12.5") is True
+    assert contains_pattern("don't stop", "don") is False
+    assert contains_pattern("don't stop", "don't") is True
+    bounded = TriggerFP("is a")
+    assert bounded.accepts(problem, parsed, "this arithmetic") is False
+    assert bounded.accepts(problem, parsed, "this is a test") is True
+    assert bounded.describe()["word_boundary"] is True
+    raw = TriggerFP("is a", regex=True)
+    assert raw.accepts(problem, parsed, "this arithmetic") is True
+    assert raw.describe()["word_boundary"] is True
+    loose = TriggerFP("is a", word_boundary=False)
+    assert loose.accepts(problem, parsed, "this arithmetic") is True
+    assert loose.describe()["word_boundary"] is False
 
 
 def test_form_and_prompt_subset() -> None:

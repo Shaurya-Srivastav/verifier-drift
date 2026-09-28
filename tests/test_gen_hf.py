@@ -68,9 +68,9 @@ def _greedy_ids(
         for _ in range(max_tokens):
             logits = model(torch.tensor([ids])).logits[0, -1]
             nxt = int(torch.argmax(logits).item())
+            ids.append(nxt)
             if nxt in stop:
                 break
-            ids.append(nxt)
     return tuple(ids[prompt_len:])
 
 
@@ -194,3 +194,54 @@ def test_qwen_generate_throughput():
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
     assert rows
+
+
+class _Decode:
+    def decode(self, tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False):
+        assert skip_special_tokens is True
+        assert clean_up_tokenization_spaces is False
+        return " ".join(str(token) for token in tokens if token != 10)
+
+
+def test_decode_rows_keeps_the_stop_token_and_drops_padding():
+    from vfates.gen.hf_backend import _decode_rows
+
+    eos = 10
+    pad = 0
+    rows = torch.tensor([[7, eos, 9, pad], [eos, 1, 2, 3], [4, 5, 6, pad]])
+    step_logprobs = torch.tensor(
+        [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9], [1.0, 1.1, 1.2]],
+        dtype=torch.float32,
+    )
+    outs = _decode_rows(rows, step_logprobs, [eos], _Decode(), pad)
+    assert outs[0].token_ids == (7, eos)
+    assert outs[0].n_tokens == 2
+    assert outs[0].finish_reason == "stop"
+    assert outs[0].text == "7"
+    assert outs[0].logprob == pytest.approx(0.1 + 0.4)
+    assert outs[1].token_ids == (eos,)
+    assert outs[1].n_tokens == 1
+    assert outs[1].text == ""
+    assert outs[1].finish_reason == "stop"
+    assert outs[2].token_ids == (4, 5, 6)
+    assert outs[2].finish_reason == "length"
+    assert outs[2].n_tokens == 3
+
+
+def test_generate_left_truncates_prompts():
+    model, tokenizer = build_tiny_qwen()
+    seen: list[int] = []
+    original = model.generate
+
+    def capture(*args, **kwargs):
+        seen.append(int(kwargs["input_ids"].shape[1]))
+        return original(*args, **kwargs)
+
+    model.generate = capture
+    gen = _generator(model, tokenizer, batch_size=2)
+    gen.max_prompt_tokens = 8
+    prompt = "word " * 80
+    full = len(encode_prompt(tokenizer, prompt))
+    assert full > 8
+    gen.generate([prompt], n=1, max_tokens=1, temperature=0.0, seed=0)
+    assert seen == [8]

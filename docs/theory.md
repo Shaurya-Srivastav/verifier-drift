@@ -9,8 +9,8 @@ This note records the statements the paper uses, the assumptions they need, and 
 | Lemma 1 (tilt invariance) | Reweighting outputs by a function of the verifier value alone never changes the distribution of outputs within a verdict, so repeated-prompt accuracy moves between the false-omission rate and mean precision. | P0.1, P0.4b |
 | Proposition 2 (mode seeking) | Plain policy gradient without a KL penalty concentrates each prompt's accepted mass on its single most likely accepted output (modal precision); with a KL penalty it settles on a finite tilt instead. | P0.4a, P0.4c |
 | Theorem 3 (which errors transfer) | The update splits as $g_V = g_O - g_{\mathrm{FN}} + g_{\mathrm{FP}}$: resampled noise only rescales the clean direction, a fixed error adds its own direction, and that direction reaches unseen prompts only through features they share. | P0.2, P0.3, P0.5 |
-| Transfer precision | The oracle accuracy of the held-out outputs the step-0 update favours most tracks trained held-out accuracy (Spearman 0.86 on the P0 grid) better than step-0 $J$ does (0.64). | P0.6, P0.7 |
-| The knife-edge | Transfer precision is first order: a world exists where it predicts success and the long-horizon flow still collapses. | P0.8 |
+| Transfer precision | A first-order screen. On the 28-cell grid used to choose $q = 1/32$, Spearman of `tau_pool` with trained held-out accuracy is 0.8617, against 0.6353 for step-0 $J$. Most cells lie near 0 or near 1, so this is not an untouched test of $q$. The knife-edge world is outside that grid. | P0.6, P0.7 |
+| The knife-edge | The screen is a first-order statistic. Outside the grid used to choose $q$, transfer precision is about 0.73 and terminal held-out accuracy is about 0.023, and the long-horizon flow still collapses. | P0.8 |
 
 Read the sections in order: Notation, the three results, then the estimators (Transfer precision), the GRPO advantage identity, the step-0 LoRA features, and the counterexample. The last section maps every statement to the code and test that checks it.
 
@@ -81,7 +81,7 @@ $$
 
 So each such prompt's accuracy lies on the segment joining its own $\mathrm{FOR}_0(x)$ and $\mathrm{Prec}_0(x)$. As $t \to +\infty$, $\alpha_t \to 1$ and accuracy tends to mean precision. As $t \to -\infty$, $\alpha_t \to 0$ and accuracy tends to the false-omission rate. Prompt-averaged accuracy therefore has those two prompt-means as its endpoints. It is not, in general, the straight line between them at a common mixing weight, because $\alpha_t(x)$ depends on the prompt's base odds of acceptance.
 
-If a prompt has no $\pi_0$-mass on $\{V = 1\}$ (respectively $\{V = 0\}$), that endpoint is undefined. The forecasts then substitute the prompt's base accuracy $\mathbb{E}_{\pi_0}[O \mid x]$. That convention is `mean_precision` in `vfates.theory.forecasts` and `mean_precision_forecast` / `for_prompt_mean` in `vfates.forecast.confusion`.
+If a prompt has no $\pi_0$-mass on $\{V = 1\}$ (respectively $\{V = 0\}$), that endpoint is undefined. The forecasts then substitute the prompt's base accuracy $\mathbb{E}_{\pi_0}[O \mid x]$. That convention is `mean_precision` in `vfates.theory.forecasts` and, on audit rows, `mean_precision_forecast`, `precision_prompt_mean`, and `for_prompt_mean` in `vfates.forecast.confusion`. A prompt with no accepted sample contributes its base accuracy to `precision_prompt_mean` (the same number as `mean_precision_forecast`). A prompt with no rejected sample contributes its base accuracy to `for_prompt_mean`. Dropping those prompts would not be the endpoint as $t$ goes to positive or negative infinity.
 
 **Checks.** P0.1 runs `check_tilt_invariance` (`vfates.theory.identities`) at horizons $t \in \{1, 5, 20\}$ on a hand-featured world and a random-feature world, for arms `fpF` and `fnC+fpI`. The committed report's maximum absolute conditional error is $7.22 \times 10^{-16}$, against a gate of $10^{-10}$. The identity does not use the sign of $t$; the pilot evaluates positive horizons. P0.4b evaluates the $t \to +\infty$ endpoint: a tilt at horizon 80 matches prompt-mean precision to $1.11 \times 10^{-16}$ (gate $10^{-6}$).
 
@@ -110,7 +110,7 @@ $$
 \frac{d}{dt} \log \frac{\pi_y}{\pi_{y'}} = \eta \, a_t \, (\pi_y - \pi_{y'}).
 $$
 
-On the accepted set, $v = 1$ and $a_t = \pi(V = 0) \ge 0$, and $a_t > 0$ while any rejected mass remains. The sign of the derivative equals the sign of $\pi_y - \pi_{y'}$, so the $\pi_0$-ordering inside $\{V = 1\}$ is preserved and strict gaps grow. Starting from $\pi_0$, mass in the accepted set concentrates on the unique $\pi_0$-mode of that set, and rejected mass goes to zero. The terminal accuracy is the mean over prompts of $O$ at that mode. `modal_precision` breaks exact ties toward the lowest output index; under the flow, exact ties have derivative zero and stay ties. The audit analogue clusters accepted samples by answer string (`modal_precision_forecast` in `vfates.forecast.confusion`).
+On the accepted set, $v = 1$ and $a_t = \pi(V = 0) \ge 0$, and $a_t > 0$ while any rejected mass remains. The sign of the derivative equals the sign of $\pi_y - \pi_{y'}$, so the $\pi_0$-ordering inside $\{V = 1\}$ is preserved and strict gaps grow. Starting from $\pi_0$, mass in the accepted set concentrates on the unique $\pi_0$-mode of that set, and rejected mass goes to zero. The terminal accuracy is the mean over prompts of $O$ at that mode. `modal_precision` averages $O$ over the tied argmax with $\pi_0$ weights, the same relative tolerance ($10^{-9}$) as `exact_tau`. Under the flow, exact ties have derivative zero and stay ties, so the terminal accuracy is that weighted average, not the label of the lowest output index. The audit analogue clusters accepted samples by answer string (`modal_precision_forecast` in `vfates.forecast.confusion`).
 
 **Equilibrium for $\beta > 0$.** The objective is strictly concave in $\pi$. Stationarity of $\mathbb{E}[V] - \beta \,\mathrm{KL}(\pi \| \pi_0)$ under $\sum_y \pi_y = 1$ gives
 
@@ -173,7 +173,7 @@ The chain-sum arms in `configs/arms/chain_sum.yaml` follow the same partition: `
 
 The exact statistic (`exact_tau` in `vfates.theory.forecasts`) scores every held-out output, not a sample. With $s = \phi g_V$, each held-out prompt contributes the $\pi_0$-weighted oracle accuracy of the outputs that attain the maximum of $s$ (ties within the same relative tolerance as `tau_hard`, $10^{-9}$). That is the oracle accuracy of the output whose log-probability grows fastest.
 
-P0.6 compares this number with trained held-out accuracy on 4 worlds $\times$ 7 arms (28 cells), each cell a mean of 3 sampled-GRPO seeds. In the committed report, Spearman correlation with held-out accuracy is $0.8600$ (gate $0.8$), against $0.6353$ for step-0 $J$ and $0.5526$ for step-0 mean precision (`report.json`, key `tables.rank`). The fraction of cells with $|\tau - \text{observed}| \le 0.10$ is $0.9643$ (27/28; gate $0.90$). The cell outside the band is `rf05` / `fnC`: exact $\tau = 0.3642$, observed held-out accuracy $0.1903$.
+P0.6 compares this number with trained held-out accuracy on 4 worlds $\times$ 7 arms (28 cells), each cell a mean of 3 sampled-GRPO seeds. That is the same grid used to choose $q = 1/32$. Most cells lie near 0 or near 1, so the Spearman below is not an untouched test of $q$. The knife-edge world (transfer precision about 0.73, terminal held-out accuracy about 0.023) is outside the grid. In the committed report, Spearman correlation of exact $\tau$ with held-out accuracy is $0.8600$ (gate $0.8$), against $0.6353$ for step-0 $J$ and $0.5526$ for step-0 mean precision (`report.json`, key `tables.rank`). The fraction of cells with $|\tau - \text{observed}| \le 0.10$ is $0.9643$ (27/28; gate $0.90$). The cell outside the band is `rf05` / `fnC`: exact $\tau = 0.3642$, observed held-out accuracy $0.1903$.
 
 ### Soft tilt and the hard limit
 
@@ -203,7 +203,11 @@ where coverage is the fraction of held-out prompts with at least one correct sam
 
 The primary finite-sample statistic is `tau_pool(q)` (`PRIMARY_Q = 1/32` in `vfates.forecast.transfer`). Prompt-centre the velocities, pool them across held-out prompts, and take the oracle accuracy of the top fraction $q$. The tail has $k = \max(1, \mathrm{round}(q N))$ samples. Samples tied with the $k$-th value share the remaining slots equally, so the value does not depend on row order (`test_tau_pool_splits_boundary_ties_evenly`).
 
-Pooling is the reason to prefer this over a per-prompt argmax. A behaviour carried by a shared feature is favoured on every prompt, including prompts whose $n$ samples happened to miss it. The global tail can still be filled by the prompts that did sample it. $q = 1/32$ was fixed on these toy worlds before any language-model run; the other fractions in `DEFAULT_QS` are sensitivity checks, stored as `tau_pool_curve`.
+Pooling is the reason to prefer this over a per-prompt argmax. A behaviour carried by a shared feature is favoured on every prompt, including prompts whose $n$ samples happened to miss it. The global tail can still be filled by the prompts that did sample it. $q = 1/32$ was fixed on these toy worlds before any language-model run; the other fractions in `DEFAULT_QS` are sensitivity checks, stored as `tau_pool_curve`. The 0.86 Spearman (0.8617 for `tau_pool`, against 0.6353 for step-0 $J$) is on this 28-cell grid. Most cells lie near 0 or near 1, so it is not an untouched test of $q$.
+
+**Length normalisation.** `length_division(normalize, loss_agg)` is true only for sum features under a sequence-mean loss. The train rows that form $g$ are then divided by completion length, because the trainer's step is $\mathbb{E}[A \cdot \phi_{\mathrm{sum}} / L]$. Held-out velocities stay undivided: $s = \langle \phi_{\mathrm{sum}}, g \rangle$ is the change in sequence log-probability. Token-mean features with `seq_mean`, and sum features with `token_mean` or `dr_constant`, are not divided. Token-mean features with `token_mean` or `dr_constant` are refused.
+
+**Group-std secondary.** The primary direction is the prompt-centred covariance, prompts weighted equally. `tau_pool_std` is the same pooled tail along the group-std-weighted direction: each prompt's centred verdicts are divided by that prompt's unbiased verdict standard deviation, and a zero-variance prompt (including `np.isclose` to 0) maps to advantage 0, matching `grpo_core.group_advantages`. Within one prompt the scale does not change the ranking. Across prompts the scales differ, so the averaged direction can move. `tau_pool_std` is stored. It is not the pre-registered statistic.
 
 **Prompt-mean centring.** The pooled tail uses velocities with the per-prompt mean removed (`prompt_centered`). A raw velocity contains an additive prompt-level offset. Across prompts those offsets dominate the ranking, and the global top fraction selects whole prompts rather than the favoured behaviour inside each prompt. `test_tau_pool_takes_the_pooled_prompt_centred_tail` shifts one prompt's scores by $+100$. After centring, the top eighth is the within-prompt outlier, whose label is 0. Without centring that tail would be taken from the shifted prompt.
 
@@ -238,7 +242,7 @@ $$
 
 The false-positive rate cancels. The identity holds for any $(\rho_0, \rho_1)$ with the stated $J$, not only for symmetric noise. The factor $1 - 1/G$ is the effect of including the sample in the mean it is centred by.
 
-Dividing by the group's standard deviation, when that standard deviation is positive, multiplies every advantage in the group by the same positive constant (the implementations add $10^{-8}$ in the identity check and $10^{-4}$ in `vfates.train.grpo_core`, and they set the advantage to 0 when the standard deviation is 0). A positive scale does not change the sign of a nonzero advantage. A zero-variance group already has centred advantage 0. P0.3c draws groups at $G \in \{4,8,16\}$, $p \in \{0.2, 0.5\}$, $J \in \{0.4, 0.9\}$, with symmetric rates $\mathrm{FPR} = \mathrm{FNR} = (1-J)/2$, and compares the mean-centred advantage with the identity using a prompt-free cluster standard error. The maximum $\lvert z \rvert$ in the committed report is $1.5915$ (gate $4$), and the fraction of nonzero advantages whose sign flips under standard-deviation scaling is $0$.
+Dividing by the group's standard deviation, when that standard deviation is positive, multiplies every advantage in the group by the same positive constant. The identity check adds $10^{-8}$ and zeroes a standard deviation that is exactly 0. `grpo_core.group_advantages` adds $10^{-4}$ and zeroes a standard deviation that `np.isclose` calls 0. A positive scale does not change the sign of a nonzero advantage inside that group. A zero-variance group already has centred advantage 0. Across prompts the scales differ, so the averaged direction can move. The screen's primary direction stays the covariance. `tau_pool_std` stores the group-std-weighted direction and is not tested as the primary statistic. P0.3c draws groups at $G \in \{4,8,16\}$, $p \in \{0.2, 0.5\}$, $J \in \{0.4, 0.9\}$, with symmetric rates $\mathrm{FPR} = \mathrm{FNR} = (1-J)/2$, and compares the mean-centred advantage with the identity using a prompt-free cluster standard error. The maximum $\lvert z \rvert$ in the committed report is $1.5915$ (gate $4$), and the fraction of nonzero advantages whose sign flips under standard-deviation scaling is $0$.
 
 `grpo_core.group_advantages` is the trainer reference: unbiased standard deviation matches TRL's `scale_rewards="group"`, and `mode="mean"` is Dr.GRPO (centre only). The sign statement does not depend on which of these positive scales is used. The conditional-expectation identity above is for the mean-centred advantage, before that scale.
 
@@ -262,7 +266,7 @@ hence $\partial L / \partial A = 0$. The first optimiser step moves only $B$.
 
 The gradient of a full linear map $Y = Wx$ is $(\partial L / \partial Y) x^{\top}$. The $B$ gradient is that expression with $x$ replaced by $Ax$. $A$ is a fixed random projection of the layer input, so $\partial L / \partial B$ is a random projection of the full weight gradient. Sketching $B$, and not $A$, is the step-0 feature of the parameters GRPO trains. `lora_grad_features` raises if the maximum absolute $A$ gradient on the first sample exceeds $10^{-5}$ in float32 ($10^{-2}$ in reduced precision).
 
-`normalize="sum"` differentiates the sum of completion-token log-probabilities. `normalize="token_mean"` differentiates their mean, which is the sum-gradient divided by the completion length. `velocity_direction(..., lengths=)` divides features by length again. Pass `lengths` only for the sum features.
+`normalize="sum"` differentiates the sum of completion-token log-probabilities. `normalize="token_mean"` differentiates their mean, which is the sum-gradient divided by the completion length. When the loss is `seq_mean` and the features are `sum`, `length_division` is true and the train rows that form $g$ are divided by completion length. Held-out velocities stay undivided, so $s$ is the change in sequence log-probability. Do not pass lengths for token-mean features: that divides twice.
 
 ### CountSketch
 
@@ -290,7 +294,7 @@ $$
 
 ## The knife-edge (P0.8)
 
-$\tau$ uses $g_V$ at $\pi_0$. It does not describe a later $g$ evaluated at a policy that has already moved. `knife_edge_world` is a four-atom counterexample, identical base masses on every prompt:
+The screen is a first-order statistic. $\tau$ uses $g_V$ at $\pi_0$. It does not describe a later $g$ evaluated at a policy that has already moved. This world is outside the 28-cell grid used to choose $q = 1/32$. On the committed seeds, transfer precision is about 0.73 and mean terminal held-out accuracy is about 0.023 (the committed value is 0.0226). `knife_edge_world` is a four-atom counterexample, identical base masses on every prompt:
 
 | Atom | Oracle | Verifier | Feature | Mass |
 | --- | --- | --- | --- | --- |
@@ -311,7 +315,10 @@ Along the shared flow the skill coordinate also raises the logit of $I$, which i
 | --- | --- | --- |
 | Tilt leaves $\pi(\cdot \mid V=v, x)$ unchanged | `identities.check_tilt_invariance` | P0.1 |
 | $t \to +\infty$ accuracy is mean precision | `forecasts.mean_precision`, `dynamics.tilt` | P0.4b |
-| $\beta = 0$ tabular limit is modal precision | `forecasts.modal_precision` | P0.4a; `test_beta_equilibrium_is_the_tilt_and_beta0_is_the_mode` |
+| $\beta = 0$ tabular limit is modal precision; ties use $\pi_0$ weights | `forecasts.modal_precision` | P0.4a; `test_modal_precision_averages_tied_argmax_with_pi0` |
+| Sum features under `seq_mean`: divide train rows by length; held-out velocities stay undivided | `transfer.length_division`, `velocity_direction` | `test_length_division_flips_the_pooled_tail` |
+| Group-std direction is the stored secondary `tau_pool_std` | `transfer.group_std_advantages` | `test_std_weighted_direction_can_disagree_with_the_covariance` |
+| Prompt with no rejection contributes base accuracy to `for_prompt_mean` | `confusion.confusion` | `test_for_prompt_mean_substitutes_base_accuracy` |
 | $\beta > 0$ equilibrium is $\pi_0 \exp(V/\beta)$ | `population_flow(..., beta=)` | P0.4c |
 | $g_V = g_O - g_{\mathrm{FN}} + g_{\mathrm{FP}}$ | `identities.check_decomposition` | P0.2 |
 | $\mathbb{E}[g_V] = J g_O$ under resampled noise | `identities.check_j_scaling` | P0.3a, P0.3b |

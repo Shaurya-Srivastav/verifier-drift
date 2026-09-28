@@ -11,11 +11,28 @@ TRL's eval sampler repeats each held-out prompt ``num_generations`` times, so
 means go to ``trl_eval.jsonl``. The endpoint (``eval.jsonl``,
 ``eval_prompts.jsonl``) comes from :mod:`vfates.train.checkpoint_eval`, run on
 the saved adapters after training.
+
+LoRA A is drawn from ``config.lora_seed`` (or loaded from ``config.lora_init``)
+before ``GRPOTrainer`` is constructed. TRL 0.25.1 calls ``set_seed`` only inside
+``Trainer.__init__``, which is after ``get_peft_model``, so passing ``peft_config``
+would draw A from whatever the process RNG happened to be. A ``PeftModel`` passed
+with ``peft_config=None`` is accepted: ``prepare_peft_model`` re-wraps only when
+``peft_config`` is not ``None`` (``trl/models/utils.py`` in 0.25.1).
+
+vLLM training rollouts are not seeded. TRL 0.25.1 colocate generation builds one
+``SamplingParams`` for the batch (``grpo_trainer.py`` ``_generate_single_turn``)
+with ``n=1`` and no ``seed``. The batch is each prompt repeated ``group_size``
+times. One shared seed can make those duplicates identical and the advantage
+zero, and this TRL version does not expose a per-request seed. ``run_metadata.json``
+records ``rollout_seeded: false`` on that path. Do not add a seed to
+``generation_kwargs``.
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
+import time
 import warnings
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -23,13 +40,16 @@ from typing import Any
 
 from vfates.gen.base import chat_messages
 from vfates.tasks.base import Task
-from vfates.train.config import GRPOConfig
+from vfates.train.config import GRPOConfig, NonFiniteLossError
 from vfates.train.grpo_core import TRL_LOSS_TYPE, TRL_SCALE_REWARDS
 from vfates.train.rewards import RewardContext, make_trl_reward_funcs, reward_weights_for
 from vfates.types import Problem
 from vfates.utils.env import environment_report
 from vfates.utils.io import append_jsonl, write_json
 from vfates.verifiers.base import Verifier
+
+RUN_METADATA_NAME = "run_metadata.json"
+_PEFT_PREFIX = "base_model.model."
 
 _REWARD_HEADS = ("verifier", "oracle", "false_positive", "false_negative")
 
@@ -104,6 +124,26 @@ def trl_grpo_kwargs(
         "dataloader_num_workers": 0,
         "dataloader_pin_memory": False,
         "disable_tqdm": True,
+        # A non-finite loss must reach the guard below, not be replaced by the
+        # average of earlier losses.
+        "logging_nan_inf_filter": False,
+    }
+
+
+def trl_run_metadata(config: GRPOConfig, *, use_vllm: bool) -> dict[str, Any]:
+    """Run facts that are not optimizer hyperparameters.
+
+    ``rollout_seeded`` is false when training samples with colocated vLLM: TRL
+    0.25.1 does not pass a per-request seed, and a single seed on the repeated
+    prompt group can collapse it. The Hugging Face generate path follows the
+    torch RNG seeded by :func:`transformers.set_seed` and TRL's later
+    ``set_seed(args.seed, device_specific=True)``.
+    """
+    return {
+        "lora_seed": int(config.lora_seed),
+        "lora_init": config.lora_init,
+        "lora_init_sha256": config.lora_init_sha256,
+        "rollout_seeded": not bool(use_vllm),
     }
 
 
@@ -137,13 +177,20 @@ def metric_row_from_trl_logs(
     *,
     step: int,
     monitor_names: Sequence[str],
+    wall_s: float | None = None,
 ) -> dict[str, Any]:
     """One ``metrics.jsonl`` row from a TRL ``on_log`` payload.
 
-    ``tokens_generated`` is TRL's cumulative prompt+completion token counter
-    (``num_tokens``), not the step's completion count. ``gen_seconds`` and
-    ``train_seconds`` are not split in TRL's logs. ``monitors_wrong`` cannot be
-    recovered from marginal means, so it is ``None``.
+    ``wall_s`` is not in the TRL payload. The callback passes the optimizer-step
+    wall clock: ``time.perf_counter`` from ``on_step_begin`` to this training
+    log. That span is generation, reward, backward, and the optimizer step.
+    Evaluation is excluded, because Transformers logs the step and only then
+    calls ``evaluate``. ``tokens_generated`` (the step's completion tokens in
+    the MLX schema) is ``None``: TRL logs only a cumulative prompt+completion
+    counter, kept as ``num_tokens_cumulative`` so no consumer sums it as a
+    per-step count. ``gen_seconds`` and ``train_seconds`` are not split in
+    TRL's logs.
+    ``monitors_wrong`` cannot be recovered from marginal means, so it is ``None``.
     """
     heads = list(_REWARD_HEADS) + [f"monitor_{name}" for name in monitor_names]
     means = {name: _optional_float(logs.get(f"rewards/{name}/mean")) for name in heads}
@@ -152,8 +199,9 @@ def metric_row_from_trl_logs(
     zero = _optional_float(logs.get("frac_reward_zero_std"))
     return {
         "step": int(step),
-        "wall_s": None,
-        "tokens_generated": _optional_int(logs.get("num_tokens")),
+        "wall_s": wall_s,
+        "tokens_generated": None,
+        "num_tokens_cumulative": _optional_int(logs.get("num_tokens")),
         "gen_seconds": None,
         "train_seconds": None,
         "reward_V_mean": rates["accept_rate"],
@@ -178,8 +226,12 @@ def eval_row_from_trl_logs(
     step: int,
     monitor_names: Sequence[str],
     split: str = "heldout",
+    eval_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """One ``eval.jsonl`` row. TRL eval is the held-out set."""
+    """One ``trl_eval.jsonl`` row. TRL eval is the held-out set.
+
+    ``eval_seconds`` is that eval call's wall time. It is not part of ``wall_s``.
+    """
     row = metric_row_from_trl_logs(logs, step=step, monitor_names=monitor_names)
     return {
         "step": int(step),
@@ -195,40 +247,257 @@ def eval_row_from_trl_logs(
         "monitors_wrong": None,
         "mean_length": row["mean_completion_length"],
         "truncation_rate": row["truncation_rate"],
+        "eval_seconds": eval_seconds,
     }
 
 
 class VfatesLogCallback:
-    """Appends the shared JSONL schema. Subclasses ``TrainerCallback`` once TRL is imported."""
+    """Appends the shared JSONL schema. Subclasses ``TrainerCallback`` once TRL is imported.
+
+    ``wall_s`` matches ``MLXGRPOTrainer._train_step``: one optimizer step,
+    including generation, reward, backward, and the update, excluding eval.
+    MLX logs the row and only then calls ``_evaluate`` (``mlx_grpo.py``).
+
+    Transformers 4.57.1 calls ``on_step_begin`` once per optimizer step, when
+    ``step % gradient_accumulation_steps == 0``, and calls ``on_log`` from
+    ``_maybe_log_save_evaluate`` before ``evaluate``. TRL 0.25.1 generates in
+    ``GRPOTrainer._prepare_inputs`` during ``training_step``, which is after
+    ``on_step_begin``. ``steps_per_generation`` defaults to
+    ``gradient_accumulation_steps`` and ``num_iterations`` defaults to 1, so
+    that generation sits inside this step's clock.
+
+    The start stamp is taken in ``on_step_begin`` and is not loaded from the
+    checkpoint. A training log with no ``on_step_begin`` in this process keeps
+    ``wall_s`` null, so resume does not invent a first duration. Eval time is
+    ``eval_seconds`` on ``trl_eval.jsonl``. ``logging_steps`` is 1, so each
+    training log is one optimizer step; a later ``on_step_begin`` replaces an
+    unlogged stamp instead of stretching it across steps.
+    """
 
     def __init__(self, out_dir: str, monitor_names: Sequence[str]) -> None:
         self.out_dir = Path(out_dir)
         self.monitor_names = list(monitor_names)
+        self._step_t0: float | None = None
+        self._eval_t0: float | None = None
+
+    def on_train_begin(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+        del state, control, kwargs
+        # A new ``train()`` (including resume) must not keep a stamp from an
+        # earlier process. ``perf_counter`` is not a checkpoint field.
+        self._step_t0 = None
+        self._eval_t0 = None
+        if getattr(args, "eval_on_start", False):
+            self._eval_t0 = time.perf_counter()
+
+    def on_step_begin(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+        del args, state, control, kwargs
+        self._step_t0 = time.perf_counter()
+
+    def _consume(self, started: float | None) -> float | None:
+        if started is None:
+            return None
+        return time.perf_counter() - started
 
     def on_log(
         self, args: Any, state: Any, control: Any, logs: dict[str, Any] | None = None, **kwargs: Any
     ) -> None:
-        del args, control, kwargs
+        del args, kwargs
         if not logs:
             return
         flat = {str(key): _plain(value) for key, value in logs.items()}
         step = int(getattr(state, "global_step", 0) or 0)
         if any(key.startswith("eval_rewards/") for key in flat):
+            elapsed = self._consume(self._eval_t0)
+            self._eval_t0 = None
             stripped = {
                 key[len("eval_") :] if key.startswith("eval_") else key: value
                 for key, value in flat.items()
             }
             append_jsonl(
                 self.out_dir / "trl_eval.jsonl",
-                eval_row_from_trl_logs(stripped, step=step, monitor_names=self.monitor_names),
+                eval_row_from_trl_logs(
+                    stripped,
+                    step=step,
+                    monitor_names=self.monitor_names,
+                    eval_seconds=elapsed,
+                ),
             )
             return
         if "rewards/verifier/mean" not in flat:
             return
+        elapsed = self._consume(self._step_t0)
+        self._step_t0 = None
         append_jsonl(
             self.out_dir / "metrics.jsonl",
-            metric_row_from_trl_logs(flat, step=step, monitor_names=self.monitor_names),
+            metric_row_from_trl_logs(
+                flat, step=step, monitor_names=self.monitor_names, wall_s=elapsed
+            ),
         )
+        # Eval runs after this log. Start its clock only once the step clock is closed.
+        if getattr(control, "should_evaluate", False):
+            self._eval_t0 = time.perf_counter()
+
+
+def _adapter_key(parameter_name: str, marker: str) -> str | None:
+    if marker not in parameter_name or not parameter_name.endswith("weight"):
+        return None
+    head = parameter_name.split(marker, 1)[0]
+    if head.startswith(_PEFT_PREFIX):
+        head = head[len(_PEFT_PREFIX) :]
+    return head
+
+
+def peft_lora_matrices(model: Any) -> dict[str, tuple[Any, Any]]:
+    """Map a base-module path to ``(lora_A weight, lora_B weight)``.
+
+    Keys match the LoRA init file: ``model.layers.0.self_attn.q_proj``, the
+    path of the wrapped ``nn.Linear`` on the base causal LM. PEFT stores that
+    under ``base_model.model.<path>.lora_A.default.weight``.
+    """
+    a_weights: dict[str, Any] = {}
+    b_weights: dict[str, Any] = {}
+    for name, param in model.named_parameters():
+        a_key = _adapter_key(name, ".lora_A.")
+        b_key = _adapter_key(name, ".lora_B.")
+        if a_key is not None:
+            if a_key in a_weights:
+                raise RuntimeError(f"duplicate lora_A parameter for {a_key}")
+            a_weights[a_key] = param
+        if b_key is not None:
+            if b_key in b_weights:
+                raise RuntimeError(f"duplicate lora_B parameter for {b_key}")
+            b_weights[b_key] = param
+    if set(a_weights) != set(b_weights):
+        raise RuntimeError(
+            "lora_A and lora_B cover different modules: "
+            f"only A {sorted(set(a_weights) - set(b_weights))[:3]}, "
+            f"only B {sorted(set(b_weights) - set(a_weights))[:3]}"
+        )
+    if not a_weights:
+        raise RuntimeError("LoRA wrapping produced no lora_A parameters")
+    return {key: (a_weights[key], b_weights[key]) for key in a_weights}
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _load_lora_init_file(path: str, expected_sha256: str | None) -> tuple[dict[str, Any], str]:
+    from vfates.features.lora_init import load_lora_init
+
+    tensors, _meta = load_lora_init(path, expected_sha256=expected_sha256)
+    digest = expected_sha256 if expected_sha256 is not None else _file_sha256(Path(path))
+    return tensors, digest
+
+
+def _apply_peft_lora_init(model: Any, config: GRPOConfig) -> str:
+    """Overwrite every ``lora_A`` from ``config.lora_init``. B stays zero."""
+    import numpy as np
+    import torch
+
+    if config.lora_init is None:
+        raise ValueError("lora_init path is required")
+    tensors, digest = _load_lora_init_file(config.lora_init, config.lora_init_sha256)
+    pairs = peft_lora_matrices(model)
+    got = set(tensors)
+    want = set(pairs)
+    if got != want:
+        missing = sorted(want - got)
+        extra = sorted(got - want)
+        raise ValueError(
+            "lora init keys must equal the wrapped modules: "
+            f"missing {missing[:4]}, extra {extra[:4]}, "
+            f"{len(want)} wrapped, {len(got)} in the file"
+        )
+    pending: list[tuple[Any, Any]] = []
+    for key, (a_weight, b_weight) in pairs.items():
+        array = np.asarray(tensors[key])
+        if array.dtype != np.float32:
+            raise ValueError(f"{key} must be float32, got {array.dtype}")
+        if tuple(array.shape) != tuple(a_weight.shape):
+            raise ValueError(
+                f"{key} has shape {tuple(array.shape)}, lora_A weight is {tuple(a_weight.shape)}"
+            )
+        if not torch.equal(b_weight, torch.zeros_like(b_weight)):
+            raise RuntimeError(f"lora_B for {key} is not zero; refusing to load A on top of it")
+        pending.append((a_weight, array))
+    with torch.no_grad():
+        for a_weight, array in pending:
+            a_weight.copy_(torch.as_tensor(array, dtype=a_weight.dtype, device=a_weight.device))
+    return digest
+
+
+def _seed_torch(seed: int) -> None:
+    import torch
+
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+
+def _load_causal_lm(config: GRPOConfig, model: Any) -> Any:
+    if model is not None and not isinstance(model, str):
+        return model
+    from transformers import AutoModelForCausalLM
+
+    model_id = config.model_id if model is None else str(model)
+    return AutoModelForCausalLM.from_pretrained(model_id)
+
+
+def _wrap_peft(config: GRPOConfig, model: Any) -> Any:
+    """Build a ``PeftModel`` seeded by ``lora_seed``, optionally overwrite A."""
+    from peft import PeftModel, get_peft_model
+    from transformers import set_seed
+
+    # Run seed first, then the adapter seed immediately before the draw.
+    set_seed(int(config.seed))
+    wrapped: Any
+    if isinstance(model, PeftModel):
+        wrapped = model
+    else:
+        _seed_torch(int(config.lora_seed))
+        wrapped = get_peft_model(model, _peft_config(config, model))
+    if config.lora_init is not None:
+        digest = _apply_peft_lora_init(wrapped, config)
+        config.lora_init_sha256 = digest
+    return wrapped
+
+
+def _install_nonfinite_guard(trainer: Any, run_dir: str) -> None:
+    """Raise before the optimizer step when the loss or a gradient is non-finite."""
+    import torch
+    from transformers import TrainerCallback
+
+    trainer._vfates_loss_fn = trainer.compute_loss
+
+    def compute_loss(model: Any, inputs: Any, *args: Any, **kwargs: Any) -> Any:
+        loss = trainer._vfates_loss_fn(model, inputs, *args, **kwargs)
+        if torch.is_tensor(loss):
+            finite = bool(torch.isfinite(loss.detach()).all())
+        else:
+            finite = math.isfinite(float(loss))
+        if not finite:
+            raise NonFiniteLossError(int(trainer.state.global_step) + 1, run_dir, what="loss")
+        return loss
+
+    trainer.compute_loss = compute_loss
+
+    class _GradCallback(TrainerCallback):
+        def on_pre_optimizer_step(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            del args, control
+            watched = kwargs.get("model")
+            if watched is None:
+                return
+            for param in watched.parameters():
+                grad = getattr(param, "grad", None)
+                if grad is None:
+                    continue
+                if not bool(torch.isfinite(grad).all()):
+                    raise NonFiniteLossError(
+                        int(state.global_step) + 1, run_dir, what="gradient norm"
+                    )
+
+    trainer.add_callback(_GradCallback())
 
 
 def build_trl_trainer(
@@ -271,8 +540,8 @@ def build_trl_trainer(
     funcs = make_trl_reward_funcs(ctx)
     out = Path(config.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    write_json(out / "config.json", config.to_dict())
-    write_json(out / "environment_report.json", environment_report())
+    base = _load_causal_lm(config, model)
+    wrapped = _wrap_peft(config, base)
 
     cuda = bool(torch.cuda.is_available())
     kwargs = trl_grpo_kwargs(
@@ -284,6 +553,12 @@ def build_trl_trainer(
     )
     if extra_trl_args:
         kwargs.update(extra_trl_args)
+    write_json(out / "config.json", config.to_dict())
+    write_json(out / "environment_report.json", environment_report())
+    write_json(
+        out / RUN_METADATA_NAME,
+        trl_run_metadata(config, use_vllm=bool(kwargs["use_vllm"])),
+    )
     args = TrlGRPOConfig(**kwargs)
 
     heldout = heldout_problems[: config.eval_heldout_n]
@@ -304,6 +579,12 @@ def build_trl_trainer(
             super().__init__()
             self._inner = VfatesLogCallback(out_dir, names)
 
+        def on_train_begin(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            self._inner.on_train_begin(args, state, control, **kwargs)
+
+        def on_step_begin(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            self._inner.on_step_begin(args, state, control, **kwargs)
+
         def on_log(
             self,
             args: Any,
@@ -315,15 +596,16 @@ def build_trl_trainer(
             self._inner.on_log(args, state, control, logs=logs, **kwargs)
 
     trainer = GRPOTrainer(
-        model=config.model_id if model is None else model,
-        reward_funcs=funcs,  # type: ignore[arg-type]  # trl stub
+        model=wrapped,
+        reward_funcs=funcs,
         args=args,
         train_dataset=_dataset(task, train_problems),
         eval_dataset=eval_ds,
         processing_class=processing_class,
-        peft_config=_peft_config(config, model),
+        peft_config=None,
         callbacks=[_Callback(config.out_dir, sorted(monitors))],
     )
+    _install_nonfinite_guard(trainer, config.out_dir)
     return trainer
 
 
@@ -332,10 +614,11 @@ def _peft_config(config: GRPOConfig, model: Any) -> Any:
 
     return LoraConfig(
         r=int(config.lora.rank),
-        lora_alpha=float(config.lora.alpha),  # type: ignore[arg-type]  # peft stub
+        lora_alpha=float(config.lora.alpha),
         lora_dropout=float(config.lora.dropout),
         bias="none",
         task_type=TaskType.CAUSAL_LM,
+        init_lora_weights=True,
         target_modules=config.lora.peft_keys(),
         layers_to_transform=_lora_layer_ids(config, model),
     )

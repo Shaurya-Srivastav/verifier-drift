@@ -29,7 +29,7 @@ def test_group_advantages_match_trl_unbiased_std() -> None:
     np.testing.assert_allclose(advantages[1], 0.0)
     assert informative.tolist() == [True, False]
     # torch.std(unbiased=True) on the same rows.
-    import torch
+    torch = pytest.importorskip("torch")
 
     torch_std = torch.tensor(rewards).std(dim=1, unbiased=True)
     np.testing.assert_allclose(std, float(torch_std[0]), atol=1e-12)
@@ -130,7 +130,8 @@ def test_config_validation_and_yaml(tmp_path: Path) -> None:
     assert pilot.steps == 200
     assert pilot.prompts_per_step == 16
     assert pilot.group_size == 8
-    assert pilot.max_tokens == 384
+    assert pilot.max_tokens == 512
+    assert pilot.eval_max_tokens == 512
     assert pilot.lr == pytest.approx(2e-5)
     assert pilot.eval_every == 25
     assert pilot.eval_heldout_n == 256
@@ -144,12 +145,33 @@ def test_config_validation_and_yaml(tmp_path: Path) -> None:
     assert study.steps == 300
     assert study.prompts_per_step == 64
     assert study.group_size == 8
-    assert study.max_tokens == 512
+    assert study.max_tokens == 1024
+    assert study.eval_max_tokens == 1024
+    assert study.lr == pytest.approx(2e-5)
+    assert study.warmup_steps == 10
+    assert study.micro_batch_size == 32
+    assert study.eval_heldout_n == 384
+    assert study.eval_train_n == 128
+    assert study.save_every == 25
+    assert study.eval_every == 25
     assert study.use_vllm is True
     assert study.vllm_mode == "colocate"
     assert study.vllm_importance_sampling_correction is False
-    assert study.eval_samples_per_prompt == 8
+    assert study.eval_samples_per_prompt == 4
+    assert study.lora_seed == 0
     assert study.completions_per_step % study.micro_batch_size == 0
+    with pytest.raises(ValueError, match="lora_seed"):
+        GRPOConfig.from_dict({**good, "lora_seed": True})
+    with pytest.raises(ValueError, match="lora_init_sha256 requires"):
+        GRPOConfig.from_dict({**good, "lora_init_sha256": "ab" * 32})
+    with pytest.raises(ValueError, match="64-character"):
+        GRPOConfig.from_dict({**good, "lora_init": "a.safetensors", "lora_init_sha256": "abcd"})
+    loaded = GRPOConfig.from_dict(
+        {**good, "lora_init": " a.safetensors ", "lora_init_sha256": "AB" * 32, "lora_seed": 3}
+    )
+    assert loaded.lora_init == "a.safetensors"
+    assert loaded.lora_init_sha256 == "ab" * 32
+    assert loaded.to_dict()["lora_seed"] == 3
 
 
 class _YesTask(Task):
@@ -237,4 +259,22 @@ def test_evaluate_policy_prompt_average() -> None:
     assert stats["mean_length"] == pytest.approx(2.0)
     assert stats["truncation_rate"] == pytest.approx(0.5)
     assert stats["monitors"]["yes_word"] == pytest.approx(0.5)
+    assert stats["n_samples"] == 2
+    # O=1 samples are both "yes"; O=0 samples are both "no".
+    assert stats["monitors_correct"]["yes_word"] == pytest.approx(1.0)
+    assert stats["monitors_wrong"]["yes_word"] == pytest.approx(0.0)
     assert len(stats["records"]) == 4
+    no_verifier = evaluate_policy(
+        _Scripted(),
+        task,
+        problems,
+        n_samples=2,
+        max_tokens=4,
+        temperature=1.0,
+        seed=0,
+        monitors={"yes_word": lambda problem, parsed, text: "yes" in text},
+    )
+    assert no_verifier["accept_rate"] is None
+    assert no_verifier["monitors_correct"]["yes_word"] == pytest.approx(1.0)
+    assert no_verifier["monitors_wrong"]["yes_word"] == pytest.approx(0.0)
+    assert no_verifier["n_samples"] == 2

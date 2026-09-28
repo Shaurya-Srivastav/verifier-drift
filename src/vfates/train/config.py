@@ -7,6 +7,7 @@ knobs (``use_vllm``, micro-batch, checkpointing).
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,28 @@ _ADV = ("std", "mean")
 _AGG = ("seq_mean", "token_mean", "dr_constant")
 _REGIME = ("multi_epoch", "streaming")
 _VLLM_MODE = ("colocate", "server")
+
+
+class NonFiniteLossError(RuntimeError):
+    """A step produced a non-finite loss or gradient norm.
+
+    Raised before any metric row or checkpoint for that step is written.
+    ``step`` is the 1-indexed optimizer step that did not complete.
+    ``run_dir`` is the run directory. Callers resume from the last checkpoint.
+    """
+
+    def __init__(self, step: int, run_dir: str, *, what: str = "loss or gradient norm") -> None:
+        self.step = int(step)
+        self.run_dir = str(run_dir)
+        super().__init__(f"non-finite {what} at step {self.step} in {self.run_dir}")
+
+
+def raise_if_nonfinite(loss: float, grad_norm: float, *, step: int, run_dir: str) -> None:
+    """Raise :class:`NonFiniteLossError` when ``loss`` or ``grad_norm`` is not finite."""
+    if not math.isfinite(float(loss)):
+        raise NonFiniteLossError(step, run_dir, what="loss")
+    if not math.isfinite(float(grad_norm)):
+        raise NonFiniteLossError(step, run_dir, what="gradient norm")
 
 
 def resolve_lora_keys(keys: list[str] | tuple[str, ...], mapping: dict[str, str]) -> list[str]:
@@ -105,6 +128,12 @@ class GRPOConfig:
     prompts_per_step: int
     out_dir: str
     seed: int
+    # Adapter draw, shared by the audit and every training seed. The run seed
+    # does not draw LoRA A. ``lora_init`` is a safetensors file of A matrices
+    # (contract C-2); ``lora_init_sha256`` is checked when it is set.
+    lora_seed: int = 0
+    lora_init: str | None = None
+    lora_init_sha256: str | None = None
     eval_every: int
     eval_heldout_n: int
     eval_train_n: int
@@ -227,6 +256,23 @@ class GRPOConfig:
             raise ValueError("lora.keys must list at least one projection")
         if not isinstance(self.notes, str):
             raise ValueError("notes must be a string")
+        _nonneg_int("lora_seed", self.lora_seed)
+        if self.lora_init is not None:
+            if not isinstance(self.lora_init, str) or not self.lora_init.strip():
+                raise ValueError("lora_init must be a non-empty path or null")
+            self.lora_init = self.lora_init.strip()
+        if self.lora_init_sha256 is not None:
+            if self.lora_init is None:
+                raise ValueError("lora_init_sha256 requires lora_init")
+            if not isinstance(self.lora_init_sha256, str):
+                raise ValueError("lora_init_sha256 must be a hex digest or null")
+            digest = self.lora_init_sha256.strip().lower()
+            if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                raise ValueError(
+                    "lora_init_sha256 must be a 64-character sha256 hex digest, "
+                    f"got {self.lora_init_sha256!r}"
+                )
+            self.lora_init_sha256 = digest
 
     @property
     def completions_per_step(self) -> int:

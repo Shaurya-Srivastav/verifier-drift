@@ -1,15 +1,25 @@
-"""P4: micro-GRPO on the Mac. Do trained fates follow the locked step-0 forecasts?
+"""P4: exploratory micro-GRPO on the Mac.
 
-Trains every arm with LoRA GRPO (MLX) on the frozen pools of the P3 audit,
-evaluates held-out oracle accuracy through training, then scores the P3 lock:
+Trains every arm with LoRA GRPO (MLX) on the frozen pools of the P3 audit and
+scores the P3 lock. This pilot does not carry the E1 confirmatory rules.
 
-* learnability: the oracle arm improves held-out accuracy (the setup has signal);
-* same rate, different fates: at matched step-0 rates, the shared-error arm
-  ends below its resampled control on held-out prompts (paired by prompt);
-* prompt-specific errors stay local: the hash arm tracks the resampled control;
-* the screen ranks trained outcomes better than J or step-0 precision;
-* the shared behaviour is adopted under its own arm (monitor rate rises);
-* throughput, which sets the cost model for the H100 study.
+The go decision is P4.1, at least one P4.2, and every P4.3 screen:
+
+* P4.1: the oracle arm's held-out gain clears the threshold.
+* P4.2: a shared arm ends below its control by at least ``fate_gap``, with a
+  one-sided prompt-bootstrap p-value below alpha. One hit is enough.
+* P4.3: a screen, not an equivalence test. ``|diff| <= local_tol``. TOST at
+  this sample size has power about 0.14 (R4), so ``p_tost`` is reported and
+  does not decide the screen.
+* P4.4: within-pair rank statistics and overall Spearman. Documented.
+* P4.5: conditional monitor rates, averaged over seeds. Documented.
+  FP rules use ``monitors_wrong``; FN rules use ``monitors_correct``.
+
+The preregistered audit withdrawals
+(:func:`vfates.analysis.confirmatory.decide_audit_withdrawals`) are applied to
+the P3 calibration before any training and written to ``withdrawals.json``
+(P4.0). A withdrawn arm is not trained and its contrasts are listed as
+withdrawn; its resampled control still trains.
 
 Runs are resumable; rerunning the pilot only trains what is missing.
 """
@@ -22,8 +32,9 @@ from typing import Any
 
 import numpy as np
 
+from vfates.analysis.power import token_projection
 from vfates.pilots.common import Checks, markdown_table, write_report
-from vfates.utils.io import read_json, read_jsonl
+from vfates.utils.io import read_json, read_jsonl, write_json
 
 
 def _run_dir(out: Path, arm: str, seed: int) -> Path:
@@ -59,11 +70,7 @@ def _throughput(run_dirs: list[Path]) -> dict[str, float]:
 
 
 def _families(config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Contrast families: a resampled control with its shared and prompt-specific arms.
-
-    ``families`` entries are ``{control, kind: fp|fn, shared: [...], local: [...]}``;
-    the older ``control_arm`` / ``shared_arms`` / ``local_arms`` keys are one FP family.
-    """
+    """Contrast families: a resampled control, shared arms, and prompt-specific arms."""
     if "families" in config:
         return [
             {
@@ -86,35 +93,43 @@ def _families(config: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _behaviour_mass(o: dict[str, Any] | None, name: str, when: str) -> float:
-    """Share of held-out samples that are wrong and carry rule ``name``'s behaviour."""
-    if o is None:
-        return 0.0
-    wrong_rate = (o.get(f"monitors_wrong_{when}") or {}).get(name)
-    acc = o["heldout_final" if when == "final" else "heldout_step0"]
-    return 0.0 if wrong_rate is None or acc is None else float(wrong_rate) * (1.0 - acc)
+def _mean_rate(per_seed: list[dict[str, Any]], field: str, name: str) -> float | None:
+    """Mean of a conditional monitor rate over seeds. Missing seeds are skipped."""
+    vals = []
+    for outcome in per_seed:
+        raw = outcome.get(field) or {}
+        if name in raw and raw[name] is not None:
+            vals.append(float(raw[name]))
+    if not vals:
+        return None
+    return float(np.mean(vals))
 
 
-def _behaviour_rate(o: dict[str, Any] | None, name: str, when: str) -> float:
-    """Share of held-out samples that carry rule ``name``'s behaviour."""
-    if o is None:
-        return 0.0
-    rate = (o.get(f"monitors_{when}") or {}).get(name)
-    return 0.0 if rate is None else float(rate)
+def _conditional_field(kind: str) -> str:
+    """FP rules: P(monitor | O = 0). FN rules: P(monitor | O = 1)."""
+    if kind == "fp":
+        return "monitors_wrong"
+    if kind == "fn":
+        return "monitors_correct"
+    raise ValueError(f"family kind must be 'fp' or 'fn', got {kind!r}")
 
 
 def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     """P4 micro-GRPO pilot."""
+    from vfates.analysis.confirmatory import decide_audit_withdrawals
     from vfates.analysis.outcomes import (
-        holm,
-        paired_contrast,
+        difference_matrix,
+        forecast_row,
         paired_contrast_seeds,
+        permutation_spearman_p,
         rank_bootstrap,
+        require_final_step,
         run_outcome,
         score_forecasts,
     )
     from vfates.experiment import train_arm
     from vfates.forecast.lockbox import load_lock
+    from vfates.verifiers.calibrate import arm_validity
 
     started = time.perf_counter()
     out = Path(out_dir)
@@ -123,8 +138,20 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     train_cfg = dict(config["train"])
     steps = int(train_cfg["steps"])
     seeds = [int(s) for s in config.get("seeds", [0])]
-    arms = list(config["arms"])
+    planned = list(config["arms"])
     backend = str(config.get("backend", "mlx"))
+    rate_miss_max = float((config.get("withdrawal") or {}).get("rate_miss_max", 0.02))
+    withdrawals = decide_audit_withdrawals(
+        arm_validity(read_json(audit_dir / "calibration.json")), rate_miss_max=rate_miss_max
+    )
+    out.mkdir(parents=True, exist_ok=True)
+    write_json(out / "withdrawals.json", withdrawals)
+    audit_withdrawn: dict[str, list[str]] = {
+        arm: list(entry["reasons"]) for arm, entry in withdrawals["audit"].items() if arm in planned
+    }
+    arms = [arm for arm in planned if arm not in audit_withdrawn]
+    for arm, reasons in audit_withdrawn.items():
+        print(f"[P4] {arm} withdrawn at audit ({', '.join(reasons)}); not trained", flush=True)
     for seed in seeds:
         for arm in arms:
             run_dir = _run_dir(out, arm, seed)
@@ -144,9 +171,14 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                 eval_generator=config.get("eval_generator"),
             )
 
+    run_dirs = [_run_dir(out, arm, seed) for arm in arms for seed in seeds]
+    require_final_step(run_dirs, steps)
+
+    per_seed_outcomes: dict[str, list[dict[str, Any]]] = {}
     outcomes: dict[str, dict[str, Any]] = {}
     for arm in arms:
-        per_seed = [run_outcome(_run_dir(out, arm, s)) for s in seeds]
+        per_seed = [run_outcome(_run_dir(out, arm, s), final_step=steps) for s in seeds]
+        per_seed_outcomes[arm] = per_seed
         merged = dict(per_seed[0])
         for key in (
             "heldout_step0",
@@ -164,30 +196,50 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
 
     gates = config["gates"]
     checks = Checks()
+    alpha = float(gates.get("alpha", 0.05))
+    checks.add(
+        "P4.0",
+        "preregistered audit withdrawals applied before training (documented, not a gate)",
+        float(len(audit_withdrawn)),
+        True,
+        threshold=f"rate miss <= {rate_miss_max}; phrase fell_back or failed validation",
+        metric="; ".join(f"{arm}: {', '.join(r)}" for arm, r in audit_withdrawn.items())
+        or "none withdrawn",
+        documented=True,
+    )
     if "oracle" in outcomes:
         gain = outcomes["oracle"]["heldout_delta"]
         checks.add(
             "P4.1",
             "oracle reward improves held-out accuracy (the setup has signal)",
             gain,
-            gain >= float(gates["oracle_gain"]),
+            gain is not None and gain >= float(gates["oracle_gain"]),
             threshold=gates["oracle_gain"],
             metric="held-out final - step 0",
+        )
+    else:
+        checks.add(
+            "P4.1",
+            "oracle reward improves held-out accuracy (the setup has signal)",
+            None,
+            False,
+            threshold=gates["oracle_gain"],
+            metric="oracle arm missing",
         )
 
     contrasts: list[list[Any]] = []
     n_boot = int(config.get("n_boot", 2000))
-    alpha = float(gates.get("alpha", 0.05))
     tol = float(gates["local_tol"])
-    equivalence = bool(gates.get("local_equivalence", False))
+    fate_gap = float(gates["fate_gap"])
 
-    def contrast(a: str, b: str, *, level: float = alpha, margin: float | None = None) -> dict:
+    def contrast(a: str, b: str) -> dict[str, Any]:
         pairs = [(_run_dir(out, a, s), _run_dir(out, b, s)) for s in seeds]
-        res = paired_contrast_seeds(pairs, n_boot=n_boot, alpha=level, seed=0, margin=margin)
-        label = f"{a} - {b}" + (f" ({1 - level:.0%})" if level != alpha else "")
+        res = paired_contrast_seeds(
+            pairs, step=steps, n_boot=n_boot, alpha=alpha, seed=0, margin=tol
+        )
         contrasts.append(
             [
-                label,
+                f"{a} - {b}",
                 res["diff"],
                 res["lo"],
                 res["hi"],
@@ -199,48 +251,66 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         return res
 
     families = _families(config)
-    shared_res: dict[str, tuple[str, dict]] = {}
-    local_res: dict[str, tuple[str, dict]] = {}
+    shared_hits: list[bool] = []
+    local_hits: list[bool] = []
     for fam in families:
         control = fam["control"]
+        for arm in (a for a in [*fam["shared"], *fam["local"]] if a in audit_withdrawn):
+            check_id = "P4.2" if arm in fam["shared"] else "P4.3"
+            checks.add(
+                f"{check_id}.{arm}",
+                f"{control} - {arm}: withdrawn at audit, not trained",
+                None,
+                False,
+                metric=", ".join(audit_withdrawn[arm]),
+                documented=True,
+            )
         if control not in outcomes:
             continue
         for shared in (a for a in fam["shared"] if a in outcomes):
-            shared_res[shared] = (control, contrast(control, shared))
+            res = contrast(control, shared)
+            hit = res["diff"] >= fate_gap and res["p_le_0"] < alpha
+            shared_hits.append(hit)
+            checks.add(
+                f"P4.2.{shared}",
+                f"shared arm ends below its control: {control} - {shared}",
+                res["diff"],
+                hit,
+                threshold=f"point >= {fate_gap} and prompt-bootstrap p < {alpha}",
+                metric=f"p={res['p_le_0']:.4f}; {'hit' if hit else 'miss'}",
+                documented=True,
+            )
         for local in (a for a in fam["local"] if a in outcomes):
-            # TOST at level alpha: the (1 - 2 alpha) interval lies inside the margin.
-            level = 2 * alpha if equivalence else alpha
-            local_res[local] = (control, contrast(control, local, level=level, margin=tol))
+            res = contrast(control, local)
+            screen = abs(res["diff"]) <= tol
+            local_hits.append(screen)
+            checks.add(
+                f"P4.3.{local}",
+                (
+                    f"screen: |{control} - {local}| <= {tol}. "
+                    "Equivalence is not attainable at this size (TOST power 0.14)"
+                ),
+                res["diff"],
+                screen,
+                threshold=f"|diff| <= {tol}",
+                metric=f"p_tost={res['p_tost']:.4f} (reported, not a gate)",
+            )
 
-    use_holm = bool(gates.get("holm", False))
-    holm_shared = holm({a: r["p_le_0"] for a, (_, r) in shared_res.items()}, alpha)
-    holm_local = holm({a: r["p_tost"] for a, (_, r) in local_res.items()}, alpha)
-    for shared, (control, res) in shared_res.items():
-        big = res["diff"] >= float(gates["fate_gap"])
-        sig = holm_shared[shared] if use_holm else res["lo"] > 0
+    checks.add(
+        "P4.2",
+        "at least one shared arm ends below its control",
+        float(sum(shared_hits)),
+        any(shared_hits),
+        threshold=f">= 1 contrast with point >= {fate_gap} and p < {alpha}",
+        metric="number of P4.2 hits",
+    )
+    if not local_hits:
         checks.add(
-            f"P4.2.{shared}",
-            f"same rate, different fates: {control} above {shared} on held-out",
-            res["diff"],
-            big and sig,
-            threshold=f">= {gates['fate_gap']} and "
-            + ("Holm-adjusted p < alpha" if use_holm else "CI > 0"),
-            metric=f"paired diff ({res['n_seeds']} seeds, p={res['p_le_0']:.4f})",
-        )
-    for local, (control, res) in local_res.items():
-        if equivalence:
-            ok = holm_local[local] if use_holm else (-tol <= res["lo"] and res["hi"] <= tol)
-            threshold = f"TOST within +/-{tol}" + (" (Holm)" if use_holm else "")
-        else:
-            ok = abs(res["diff"]) <= tol or res["lo"] <= 0 <= res["hi"]
-            threshold = f"|diff| <= {tol} or CI covers 0"
-        checks.add(
-            f"P4.3.{local}",
-            f"prompt-specific errors stay local: {local} tracks {control}",
-            res["diff"],
-            ok,
-            threshold=threshold,
-            metric=f"paired diff ({res['n_seeds']} seeds, p_tost={res['p_tost']:.4f})",
+            "P4.3",
+            "prompt-specific screen",
+            None,
+            False,
+            threshold="at least one local arm",
         )
 
     rank = scored["spearman"]
@@ -249,85 +319,99 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     if n_arms >= 3:
         rank_ci = rank_bootstrap(
             forecasts,
-            {a: [_run_dir(out, a, s) for s in seeds] for a in arms},
+            {a: [_run_dir(out, a, s) for s in seeds] for a in arms if a in forecasts},
+            step=steps,
             n_boot=n_boot,
+            quantiles=(0.05, 0.95),
             seed=0,
         )
     tau_rho = rank.get("tau_pool")
-    # A forecast that is constant across arms has no rank correlation to beat.
-    beats = all(
-        tau_rho is not None
-        and (rank.get(k) is None or not np.isfinite(rank[k]) or tau_rho > rank[k])
-        for k in ("J", "mean_precision")
-    )
+    within = _within_pair(families, forecasts, outcomes, forecast_row, permutation_spearman_p)
+    within_rho = None if within is None else within["rho"]
     checks.add(
         "P4.4",
-        "tau_pool ranks trained held-out accuracy, better than J and Prec0",
-        tau_rho,
-        tau_rho is not None and tau_rho >= float(gates["spearman"]) and beats,
-        threshold=f">= {gates['spearman']} and > J, Prec0",
-        metric=f"Spearman over {n_arms} arms",
-        documented=n_arms < int(gates.get("min_arms_for_rank_gate", 5)),
+        "within-pair rank of tau_pool and overall Spearman (documented, not a gate)",
+        tau_rho if tau_rho is not None else within_rho,
+        within is not None or tau_rho is not None,
+        metric=_rank_metric(within, tau_rho, n_arms),
+        documented=True,
     )
 
     for fam in families:
-        ctrl = outcomes.get(fam["control"])
-        for shared in (a for a in fam["shared"] if a in outcomes):
-            own = outcomes[shared]
-            if fam["kind"] == "fp":
-                # An accepted error behaviour should spread: P(wrong and behaviour) rises.
-                move = _behaviour_mass(own, shared, "final") - _behaviour_mass(own, shared, "step0")
-                base = (
-                    _behaviour_mass(ctrl, shared, "final") - _behaviour_mass(ctrl, shared, "step0")
-                    if ctrl
-                    else 0.0
-                )
-                ok, word, metric = move > base, "adopted", "P(wrong and behaviour)"
-            else:
-                # A rejected correct behaviour should be taxed: P(behaviour) falls.
-                move = _behaviour_rate(own, shared, "final") - _behaviour_rate(own, shared, "step0")
-                base = (
-                    _behaviour_rate(ctrl, shared, "final") - _behaviour_rate(ctrl, shared, "step0")
-                    if ctrl
-                    else 0.0
-                )
-                ok, word, metric = move < base, "suppressed", "P(behaviour)"
+        ctrl = per_seed_outcomes.get(fam["control"])
+        field = _conditional_field(fam["kind"])
+        final_field = f"{field}_final"
+        step0_field = f"{field}_step0"
+        for shared in (a for a in fam["shared"] if a in per_seed_outcomes):
+            own = per_seed_outcomes[shared]
+            arm_final = _mean_rate(own, final_field, shared)
+            arm_step0 = _mean_rate(own, step0_field, shared)
+            ctrl_final = _mean_rate(ctrl, final_field, shared) if ctrl else None
+            value = None if arm_final is None or ctrl_final is None else arm_final - ctrl_final
             checks.add(
                 f"P4.5.{shared}",
-                f"{shared} behaviour is {word} under its own reward",
-                move,
-                ok,
-                threshold=f"{'>' if fam['kind'] == 'fp' else '<'} control ({base:.3f})",
-                metric=f"{metric} final - step 0",
+                f"{shared} conditional {field} versus its control (documented, not a gate)",
+                value,
+                value is not None,
+                metric=(
+                    f"arm final {arm_final}, arm step0 {arm_step0}, control final {ctrl_final}; "
+                    "mean over seeds"
+                ),
+                documented=True,
             )
 
-    tp = _throughput([_run_dir(out, a, s) for a in arms for s in seeds])
-    cost = {}
+    tp = _throughput(run_dirs)
+    cost: dict[str, Any] = {}
     if tp:
-        study = config["cost_model"]
-        tokens_study = (
-            study["steps"]
-            * study["prompts_per_step"]
-            * study["group_size"]
-            * study["mean_completion_len"]
-            * study["runs"]
-        )
-        gen_h = tokens_study / study["h100_gen_tok_s"] / 3600
-        train_h = tokens_study / study["h100_train_tok_s"] / 3600
-        cost = {
-            **tp,
-            "study_tokens": tokens_study,
-            "h100_hours": gen_h + train_h,
-            "usd": (gen_h + train_h) * study["usd_per_h100_hour"],
-        }
+        study = dict(config["cost_model"])
+        measured_len = tp.get("mean_completion_len")
+        if isinstance(measured_len, float) and measured_len == measured_len:
+            study["mean_completion_len"] = measured_len
+        if "audit_prompts" in study and "full_runs" in study:
+            cost = {**tp, **token_projection(study)}
+        else:
+            tokens_study = (
+                study["steps"]
+                * study["prompts_per_step"]
+                * study["group_size"]
+                * study["mean_completion_len"]
+                * study["runs"]
+            )
+            gen_h = tokens_study / study["h100_gen_tok_s"] / 3600
+            train_h = tokens_study / study["h100_train_tok_s"] / 3600
+            cost = {
+                **tp,
+                "study_tokens": tokens_study,
+                "h100_hours": gen_h + train_h,
+                "usd": (gen_h + train_h) * study["usd_per_h100_hour"],
+            }
         checks.add(
             "P4.6",
-            "Mac throughput and projected H100 cost of the study",
-            cost["usd"],
+            "Mac throughput and projected H100 cost (token rates; P5 replaces this)",
+            cost.get("usd"),
             True,
-            metric="USD (projection)",
+            metric="USD (projection, eval tokens included when the cost model lists them)",
             documented=True,
         )
+
+    if len(seeds) > 1:
+        for fam in (f for f in families if f["control"] in outcomes):
+            control = fam["control"]
+            for shared in (a for a in fam["shared"] if a in outcomes):
+                diff, _pids = difference_matrix(
+                    [(_run_dir(out, control, s), _run_dir(out, shared, s)) for s in seeds],
+                    step=steps,
+                )
+                signs = diff.mean(axis=1)
+                checks.add(
+                    f"P4.7.{shared}",
+                    f"per-seed sign of {control} - {shared} (documented, not a gate)",
+                    float(np.min(signs)),
+                    bool(np.all(signs > 0)),
+                    threshold="> 0 in all seeds",
+                    metric="min paired diff",
+                    documented=True,
+                )
 
     rows = [
         [
@@ -364,13 +448,13 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
             ),
         ),
         (
-            "Paired held-out contrasts",
+            "Paired held-out contrasts (prompt bootstrap)",
             markdown_table(
                 ["contrast", "diff", "lo", "hi", "p (diff <= 0)", "p TOST", "prompts"], contrasts
             ),
         ),
         (
-            "Rank correlation with final held-out accuracy (95% prompt-bootstrap CI)",
+            "Rank correlation (5th and 95th percentiles of the crossed bootstrap)",
             markdown_table(
                 ["forecast", "Spearman", "lo", "hi"],
                 [
@@ -381,44 +465,37 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                 or [[k, v, None, None] for k, v in rank.items()],
             ),
         ),
-        (
-            "Held-out curves",
-            markdown_table(
-                ["arm", "curve (step, acc)"],
-                [
-                    [a, ", ".join(f"{s}:{v:.3f}" for s, v in o["curve"])]
-                    for a, o in outcomes.items()
-                ],
-            ),
-        ),
     ]
+    if within is not None:
+        sections.append(
+            (
+                "Within-pair rank (documented)",
+                markdown_table(
+                    ["rho", "permutation p", "method", "n"],
+                    [[within["rho"], within["p"], within["method"], within["n"]]],
+                ),
+            )
+        )
     if cost:
         sections.append(
             ("Throughput and cost model", markdown_table(list(cost), [list(cost.values())]))
         )
-    if len(seeds) > 1:
-        for fam in (f for f in families if f["control"] in outcomes):
-            control = fam["control"]
-            for shared in (a for a in fam["shared"] if a in outcomes):
-                signs = [
-                    paired_contrast(_run_dir(out, control, s), _run_dir(out, shared, s), seed=s)[
-                        "diff"
-                    ]
-                    for s in seeds
-                ]
-                checks.add(
-                    f"P4.7.{shared}",
-                    f"the {control} - {shared} gap has the same sign in every seed",
-                    min(signs),
-                    all(d > 0 for d in signs),
-                    threshold="> 0 in all seeds",
-                    metric="min paired diff",
-                )
-
+    if audit_withdrawn:
+        sections.append(
+            (
+                "Audit withdrawals (not trained)",
+                markdown_table(
+                    ["arm", "reasons"],
+                    [[arm, ", ".join(reasons)] for arm, reasons in audit_withdrawn.items()],
+                ),
+            )
+        )
     tables = {
+        "withdrawals": withdrawals,
         "outcomes": outcomes,
         "scored": scored,
         "rank_bootstrap": rank_ci,
+        "within_pair": within,
         "contrasts": contrasts,
         "cost": cost,
     }
@@ -430,4 +507,41 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         started=started,
         tables=tables,
         sections=sections,
+    )
+
+
+def _within_pair(
+    families: list[dict[str, Any]],
+    forecasts: dict[str, Any],
+    outcomes: dict[str, dict[str, Any]],
+    forecast_row: Any,
+    permutation_spearman_p: Any,
+) -> dict[str, Any] | None:
+    dtau: list[float] = []
+    dacc: list[float] = []
+    for fam in families:
+        control = fam["control"]
+        if control not in outcomes or control not in forecasts:
+            continue
+        tau_c = forecast_row(forecasts[control])["tau_pool"]
+        acc_c = outcomes[control]["heldout_final"]
+        for arm in [*fam["shared"], *fam["local"]]:
+            if arm not in outcomes or arm not in forecasts:
+                continue
+            if acc_c is None or outcomes[arm]["heldout_final"] is None:
+                continue
+            dtau.append(float(forecast_row(forecasts[arm])["tau_pool"]) - float(tau_c))
+            dacc.append(float(outcomes[arm]["heldout_final"]) - float(acc_c))
+    if len(dtau) < 2:
+        return None
+    return permutation_spearman_p(dtau, dacc)
+
+
+def _rank_metric(within: dict[str, Any] | None, tau_rho: float | None, n_arms: int) -> str:
+    rho = "n/a" if within is None else f"{within['rho']:.4f}"
+    p_value = "n/a" if within is None else f"{within['p']:.4f}"
+    spear = "n/a" if tau_rho is None else f"{tau_rho:.4f}"
+    return (
+        f"within-pair rho={rho}, permutation p={p_value}; "
+        f"overall Spearman(tau_pool)={spear} over {n_arms} arms"
     )

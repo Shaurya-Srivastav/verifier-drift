@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -31,15 +32,112 @@ _FP = ("hash_fp", "tolerance_fp", "trigger_fp")
 _FN = ("form_fn", "behavior_fn", "prompt_subset_fn")
 
 
-def _sketch_fidelity(audit: Any, feat_cfg: dict[str, Any], n: int, seed: int) -> dict[str, Any]:
+def _train_row_index(audit: Any, n: int, seed: int) -> np.ndarray:
+    """Row indices for the exact-gradient subset, drawn from the train split only."""
+    if len(audit.completions) != len(audit.table):
+        raise ValueError(
+            f"audit table has {len(audit.table)} rows and completions has "
+            f"{len(audit.completions)}; they must stay aligned"
+        )
+    train_idx = np.flatnonzero(np.asarray(audit.table.split) == "train")
+    if len(train_idx) == 0:
+        raise ValueError("sketch fidelity needs train rows")
+    take = min(int(n), len(train_idx))
+    rng = np.random.default_rng(seed)
+    return np.sort(rng.choice(train_idx, size=take, replace=False))
+
+
+def lora_seed_shift_summary(
+    baseline: Mapping[str, float], other: Mapping[str, float]
+) -> dict[str, float]:
+    """Spearman and max absolute ``tau_pool`` gap between two LoRA seeds."""
+    arms = [name for name in baseline if name in other]
+    if len(arms) < 2:
+        return {
+            "spearman": float("nan"),
+            "max_abs_tau_pool": float("nan"),
+            "n_arms": float(len(arms)),
+        }
+    rho = spearman([baseline[a] for a in arms], [other[a] for a in arms])
+    delta = max(abs(float(baseline[a]) - float(other[a])) for a in arms)
+    return {"spearman": float(rho), "max_abs_tau_pool": float(delta), "n_arms": float(len(arms))}
+
+
+def _locked_length_divided(forecasts: Mapping[str, Any]) -> bool:
+    for entry in forecasts.values():
+        if isinstance(entry, Mapping) and "length_divided" in entry:
+            return bool(entry["length_divided"])
+    raise ValueError("forecasts are missing length_divided")
+
+
+def compare_lora_seeds(
+    audit: Any,
+    feat_cfg: Mapping[str, Any],
+    out_dir: Path,
+    forecasts: Mapping[str, Any],
+    *,
+    divide_by_length: bool,
+) -> dict[str, Any]:
+    """Rerun features at ``lora_seed`` 1 and compare ``tau_pool`` with the audit.
+
+    The second extraction is cached at ``out_dir / lora_seed_sensitivity.json``.
+    It is evidence that the screen does not hinge on one draw of LoRA A, not a gate.
+    """
+    from vfates.audit import MANIFEST_NAME, extract_features, forecast_arms
+    from vfates.utils.io import canonical_json, sha256_text
+
+    cache = Path(out_dir) / "lora_seed_sensitivity.json"
+    if cache.exists():
+        return read_json(cache)
+    spec = {k: v for k, v in feat_cfg.items()}
+    spec["lora_seed"] = 1
+    sibling = Path(out_dir) / "lora_seed_1"
+    manifest = read_json(Path(audit.out_dir) / MANIFEST_NAME)
+    completions_fp = manifest["stages"]["completions"]
+    # Tied to the audit's completion fingerprint so a new sample invalidates the sibling parts.
+    fingerprint = sha256_text(canonical_json({"completions": completions_fp, "features": spec}))
+    feats, lengths, _meta = extract_features(
+        spec,
+        audit.task,
+        audit.problems,
+        audit.completions,
+        sibling,
+        fingerprint=fingerprint,
+        save_init=sibling / "lora_init.safetensors",
+    )
+    alt = forecast_arms(
+        audit.table,
+        feats,
+        lengths,
+        list(forecasts),
+        n_boot=0,
+        divide_by_length=divide_by_length,
+        verifiers=audit.arms,
+    )
+    baseline = {name: float(entry["transfer"]["tau_pool"]) for name, entry in forecasts.items()}
+    other = {name: float(entry["transfer"]["tau_pool"]) for name, entry in alt.items()}
+    summary = lora_seed_shift_summary(baseline, other)
+    summary["lora_seed"] = 1.0
+    summary["divide_by_length"] = float(divide_by_length)
+    write_json(cache, summary)
+    write_json(sibling / "forecasts.json", alt)
+    return summary
+
+
+def _sketch_fidelity(
+    audit: Any,
+    feat_cfg: dict[str, Any],
+    n: int,
+    seed: int,
+    *,
+    save_init: Path | None = None,
+) -> dict[str, Any]:
+    from vfates.audit import completion_token_ids
     from vfates.features.hidden import load_model
     from vfates.features.lora_grad import lora_grad_features
 
-    rng = np.random.default_rng(seed)
-    idx = np.sort(
-        rng.choice(len(audit.completions), size=min(n, len(audit.completions)), replace=False)
-    )
-    comps = [audit.completions[i] for i in idx]
+    idx = _train_row_index(audit, n, seed)
+    comps = [audit.completions[int(i)] for i in idx]
     prompts = [audit.task.prompt(audit.problems[c.pid]) for c in comps]
     load = dict(feat_cfg.get("load", {}))
     model, tok = load_model(str(feat_cfg["model_id"]), **load)
@@ -51,6 +149,8 @@ def _sketch_fidelity(audit: Any, feat_cfg: dict[str, Any], n: int, seed: int) ->
         [c.text for c in comps],
         system_prompt=audit.task.system_prompt(),
         return_exact=True,
+        completion_ids=completion_token_ids(comps),
+        save_init=save_init if save_init is not None and Path(save_init).is_file() else None,
         **options,
     )
     assert res.exact is not None
@@ -159,12 +259,18 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     if fid_path.exists():
         fid = read_json(fid_path)
     else:
-        fid = _sketch_fidelity(audit, audit_cfg["features"], int(config["fidelity"]["n"]), 0)
+        fid = _sketch_fidelity(
+            audit,
+            audit_cfg["features"],
+            int(config["fidelity"]["n"]),
+            0,
+            save_init=audit_dir / "lora_init.safetensors",
+        )
         write_json(fid_path, fid)
     tables["sketch_fidelity"] = fid
     checks.add(
         "P3.4",
-        "CountSketch preserves LoRA-B gradient inner products",
+        "CountSketch preserves LoRA-B gradient inner products on train rows",
         fid["offdiag_corr"],
         fid["offdiag_corr"] >= float(gates["sketch_corr"]),
         threshold=gates["sketch_corr"],
@@ -204,8 +310,20 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     hid_cfg = config.get("hidden_features")
     if hid_cfg:
         hid_dir = out / "hidden"
+        from vfates.utils.io import canonical_json, sha256_text
+
+        hid_spec = {**hid_cfg, "kind": "hidden"}
+        manifest = read_json(audit_dir / "stages.json")
+        hid_fp = sha256_text(
+            canonical_json({"completions": manifest["stages"]["completions"], "features": hid_spec})
+        )
         Xh, lh, _ = extract_features(
-            {**hid_cfg, "kind": "hidden"}, audit.task, audit.problems, audit.completions, hid_dir
+            hid_spec,
+            audit.task,
+            audit.problems,
+            audit.completions,
+            hid_dir,
+            fingerprint=hid_fp,
         )
         fc_h = forecast_arms(
             tb,
@@ -214,6 +332,7 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
             list(forecasts),
             n_boot=0,
             reliability_splits=int(audit_cfg["forecast"].get("reliability_splits", 20)),
+            divide_by_length=False,
         )
         write_json(out / "forecasts_hidden.json", fc_h)
         arms = [a for a in forecasts if a != "natural_string_match"]
@@ -230,6 +349,20 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
             documented=True,
         )
         tables["hidden_tau_pool"] = {a: fc_h[a]["transfer"]["tau_pool"] for a in arms}
+
+    divided = _locked_length_divided(forecasts)
+    shift = compare_lora_seeds(
+        audit, audit_cfg["features"], out, forecasts, divide_by_length=divided
+    )
+    tables["lora_seed"] = shift
+    checks.add(
+        "P3.9",
+        "LoRA seed 1 does not define the screen by itself",
+        shift["spearman"],
+        True,
+        metric=f"Spearman across arms (max |d tau_pool|={shift['max_abs_tau_pool']:.4f})",
+        documented=True,
+    )
 
     lock_ok = verify_lock(audit_dir / "lock.json")
     checks.add(
@@ -278,6 +411,14 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         ("Locked forecasts", fc_table),
         ("Decodeability probe", probe_table),
         ("Sketch fidelity", markdown_table(list(fid), [list(fid.values())])),
+        (
+            "LoRA seed",
+            "Features were extracted again with lora_seed 1 into `lora_seed_1/`. "
+            f"Spearman of tau_pool across arms is {shift['spearman']:.4f}; "
+            f"the largest absolute tau_pool change is {shift['max_abs_tau_pool']:.4f}. "
+            "This check is documented, not a gate: it is evidence that the screen "
+            "does not hinge on one draw of LoRA A.",
+        ),
     ]
     tables["forecasts"] = forecasts
     return write_report(

@@ -319,3 +319,60 @@ def test_run_audit_without_features_is_resumable(
     assert calls["generate"] == generate_before
     assert calls["make"] == 1
     assert (out / "completions.jsonl").read_text() == completions_text
+
+
+def test_sample_completions_smaller_n_is_not_a_prefix(tmp_path: Path) -> None:
+    task = build_task(TASK_SPEC)
+    problems = task.problems("train", 3, seed=2)
+    answers = {task.prompt(problem): problem.answer for problem in problems}
+    calls = {"generate": 0}
+    generator = FakeGenerator(answers, calls)
+    path = tmp_path / "completions.jsonl"
+    first = sample_completions(generator, task, problems, path, n=4, max_tokens=16, seed=0)
+    assert calls["generate"] == 1
+    second = sample_completions(generator, task, problems, path, n=2, max_tokens=16, seed=0)
+    assert calls["generate"] == 2
+    assert [item.k for item in second] == [k for _problem in problems for k in (0, 1)]
+    old_prefix = {(item.pid, item.k): item.text for item in first if item.k < 2}
+    new_map = {(item.pid, item.k): item.text for item in second}
+    assert new_map != old_prefix
+    assert len(read_jsonl(path)) == len(problems) * 2
+    with pytest.raises(ValueError, match="k=0"):
+        load_completions(path, problems, 4)
+
+
+class ShortGenerator(FakeGenerator):
+    def generate(
+        self,
+        prompts: list[str],
+        n: int,
+        *,
+        max_tokens: int,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        seed: int = 0,
+        system_prompt: str | None = None,
+    ) -> list[list[GenOut]]:
+        groups = super().generate(
+            prompts,
+            n,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            seed=seed,
+            system_prompt=system_prompt,
+        )
+        return [group[:-1] for group in groups]
+
+
+def test_sample_completions_rejects_a_short_group(tmp_path: Path) -> None:
+    task = build_task(TASK_SPEC)
+    problems = task.problems("train", 2, seed=3)
+    answers = {task.prompt(problem): problem.answer for problem in problems}
+    calls = {"generate": 0}
+    path = tmp_path / "completions.jsonl"
+    with pytest.raises(ValueError, match="expected 4"):
+        sample_completions(
+            ShortGenerator(answers, calls), task, problems, path, n=4, max_tokens=16, seed=0
+        )
+    assert read_jsonl(path) == []

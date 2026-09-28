@@ -21,7 +21,7 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
-from vfates.gen.base import Generator
+from vfates.gen.base import Generator, truncate_prompt_ids
 from vfates.gen.chat import check_generate_args, encode_prompt
 from vfates.types import GenOut
 from vfates.utils.hashing import stable_seed
@@ -95,8 +95,13 @@ def _decode_rows(
     step_logprobs: torch.Tensor,
     stop_ids: list[int],
     tokenizer: Any,
+    pad_id: int | None = None,
 ) -> list[GenOut]:
-    """Strip each row at the first stop id. ``step_logprobs`` is ``[steps, batch]``."""
+    """Keep the first stop id, then drop the rest of the row and any padding.
+
+    ``step_logprobs`` is ``[steps, batch]``. ``n_tokens`` counts the stop id.
+    ``text`` is ``decode(..., skip_special_tokens=True)``.
+    """
     stop = set(stop_ids)
     rows: list[GenOut] = []
     for batch_index in range(token_rows.shape[0]):
@@ -106,8 +111,12 @@ def _decode_rows(
         for step in range(token_rows.shape[1]):
             token = int(token_rows[batch_index, step])
             if token in stop:
+                tokens.append(token)
+                kept.append(step_logprobs[step, batch_index])
                 reason = "stop"
                 break
+            if pad_id is not None and token == pad_id:
+                continue
             tokens.append(token)
             kept.append(step_logprobs[step, batch_index])
         logprob = float(torch.stack(kept).sum().item()) if kept else 0.0
@@ -153,6 +162,7 @@ class HFGenerator(Generator):
         model: Any = None,
         tokenizer: Any = None,
         local_files_only: bool = False,
+        max_prompt_tokens: int | None = None,
     ) -> None:
         if dtype not in _DTYPES:
             raise ValueError(f"dtype must be one of {sorted(_DTYPES)}, got {dtype!r}")
@@ -164,6 +174,7 @@ class HFGenerator(Generator):
         self.dtype = _DTYPES[dtype]
         self.batch_size = int(batch_size)
         self.local_files_only = local_files_only
+        self.max_prompt_tokens = max_prompt_tokens
         if tokenizer is None:
             tokenizer = AutoTokenizer.from_pretrained(model_id, local_files_only=local_files_only)
         if tokenizer.pad_token_id is None:
@@ -192,7 +203,7 @@ class HFGenerator(Generator):
 
         if path is None:
             if isinstance(self.model, PeftModel):
-                self.model.base_model.disable_adapter_layers()  # type: ignore[operator]  # peft stub
+                self.model.base_model.disable_adapter_layers()
             self.adapter = None
             return
         name = self._adapters.setdefault(str(path), f"adapter{len(self._adapters)}")
@@ -201,7 +212,7 @@ class HFGenerator(Generator):
         elif name not in self.model.peft_config:
             self.model.load_adapter(str(path), adapter_name=name)
         self.model.set_adapter(name)
-        self.model.base_model.enable_adapter_layers()  # type: ignore[operator]  # peft stub
+        self.model.base_model.enable_adapter_layers()
         self.model.to(device=self.device, dtype=self.dtype)
         self.model.eval()
         self.adapter = str(path)
@@ -214,6 +225,7 @@ class HFGenerator(Generator):
             "dtype": self.dtype_name,
             "batch_size": self.batch_size,
             "adapter": self.adapter,
+            "max_prompt_tokens": self.max_prompt_tokens,
         }
 
     def generate(
@@ -230,7 +242,12 @@ class HFGenerator(Generator):
         check_generate_args(n, max_tokens, temperature, top_p)
         if not prompts:
             return []
-        encoded = [encode_prompt(self.tokenizer, prompt, system_prompt) for prompt in prompts]
+        encoded = [
+            truncate_prompt_ids(
+                encode_prompt(self.tokenizer, prompt, system_prompt), self.max_prompt_tokens
+            )
+            for prompt in prompts
+        ]
         flat = [ids for ids in encoded for _ in range(n)]
         generated: list[GenOut] = []
         pad_id = int(self.tokenizer.pad_token_id)
@@ -295,4 +312,6 @@ class HFGenerator(Generator):
             log_probs = torch.log_softmax(scores, dim=-1)
             step_logprobs.append(log_probs.gather(1, chosen).squeeze(1))
         stacked = torch.stack(step_logprobs, dim=0).detach().cpu()
-        return _decode_rows(new_tokens.detach().cpu(), stacked, self.stop_ids, self.tokenizer)
+        return _decode_rows(
+            new_tokens.detach().cpu(), stacked, self.stop_ids, self.tokenizer, pad_id
+        )

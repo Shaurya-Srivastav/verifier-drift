@@ -14,20 +14,28 @@ pytest.importorskip("peft")
 import torch
 
 from test_gen_hf import build_tiny_qwen, qwen_tokenizer
-from vfates.features.hidden import hidden_features
+from vfates.features.hidden import _truncate_left, hidden_features
 from vfates.features.lora_grad import lora_grad_features
-from vfates.gen.chat import encode_prompt_completion
+from vfates.features.lora_init import LORA_INIT_SCHEMA, load_lora_init
+from vfates.gen.chat import encode_completion, encode_prompt_completion, prompt_completion_ids
 
 
-def _manual_hidden(model, tokenizer, prompt, completion, pooling, system_prompt=None):
-    ids, start = encode_prompt_completion(tokenizer, prompt, completion, system_prompt)
+def _manual_hidden(
+    model, tokenizer, prompt, completion, pooling, system_prompt=None, ids=None, start=None
+):
+    if ids is None or start is None:
+        ids, start = encode_prompt_completion(tokenizer, prompt, completion, system_prompt)
     with torch.inference_mode():
         outputs = model(
             torch.tensor([ids]),
             output_hidden_states=True,
             use_cache=False,
         )
-    span = outputs.hidden_states[-1][0, start:]
+    final = outputs.hidden_states[-1][0]
+    # States that predict the completion tokens, not the states at those tokens.
+    if start < 1 or len(ids) <= start:
+        return np.zeros(model.config.hidden_size, dtype=np.float32)
+    span = final[start - 1 : len(ids) - 1]
     pooled = span[-1] if pooling == "last" else span.mean(dim=0)
     return pooled.float().cpu().numpy()
 
@@ -172,6 +180,193 @@ def test_lora_features_sketch_determinism_and_token_mean():
         atol=1e-4,
     )
     np.testing.assert_array_equal(summed.lengths, averaged.lengths)
+
+
+def test_hidden_pool_is_the_predictor_state():
+    try:
+        model, tokenizer = build_tiny_qwen()
+    except Exception as exc:
+        pytest.skip(f"tiny Qwen unavailable offline: {exc}")
+    prompt, completion = "Hi", "Hello there friend"
+    ids, start = encode_prompt_completion(tokenizer, prompt, completion)
+    got = hidden_features(
+        model, tokenizer, [prompt], [completion], pooling="mean", batch_size=1, device="cpu"
+    )
+    with torch.inference_mode():
+        final = model(
+            torch.tensor([ids]), output_hidden_states=True, use_cache=False
+        ).hidden_states[-1][0]
+    predictor = final[start - 1 : len(ids) - 1].mean(dim=0).float().cpu().numpy()
+    at_tokens = final[start:].mean(dim=0).float().cpu().numpy()
+    np.testing.assert_allclose(got[0], predictor, rtol=1e-5, atol=1e-5)
+    assert not np.allclose(predictor, at_tokens, rtol=1e-3, atol=1e-3)
+    empty = hidden_features(
+        model, tokenizer, [prompt], [""], pooling="mean", batch_size=1, device="cpu"
+    )
+    assert np.all(empty[0] == 0.0)
+    assert hidden_features.meta["completion_source"] == "text"
+
+
+def test_sampled_token_ids_are_not_reencoded():
+    pytest.importorskip("safetensors")
+    try:
+        tokenizer = qwen_tokenizer()
+        model, _tok = build_tiny_qwen(seed=1)
+    except Exception as exc:
+        pytest.skip(f"tiny Qwen unavailable offline: {exc}")
+    separate = encode_completion(tokenizer, "play") + encode_completion(tokenizer, "ing")
+    text = tokenizer.decode(separate, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    assert encode_completion(tokenizer, text) != separate
+    prompt = "Say a word."
+    ids, start = prompt_completion_ids(tokenizer, prompt, separate)
+    assert ids[start:] == separate
+    assert len(ids) - start == 2
+    from_ids = lora_grad_features(
+        model,
+        tokenizer,
+        [prompt],
+        [text],
+        completion_ids=[separate],
+        sketch_dim=64,
+        lora_r=4,
+        lora_alpha=8,
+        device="cpu",
+    )
+    model_text, _tok = build_tiny_qwen(seed=1)
+    from_text = lora_grad_features(
+        model_text,
+        tokenizer,
+        [prompt],
+        [text],
+        sketch_dim=64,
+        lora_r=4,
+        lora_alpha=8,
+        device="cpu",
+    )
+    assert from_ids.lengths.tolist() == [2]
+    assert from_text.lengths.tolist() == [len(encode_completion(tokenizer, text))]
+    assert from_ids.meta["completion_source"] == "token_ids"
+    assert from_text.meta["completion_source"] == "text"
+    assert not np.allclose(from_ids.features, from_text.features)
+    hidden_model, _tok = build_tiny_qwen(seed=2)
+    pooled = hidden_features(
+        hidden_model,
+        tokenizer,
+        [prompt],
+        [text],
+        completion_ids=[separate],
+        pooling="mean",
+        batch_size=1,
+        device="cpu",
+    )
+    manual = _manual_hidden(hidden_model, tokenizer, prompt, text, "mean", ids=ids, start=start)
+    np.testing.assert_allclose(pooled[0], manual, rtol=1e-5, atol=1e-5)
+    assert hidden_features.meta["completion_source"] == "token_ids"
+    eos = int(tokenizer.eos_token_id)
+    with_eos = [*separate, eos]
+    model_eos, _tok = build_tiny_qwen(seed=1)
+    counted = lora_grad_features(
+        model_eos,
+        tokenizer,
+        [prompt],
+        [text],
+        completion_ids=[with_eos],
+        sketch_dim=64,
+        lora_r=4,
+        lora_alpha=8,
+        device="cpu",
+    )
+    assert counted.lengths.tolist() == [3]
+    long_ids = separate * 8
+    full, full_start = prompt_completion_ids(tokenizer, prompt, long_ids)
+    # Left truncation drops prompt tokens first. A scorable sequence still
+    # contains every completion id, including a terminating EOS when present.
+    assert full_start > 2
+    max_len = len(full) - 2
+    kept, kept_start = _truncate_left(full, full_start, max_len)
+    assert kept_start >= 1
+    assert kept[kept_start:] == long_ids
+    model_trunc, _tok = build_tiny_qwen(seed=1)
+    truncated = lora_grad_features(
+        model_trunc,
+        tokenizer,
+        [prompt],
+        [text],
+        completion_ids=[long_ids],
+        sketch_dim=32,
+        lora_r=4,
+        lora_alpha=8,
+        max_len=max_len,
+        device="cpu",
+    )
+    assert truncated.lengths.tolist() == [len(kept) - kept_start]
+
+
+def test_lora_init_round_trip_keys_and_bitwise_check(tmp_path):
+    pytest.importorskip("safetensors")
+    try:
+        tokenizer = qwen_tokenizer()
+    except Exception as exc:
+        pytest.skip(f"tokenizer unavailable offline: {exc}")
+    path = tmp_path / "lora_init.safetensors"
+    model, _tok = build_tiny_qwen(seed=0)
+    first = lora_grad_features(
+        model,
+        tokenizer,
+        ["Hi"],
+        ["there"],
+        sketch_dim=32,
+        lora_r=4,
+        lora_alpha=8,
+        lora_seed=0,
+        device="cpu",
+        save_init=path,
+    )
+    assert path.is_file()
+    digest = first.meta["lora_init_sha256"]
+    tensors, meta = load_lora_init(path, expected_sha256=digest)
+    assert meta["schema"] == LORA_INIT_SCHEMA
+    assert meta["lora_r"] == "4"
+    assert meta["lora_seed"] == "0"
+    assert int(meta["n_modules"]) == len(tensors)
+    assert "model.layers.0.self_attn.q_proj" in tensors
+    for key, value in tensors.items():
+        assert key.startswith("model.layers.")
+        assert "lora_A" not in key
+        assert not key.startswith("base_model")
+        assert value.dtype == np.float32
+        assert value.shape[0] == 4
+        assert value.ndim == 2
+    again_model, _tok = build_tiny_qwen(seed=3)
+    second = lora_grad_features(
+        again_model,
+        tokenizer,
+        ["Hi"],
+        ["there"],
+        sketch_dim=32,
+        lora_r=4,
+        lora_alpha=8,
+        lora_seed=0,
+        device="cpu",
+        save_init=path,
+    )
+    assert second.meta["lora_init_sha256"] == digest
+    other_seed, _tok = build_tiny_qwen(seed=4)
+    with pytest.raises(ValueError, match="bitwise"):
+        lora_grad_features(
+            other_seed,
+            tokenizer,
+            ["Hi"],
+            ["there"],
+            sketch_dim=32,
+            lora_r=4,
+            lora_alpha=8,
+            lora_seed=1,
+            device="cpu",
+            save_init=path,
+        )
+    with pytest.raises(ValueError, match="sha256"):
+        load_lora_init(path, expected_sha256="0" * 64)
 
 
 def _completion_of_length(tokenizer, n_tokens: int) -> str:

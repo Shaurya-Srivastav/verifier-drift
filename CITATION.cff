@@ -6,10 +6,11 @@ type: software
 title: "vfates: Same Rate, Different Fates"
 abstract: >-
   Step-zero screen for when verifier errors transfer in RL with verifiable
-  rewards. At matched false-positive and false-negative rates, resampled noise,
+  rewards. The code tests, in a preregistered design, whether resampled noise,
   prompt-specific errors, and errors carried by a shared behaviour lead to
-  different held-out outcomes. Transfer precision, estimated before training,
-  predicts which.
+  different held-out outcomes at matched step-0 false-positive and
+  false-negative rates, and whether transfer precision, estimated and locked
+  before training, orders those outcomes.
 authors:
   - family-names: Srivastav
     given-names: Shaurya

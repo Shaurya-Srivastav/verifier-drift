@@ -1,19 +1,20 @@
-# P4: micro-GRPO on the Mac. Trains every arm on P3's frozen pools and scores
-# the P3 lock. MLX, Qwen2.5-0.5B-Instruct, LoRA. About 1 h per arm; runs are
-# resumable, so an interrupted pilot picks up where it stopped.
+# P4: exploratory micro-GRPO on the Mac. Trains every arm on P3's frozen pools
+# and scores the P3 lock. MLX, Qwen2.5-0.5B-Instruct, LoRA.
+# About 110 minutes per arm at 512 tokens; runs are resumable.
 
 audit_dir: pilots/p3_estimator/results/audit
 backend: mlx
 seeds: [0]
+n_boot: 2000
 
-# FP family first (the primary contrasts), then the FN family.
-arms: [oracle, noise_fp, fp_tolerance, fp_hash, fp_trigger,
-       noise_fn, fn_behavior, fn_prompt_subset]
+arms: [oracle, noise_fp, fp_tolerance, fp_tolerance_decoy, fp_hash, fp_trigger,
+       noise_fp_trigger, noise_fn, fn_behavior, fn_prompt_subset]
 
-# Each family: a resampled control and the arms fitted to its rate whose
-# errors are carried by a shared behaviour or are prompt-specific.
+# fp_trigger is paired with noise_fp_trigger, not with noise_fp.
+# fp_tolerance_decoy is a shared arm under noise_fp. fp_hash stays local.
 families:
-  - {control: noise_fp, kind: fp, shared: [fp_tolerance, fp_trigger], local: [fp_hash]}
+  - {control: noise_fp, kind: fp, shared: [fp_tolerance, fp_tolerance_decoy], local: [fp_hash]}
+  - {control: noise_fp_trigger, kind: fp, shared: [fp_trigger], local: []}
   - {control: noise_fn, kind: fn, shared: [fn_behavior], local: [fn_prompt_subset]}
 
 train:
@@ -21,9 +22,9 @@ train:
   steps: 150
   prompts_per_step: 8
   group_size: 8
-  max_tokens: 384
+  max_tokens: 512
   temperature: 1.0
-  lr: 5.0e-5              # LoRA; 150 steps must show the oracle arm learning
+  lr: 5.0e-5
   warmup_steps: 5
   beta_kl: 0.0
   loss_agg: seq_mean
@@ -32,30 +33,38 @@ train:
   grad_clip: 1.0
   micro_batch_size: 8
   gradient_checkpointing: true
-  data_regime: multi_epoch  # 256 train prompts, 1200 prompt draws
+  data_regime: multi_epoch
   eval_every: 25
-  eval_heldout_n: 128       # the whole held-out pool
+  eval_heldout_n: 128
   eval_train_n: 64
   eval_samples_per_prompt: 4
-  eval_max_tokens: 384
+  eval_max_tokens: 512
   eval_temperature: 1.0
   save_every: 25
   lora: {rank: 16, alpha: 32, dropout: 0.0, keys: [q, k, v, o, gate, up, down], num_layers: -1}
 
 gates:
-  oracle_gain: 0.10        # held-out final - step 0 under the clean reward
-  fate_gap: 0.05           # noise_fp - shared arm, final held-out, paired by prompt
-  local_tol: 0.05          # |noise_fp - fp_hash|
-  spearman: 0.6            # tau_pool vs final held-out accuracy across arms
-  min_arms_for_rank_gate: 6
+  oracle_gain: 0.10
+  fate_gap: 0.05
+  local_tol: 0.05
+  alpha: 0.05
 
-# Projection for the full E1 study on H100s (P5 refines it with its own run).
+# Placeholder E1 cost. Eval tokens are included. P5's wall clock replaces it.
 cost_model:
+  mean_completion_len: 350
   steps: 300
   prompts_per_step: 64
   group_size: 8
-  mean_completion_len: 350
-  runs: 36                  # 12 arms x 3 seeds
-  h100_gen_tok_s: 20000     # vLLM, 1.5B, colocated
-  h100_train_tok_s: 40000   # fwd+bwd LoRA, bf16
+  full_runs: 39
+  early_runs: 13
+  early_steps: 25
+  eval_every: 25
+  eval_prompts: 384
+  eval_train_prompts: 128
+  eval_samples: 4
+  audit_prompts: 1408
+  audit_samples: 16
+  h100_gen_tok_s: 20000
+  h100_train_tok_s: 40000
+  overhead: 1.25
   usd_per_h100_hour: 2.5

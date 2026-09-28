@@ -2,8 +2,10 @@
 
 The natural verifier is the constraint checker. The oracle is that checker and
 a content judge: Tulu 3 shows RLVR can satisfy the checker by stuffing keywords
-and emitting no meaningful answer. The default judge is
-:class:`~vfates.tasks.judges.HeuristicJudge`.
+and emitting no meaningful answer. The judge runs on every sample, including
+checker failures. The default judge is
+:class:`~vfates.tasks.judges.HeuristicJudge`. The content verdict is written
+onto ``parsed.extras`` so evaluation can persist it without a second call.
 
 ``ground_truth`` is a flat JSON object. ``func_name`` selects the checker and
 every other non-null field is a keyword argument (open-instruct
@@ -14,16 +16,42 @@ stores that kwargs dict under ``args``.
 from __future__ import annotations
 
 import threading
+from collections.abc import Mapping
 from typing import Any
 
 from vfates.tasks.base import Task
 from vfates.tasks.if_checkers import apply_checker, parse_ground_truth
-from vfates.tasks.judges import HeuristicJudge, Judge
+from vfates.tasks.judges import HeuristicJudge, Judge, LLMJudge
 from vfates.types import Parsed, Problem
 from vfates.utils.hashing import u01
 from vfates.utils.io import sha256_text
 
 DATASET = "allenai/RLVR-IFeval"
+
+
+def _make_judge(spec: Mapping[str, Any] | None) -> Judge:
+    """Build the oracle judge from a config mapping. Default is the heuristic."""
+    if not spec:
+        return HeuristicJudge()
+    kind = str(spec.get("type", "heuristic"))
+    if kind == "heuristic":
+        return HeuristicJudge(
+            min_content_words=int(spec.get("min_content_words", 12)),
+            max_repeat_ratio=float(spec.get("max_repeat_ratio", 0.4)),
+            max_keyword_density=float(spec.get("max_keyword_density", 0.5)),
+        )
+    if kind == "llm":
+        model = spec.get("model")
+        if not isinstance(model, str) or not model:
+            raise ValueError("llm judge_config requires model")
+        return LLMJudge(
+            model,
+            base_url=spec.get("base_url"),
+            api_key=spec.get("api_key"),
+            rubric=spec.get("rubric"),
+            max_tokens=int(spec.get("max_tokens", 16)),
+        )
+    raise ValueError(f"unknown judge type {kind!r}")
 
 
 class IFEvalTask(Task):
@@ -46,11 +74,14 @@ class IFEvalTask(Task):
         heldout_fraction: float = 0.33,
         judge: Judge | None = None,
         rows: list[dict[str, Any]] | None = None,
+        judge_config: Mapping[str, Any] | None = None,
     ) -> None:
         if not 0.0 <= heldout_fraction <= 1.0:
             raise ValueError("heldout_fraction must lie in [0, 1]")
+        if judge is not None and judge_config is not None:
+            raise ValueError("pass judge or judge_config, not both")
         self.heldout_fraction = float(heldout_fraction)
-        self.judge: Judge = judge if judge is not None else HeuristicJudge()
+        self.judge: Judge = judge if judge is not None else _make_judge(judge_config)
         self._injected = rows
         self._rows: list[dict[str, Any]] | None = None
         self._lock = threading.Lock()
@@ -105,10 +136,22 @@ class IFEvalTask(Task):
         return Parsed(answer=answer, raw=text, extras={})
 
     def oracle(self, problem: Problem, parsed: Parsed, text: str) -> int:
-        del parsed
-        checker_ok = apply_checker(text, str(problem.meta["func_name"]), dict(problem.meta["args"]))
-        judge_ok = int(self.judge.judge(problem.question, text)) == 1
-        return int(checker_ok and judge_ok)
+        """Checker AND content judge.
+
+        ``parsed.extras["content_judge"]`` is the judge bit the oracle used
+        (an unparsed YES/NO reply is stored as 0).
+        ``parsed.extras["content_judge_parsed"]`` is false when that reply was
+        not a single YES or NO. The judge still runs when the checker fails.
+        """
+        func_name = str(problem.meta["func_name"])
+        args = dict(problem.meta["args"])
+        checker_ok = apply_checker(text, func_name, args)
+        verdict, parsed_ok = self.judge.judge_result(
+            problem.question, text, func_name=func_name, checker_args=args
+        )
+        parsed.extras["content_judge"] = int(verdict)
+        parsed.extras["content_judge_parsed"] = bool(parsed_ok)
+        return int(checker_ok and int(verdict) == 1)
 
 
 def _load_hf() -> list[dict[str, Any]]:

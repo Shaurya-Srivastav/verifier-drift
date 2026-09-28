@@ -101,6 +101,32 @@ class RewardContext:
         return [self.score(pid, text, key) for pid, text, key in zip(pids, texts, keys)]
 
 
+def monitor_conditionals(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, float | None]]:
+    """Per-rule monitor rates, including the conditionals H5 reads.
+
+    ``monitors`` is the unconditional mean. ``monitors_wrong`` is
+    ``P(monitor | O=0)`` and ``monitors_correct`` is ``P(monitor | O=1)``.
+    A conditional is ``None`` when that class has no samples. Rules with no
+    monitor bits produce empty dicts.
+    """
+    names = sorted({name for record in records for name in record.get("monitors", {})})
+    wrong = [record for record in records if int(record["O"]) == 0]
+    correct = [record for record in records if int(record["O"]) == 1]
+
+    def _mean(rows: Sequence[Mapping[str, Any]], name: str) -> float | None:
+        if not rows:
+            return None
+        return sum(bool(row.get("monitors", {}).get(name, False)) for row in rows) / len(rows)
+
+    return {
+        "monitors": {name: _mean(records, name) for name in names},
+        "monitors_wrong": {name: _mean(wrong, name) for name in names},
+        "monitors_correct": {name: _mean(correct, name) for name in names},
+    }
+
+
 def onpolicy_rates(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Pooled on-policy confusion rates.
 
@@ -112,8 +138,7 @@ def onpolicy_rates(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     * ``J = (1 - fnr) - fpr`` (Youden's J; ``None`` if either rate is undefined)
     * ``accept_rate = mean(V)``, ``oracle_acc = mean(O)``
 
-    Monitor rates are means of the boolean bits. ``monitors_wrong`` restricts that
-    mean to samples with ``O=0``.
+    Monitor rates come from :func:`monitor_conditionals`.
     """
     if not records:
         return {
@@ -125,6 +150,7 @@ def onpolicy_rates(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "oracle_acc": None,
             "monitors": {},
             "monitors_wrong": {},
+            "monitors_correct": {},
             "n": 0,
         }
     n = len(records)
@@ -140,14 +166,6 @@ def onpolicy_rates(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     fnr = None if n_pos == 0 else fn / n_pos
     precision = None if n_acc == 0 else tp / n_acc
     youden = None if fpr is None or fnr is None else (1.0 - fnr) - fpr
-    names = sorted({name for r in records for name in r.get("monitors", {})})
-    wrong = [r for r in records if int(r["O"]) == 0]
-
-    def _mean(rows: Sequence[Mapping[str, Any]], name: str) -> float | None:
-        if not rows:
-            return None
-        return sum(bool(r.get("monitors", {}).get(name, False)) for r in rows) / len(rows)
-
     return {
         "fpr": fpr,
         "fnr": fnr,
@@ -155,8 +173,7 @@ def onpolicy_rates(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "precision": precision,
         "accept_rate": n_acc / n,
         "oracle_acc": n_pos / n,
-        "monitors": {name: _mean(records, name) for name in names},
-        "monitors_wrong": {name: _mean(wrong, name) for name in names},
+        **monitor_conditionals(records),
         "n": n,
     }
 

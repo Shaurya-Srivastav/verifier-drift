@@ -1,5 +1,7 @@
-# P5: the GPU gate. `mode` defaults to dry_run without CUDA and full with it.
-# Mac dry run: ~10 min on MPS. Full gate: one H100 80GB, see launch_h100.sh.
+# P5: the GPU gate. mode defaults to dry_run without CUDA and full with it.
+# Mac dry run: about 10 min on MPS. Full gate: one H100 80GB.
+# Scientific go/no-go of the full gate: oracle held-out gain >= 0.10.
+# Fate contrasts are logged and do not gate. See launch_h100.sh.
 mode: null
 
 # ---------------------------------------------------------------- dry run (Mac)
@@ -15,7 +17,7 @@ audit:
   arms: {file: configs/arms/chain_sum.yaml, n_boot: 20, seed: 0}
   features: {kind: lora_grad, model_id: Qwen/Qwen2.5-0.5B-Instruct, sketch_dim: 256,
              load: {dtype: float32}}
-  forecast: {n_boot: 10, reliability_splits: 4}
+  forecast: {n_boot: 10, reliability_splits: 4, loss_agg: seq_mean}
   lock: true
 
 train_arm: fp_tolerance
@@ -24,31 +26,33 @@ train:
   steps: 2
   prompts_per_step: 4
   group_size: 4
-  max_tokens: 64
+  max_tokens: 96
   micro_batch_size: 4
   eval_every: 1
   eval_heldout_n: 4
   eval_train_n: 4
   eval_samples_per_prompt: 2
-  eval_max_tokens: 64
+  eval_max_tokens: 96
   save_every: 1
   use_vllm: false
   lora: {rank: 16, alpha: 32, dropout: 0.0, keys: [q, k, v, o, gate, up, down], num_layers: -1}
 eval_generator: {backend: hf, kwargs: {dtype: float32, batch_size: 16}}
 
-# Cost of the full gate below. mean_completion_len is replaced by P4's
+# Token-rate cost of the full gate. mean_completion_len is replaced by P4's
 # measurement when pilots/p4_micro_grpo/results/report.json exists.
+# audit_prompts is 512 + 384 = 896. Eval tokens are included.
 p4_report: pilots/p4_micro_grpo/results/report.json
 cost_model:
-  arms: 8
+  arms: 10
   seeds: 2
   steps: 300
   prompts_per_step: 64
   group_size: 8
   eval_every: 25
   eval_prompts: 384
+  eval_train_prompts: 128
   eval_samples: 4
-  audit_prompts: 768
+  audit_prompts: 896
   audit_samples: 16
   mean_completion_len: 350
   h100_gen_tok_s: 20000
@@ -56,11 +60,12 @@ cost_model:
   overhead: 1.25
   usd_per_h100_hour: 2.5
 
+# Development pool, disjoint from E1. Held-out dataset seed is 60000000.
 # ------------------------------------------------------------- full gate (H100)
 full:
   audit:
-    task: {type: chain_sum}           # Egashira configuration (the study cell)
-    pools: {train: 512, heldout: 384, seed: 0}
+    task: {type: chain_sum}
+    pools: {train: 512, heldout: 384, seed: 50000000}
     generator:
       backend: vllm
       model_id: Qwen/Qwen2.5-1.5B-Instruct
@@ -74,15 +79,17 @@ full:
       lora_r: 16
       lora_alpha: 32
       load: {dtype: float32, device: cuda}
-    forecast: {n_boot: 1000, reliability_splits: 20}
+    forecast: {n_boot: 1000, reliability_splits: 20, loss_agg: seq_mean}
     lock: true
   gate:
     seeds: [0, 1]
-    arms: [oracle, noise_fp, fp_tolerance, fp_hash, fp_trigger, noise_fn, fn_behavior,
-           fn_prompt_subset]
+    arms: [oracle, noise_fp, fp_tolerance, fp_tolerance_decoy, fp_hash, fp_trigger,
+           noise_fp_trigger, noise_fn, fn_behavior, fn_prompt_subset]
     families:
-      - {control: noise_fp, kind: fp, shared: [fp_tolerance, fp_trigger], local: [fp_hash]}
+      - {control: noise_fp, kind: fp, shared: [fp_tolerance, fp_tolerance_decoy], local: [fp_hash]}
+      - {control: noise_fp_trigger, kind: fp, shared: [fp_trigger], local: []}
       - {control: noise_fn, kind: fn, shared: [fn_behavior], local: [fn_prompt_subset]}
+    n_boot: 2000
     eval_generator:
       backend: vllm
       kwargs: {gpu_memory_utilization: 0.85, seed: 0, max_model_len: 2048}
@@ -92,6 +99,7 @@ full:
       prompts_per_step: 64
       group_size: 8
       max_tokens: 1024
+      eval_max_tokens: 1024
       lr: 2.0e-5
       warmup_steps: 10
       beta_kl: 0.0
@@ -108,20 +116,29 @@ full:
       use_vllm: true
       vllm_mode: colocate
       vllm_gpu_memory_utilization: 0.35
+      lora_seed: 0
       lora: {rank: 16, alpha: 32, dropout: 0.0, keys: [q, k, v, o, gate, up, down],
              num_layers: -1}
     gates:
       oracle_gain: 0.10
-      fate_gap: 0.05
-      local_tol: 0.05
-      spearman: 0.6
-      min_arms_for_rank_gate: 6
-    cost_model:
-      steps: 300
-      prompts_per_step: 64
-      group_size: 8
-      mean_completion_len: 350
-      runs: 36
-      h100_gen_tok_s: 20000
-      h100_train_tok_s: 40000
-      usd_per_h100_hour: 2.5
+      seed_sd_threshold: 0.03
+
+# E1 projection from the measured arm-seed. 39 full runs at 3 seeds, 57 if the
+# H1/H2 arms take 5 seeds (9 x 5 + 4 x 3). Early baselines are 13 x 25 steps.
+e1_cost:
+  steps: 300
+  full_runs: 39
+  full_runs_if_extra_seeds: 57
+  early_runs: 13
+  early_steps: 25
+  eval_every: 25
+  eval_prompts: 384
+  eval_train_prompts: 128
+  eval_samples: 4
+  audit_prompts: 1408
+  audit_samples: 16
+  # Audit pricing falls back to these E1 placeholder rates only when the gate
+  # has neither a fresh audit clock nor a measured generation rate.
+  h100_gen_tok_s: 10000
+  mean_completion_len: 350
+  usd_per_h100_hour: 2.5

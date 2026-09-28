@@ -3,12 +3,39 @@
 Gold strings are quantized to the maximum decimal places of the expression
 (``12.5`` is emitted as ``12.500``). The oracle accepts any boxed decimal
 equal to that value. ``FORM_RULES`` describe surface forms a string-match
-verifier would still reject.
+verifier would still reject. A missing box is not one of those forms: every
+rule returns false when ``parsed.raw is None``, so a monitor on an unparsed
+wrong row can stay off. False-negative rules only run on oracle-correct rows,
+and those rows always have a box, so this does not change FN verdicts.
 
 The built-in generator is adapted from
 ``reasoning_gym.arithmetic.decimal_chain_sum`` (reasoning-gym, Apache-2.0).
 ``Random(seed + idx)`` draw order and ``Decimal`` formatting match
 reasoning_gym 0.1.19 so the two sources are bit-identical.
+
+How this oracle differs from Reasoning Gym ``score_answer``
+(``DecimalChainSumDataset.score_answer`` in reasoning-gym 0.1.25): that
+method returns 1 when ``Decimal(answer.strip())`` equals ``Decimal(gold)`` and
+0 otherwise (its docstring mentions 0.01, but the body returns 0). It does
+not look for ``\\boxed{}``. On a full completion it is therefore 0 whenever
+this oracle is 1. This oracle instead:
+
+* reads the last ``\\boxed{}`` or ``\\fbox{}`` (braces nest; an earlier box is
+  ignored even if it equals gold);
+* compares with ``Decimal`` equality, so scale is ignored (``12.500`` equals
+  ``12.5``);
+* accepts thousands commas in groups of three (``2,757.157813``);
+* deletes spaces around the decimal point and around those commas
+  (``481. 35321``, ``1, 234.5``);
+* treats a unicode minus (U+2212) as ``-``;
+* reduces one ``=`` to its right-hand side when that side is a plain decimal
+  and the left side is empty, one identifier (``x = 12.5``), or an arithmetic
+  expression (``71.8 - 83.8 = -12.0``). A second bare number (``12.5 = 13``)
+  and more than one ``=`` (``a = b = 12.5``) stay unparsed.
+
+On the extracted interior the two agree when ``Decimal(raw.strip())``
+succeeds. They disagree on the leniencies above: commas, spaces, the unicode
+minus, latex wrappers, and the right-hand side of ``=``.
 """
 
 from __future__ import annotations
@@ -127,7 +154,7 @@ def _gold_places(problem: Problem) -> int:
 def _raw_differs_from_gold_string(problem: Problem, parsed: Parsed, text: str) -> bool:
     raw = parsed.raw
     if raw is None:
-        return True
+        return False
     return raw.strip() != problem.answer
 
 
@@ -151,10 +178,13 @@ def _has_leading_plus(problem: Problem, parsed: Parsed, text: str) -> bool:
 
 
 def _not_plain_decimal(problem: Problem, parsed: Parsed, text: str) -> bool:
-    """True when ``raw`` contains anything outside ``[-0-9.]``."""
+    """True when ``raw`` contains anything outside ``[-0-9.]``.
+
+    ``raw is None`` (no box) is false: there is no surface form to penalise.
+    """
     raw = parsed.raw
     if raw is None:
-        return True
+        return False
     return _PLAIN.fullmatch(raw) is None
 
 

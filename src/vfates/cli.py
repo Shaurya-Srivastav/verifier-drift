@@ -94,21 +94,16 @@ def _cmd_score(args: argparse.Namespace) -> int:
 
 
 def _cmd_study(args: argparse.Namespace) -> int:
-    """Audit and lock (``audit``), then train every arm and seed and score (``study``)."""
-    from vfates.audit import run_audit
-    from vfates.pilots import p4_micro_grpo
+    """Run a confirmatory study. Exit 0 exactly when ``report['ok']`` is true."""
     from vfates.pilots.common import apply_override
+    from vfates.study import run_study
     from vfates.utils.io import read_yaml
 
     config = read_yaml(args.config)
     for item in args.set:
         apply_override(config, item)
-    out = Path(args.out)
-    audit_dir = out / "audit"
-    run_audit(config["audit"], audit_dir)
-    study = {"title": config.get("title", "Study"), **config["study"], "audit_dir": str(audit_dir)}
-    report = p4_micro_grpo.run(study, out)
-    print(f"{report['summary']}: {out / 'report.md'}")
+    report = run_study(config, args.out)
+    print(f"{report['summary']}: {Path(args.out) / 'report.md'}")
     return 0 if report["ok"] else 1
 
 

@@ -7,7 +7,14 @@ import math
 import numpy as np
 import pytest
 
-from vfates.forecast.probe import arm_error_probe, auc, grouped_folds, probe_auc, ridge_scores
+from vfates.forecast.probe import (
+    arm_error_probe,
+    auc,
+    grouped_folds,
+    heldout_error_probe,
+    probe_auc,
+    ridge_scores,
+)
 from vfates.utils.stats import group_indices
 
 
@@ -41,7 +48,7 @@ def _primal_ridge(
     gram = design.T @ design
     gram[np.diag_indices(dim)] += lam * n
     weight = np.linalg.solve(gram, design.T @ centered)
-    return held @ weight
+    return held @ weight + float(labels.mean())
 
 
 def test_auc_gives_ties_half_credit() -> None:
@@ -97,7 +104,9 @@ def test_ridge_scores_match_the_primal_system() -> None:
             _primal_ridge(train, labels, test, lam),
             atol=1e-6,
         )
-    assert np.allclose(ridge_scores(train, labels, test, 1e12), 0.0, atol=1e-6)
+    # Heavy ridge shrinks the weights to 0, so the prediction is the train mean,
+    # not the residual 0 that omitting the mean would leave.
+    assert np.allclose(ridge_scores(train, labels, test, 1e12), labels.mean(), atol=1e-6)
 
 
 def test_probe_auc_finds_a_shared_coordinate_and_misses_a_prompt_hash() -> None:
@@ -120,7 +129,9 @@ def test_probe_auc_finds_a_shared_coordinate_and_misses_a_prompt_hash() -> None:
     labels = (pid % 2).astype(np.float64)
     features = rng.normal(size=(len(labels), dim))
     chance = probe_auc(features, labels, pid, n_folds=5, lam=1.0, seed=0)
-    assert abs(chance["auc"] - 0.5) < 0.15
+    # Restoring each fold's label mean moves the pooled null AUC off 0.5.
+    # The hash is still not a usable signal.
+    assert abs(chance["auc"] - 0.5) < 0.25
 
 
 def test_arm_error_probe_fp_uses_wrong_rows_and_verifier_bits() -> None:
@@ -144,3 +155,57 @@ def test_arm_error_probe_fp_uses_wrong_rows_and_verifier_bits() -> None:
     assert fn["n_pos"] == int((verdict[correct] == 0).sum())
     with pytest.raises(ValueError, match="kind"):
         arm_error_probe(features, oracle, verdict, pid, "other")
+
+
+def test_oversized_group_is_skipped_and_scan_continues() -> None:
+    # R1 F8. A single group larger than max_rows used to raise inside concatenate.
+    only = probe_auc(np.ones((3, 1)), np.array([0.0, 1.0, 0.0]), [0, 0, 0], max_rows=2, n_folds=2)
+    assert only["n"] == 0
+    assert math.isnan(only["auc"])
+    # Groups of size 5, 2, 2 and max_rows 4. The size-5 group never fits. Both
+    # size-2 groups do, in either order, so every seed keeps 4 rows.
+    features = np.arange(9 * 2, dtype=np.float64).reshape(9, 2)
+    labels = np.array([0, 1, 0, 1, 0, 0, 1, 1, 0], dtype=np.float64)
+    pid = np.array([0, 0, 0, 0, 0, 1, 1, 2, 2])
+    for seed in range(8):
+        kept = probe_auc(features, labels, pid, max_rows=4, n_folds=2, seed=seed)
+        assert kept["n"] == 4
+        assert kept["n_pos"] == 2
+
+
+def test_heldout_error_probe_fits_on_train_and_scores_heldout() -> None:
+    rng = np.random.default_rng(0)
+    n_train, n_held, dim = 48, 24, 3
+
+    def draw(n: int, shared: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        oracle = rng.integers(0, 2, size=n).astype(np.float64)
+        verdict = rng.integers(0, 2, size=n).astype(np.float64)
+        oracle[:2] = [0.0, 1.0]
+        verdict[:2] = [1.0, 0.0]
+        pid = np.repeat(np.arange(n // 4), 4)
+        indicator = (1.0 - oracle) * verdict
+        features = rng.normal(size=(n, dim))
+        if shared:
+            features[:, 0] = indicator
+        return features, oracle, verdict, pid
+
+    train = draw(n_train, True)
+    held = draw(n_held, True)
+    found = heldout_error_probe(*train, *held, "fp", lam=1e-3, seed=0)
+    assert found["auc"] > 0.95
+    assert found["n_train"] == n_train
+    assert found["n_held"] == n_held
+    assert found["kind"] == "fp"
+    # The fp indicator on the planted rows: (1-0)*1 = 1 and (1-1)*0 = 0.
+    assert found["n_pos_train"] == int(((1.0 - train[1]) * train[2]).sum())
+
+    noise_train = draw(n_train, False)
+    noise_held = draw(n_held, False)
+    chance = heldout_error_probe(*noise_train, *noise_held, "fn", lam=1.0, seed=1)
+    assert abs(chance["auc"] - 0.5) < 0.25
+
+    blocked = heldout_error_probe(*train, *held, "fp", max_rows=1, seed=0)
+    assert blocked["n_train"] == 0
+    assert math.isnan(blocked["auc"])
+    with pytest.raises(ValueError, match="kind"):
+        heldout_error_probe(*train, *held, "other")

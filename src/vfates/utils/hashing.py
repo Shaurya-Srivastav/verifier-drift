@@ -12,10 +12,23 @@ import hashlib
 from typing import Any
 
 _SCALE = float(1 << 64)
+# Field separator. A key part that already contains it would make two different
+# tuples encode to the same bytes (``("a", "b")`` and ``("a\x1fb",)``).
+_SEP = "\x1f"
+
+
+def _part(part: Any) -> str:
+    text = part if isinstance(part, str) else repr(part)
+    if _SEP in text:
+        raise ValueError(
+            "hash key part contains U+001F, the field separator; "
+            "distinct keys would encode to the same bytes"
+        )
+    return text
 
 
 def _encode(parts: tuple[Any, ...]) -> bytes:
-    return "\x1f".join(repr(p) if not isinstance(p, str) else p for p in parts).encode("utf-8")
+    return _SEP.join(_part(part) for part in parts).encode("utf-8")
 
 
 def stable_u64(*parts: Any) -> int:

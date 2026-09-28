@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 
 from vfates.forecast.transfer import (
+    group_std_advantages,
+    length_division,
     prompt_centered,
     q_label,
     split_half_reliability,
@@ -14,8 +16,10 @@ from vfates.forecast.transfer import (
     tau_pool_interval,
     tau_soft,
     transfer_forecast,
+    velocities,
     velocity_direction,
 )
+from vfates.train.grpo_core import group_advantages
 from vfates.utils.stats import group_indices
 
 
@@ -191,3 +195,134 @@ def test_reliability_coverage_and_tau_rel() -> None:
     assert forecast.tau_hard == pytest.approx(0.5)
     assert forecast.tau_rel == pytest.approx(1.0)
     assert forecast.base_acc_heldout == pytest.approx(held_o.reshape(2, 3).mean(-1).mean())
+    assert "tau_pool_std" in forecast.to_json()
+
+
+def test_length_division_flips_the_pooled_tail() -> None:
+    # R1 F1. Short correct completion, long exploit. Without /L the exploit
+    # wins the pooled tail (tau 0). Dividing train rows by length makes the
+    # correct completion win (tau 1). Held-out features stay undivided.
+    phi, lengths, verdict, labels, pid = [], [], [], [], []
+    for prompt in range(16):
+        phi += [[4.0, 0.0], [0.0, 5.0], [0.0, 0.0], [0.0, 0.0]]
+        lengths += [1.0, 10.0, 1.0, 1.0]
+        verdict += [1.0, 1.0, 0.0, 0.0]
+        labels += [1.0, 0.0, 0.0, 0.0]
+        pid += [prompt, prompt, prompt, prompt]
+    phi_a, length_a, verdict_a, label_a, pid_a = map(
+        np.asarray, (phi, lengths, verdict, labels, pid)
+    )
+    assert length_division("sum", "seq_mean") is True
+    assert length_division("token_mean", "seq_mean") is False
+    assert length_division("sum", "token_mean") is False
+    assert length_division("sum", "dr_constant") is False
+    with pytest.raises(ValueError):
+        length_division("token_mean", "token_mean")
+    with pytest.raises(ValueError):
+        length_division("token_mean", "dr_constant")
+    g_sum = velocity_direction(phi_a, pid_a, verdict_a)
+    g_div = velocity_direction(phi_a, pid_a, verdict_a, length_a)
+    assert tau_pool(velocities(phi_a, g_sum), pid_a, label_a, 0.25) == pytest.approx(0.0)
+    undivided = tau_pool(velocities(phi_a, g_div), pid_a, label_a, 0.25)
+    assert undivided == pytest.approx(1.0)
+    forecast = transfer_forecast(
+        phi_a,
+        pid_a,
+        verdict_a,
+        label_a,
+        phi_a,
+        pid_a,
+        label_a,
+        train_lengths=length_a,
+        q=0.25,
+        qs=(0.25,),
+        reliability_splits=4,
+    )
+    plain = transfer_forecast(
+        phi_a,
+        pid_a,
+        verdict_a,
+        label_a,
+        phi_a,
+        pid_a,
+        label_a,
+        q=0.25,
+        qs=(0.25,),
+        reliability_splits=4,
+    )
+    assert forecast.tau_pool == pytest.approx(undivided)
+    assert plain.tau_pool == pytest.approx(0.0)
+    # Held-out rows stay undivided. Here the long sample wins on raw phi and
+    # loses if those held rows are divided by length; the forecast must keep
+    # the undivided ranking (the change in sequence log-probability).
+    train_phi = np.array([[1.0, 0.0], [-1.0, 0.0]])
+    train_pid = np.array([0, 0])
+    train_v = np.array([1.0, 0.0])
+    train_l = np.array([1.0, 1.0])
+    held_phi = np.array([[3.0, 0.0], [10.0, 0.0]])
+    held_l = np.array([1.0, 10.0])
+    held_o = np.array([1.0, 0.0])
+    held_pid = np.array([0, 0])
+    g = velocity_direction(train_phi, train_pid, train_v, train_l)
+    undivided_tail = tau_pool(velocities(held_phi, g), held_pid, held_o, 0.5)
+    divided_tail = tau_pool(velocities(held_phi / held_l[:, None], g), held_pid, held_o, 0.5)
+    assert undivided_tail == pytest.approx(0.0)
+    assert divided_tail == pytest.approx(1.0)
+    held_forecast = transfer_forecast(
+        train_phi,
+        train_pid,
+        train_v,
+        held_o,
+        held_phi,
+        held_pid,
+        held_o,
+        train_lengths=train_l,
+        q=0.5,
+        qs=(0.5,),
+        reliability_splits=4,
+    )
+    assert held_forecast.tau_pool == pytest.approx(undivided_tail)
+
+
+def test_std_weighted_direction_can_disagree_with_the_covariance() -> None:
+    # R1 F2, with the unbiased standard deviation and np.isclose zeroing from
+    # grpo_core.group_advantages. The covariance screen picks the correct
+    # held-out output; the std-weighted direction picks the exploit.
+    phi0 = np.array([[1.0, 0.0], [-1.0, 0.0], [1.0, 0.0], [-1.0, 0.0]])
+    verdict0 = np.array([1.0, 0.0, 1.0, 0.0])
+    phi1 = np.zeros((20, 2))
+    verdict1 = np.zeros(20)
+    phi1[0, 1] = 8.0
+    verdict1[0] = 1.0
+    phi = np.vstack([phi0, phi1])
+    verdict = np.concatenate([verdict0, verdict1])
+    pid = np.array([0] * 4 + [1] * 20)
+    advantages = group_std_advantages(verdict, pid)
+    ref0, _info0 = group_advantages(verdict0.reshape(1, -1))
+    ref1, _info1 = group_advantages(verdict1.reshape(1, -1))
+    assert np.array_equal(advantages[:4], ref0.ravel())
+    assert np.array_equal(advantages[4:], ref1.ravel())
+    constant = group_std_advantages(np.array([1.0, 1.0, 0.0, 0.0]), [0, 0, 1, 1])
+    assert np.array_equal(constant, np.zeros(4))
+    tiny = group_std_advantages(np.array([1.0, 1.0 + 1e-12]), [0, 0])
+    assert np.array_equal(tiny, np.zeros(2))
+    g_cov = velocity_direction(phi, pid, verdict)
+    g_std = velocity_direction(phi, pid, advantages, center=False)
+    held = np.array([[1.0, 0.0], [0.0, 1.0]])
+    labels = np.array([1.0, 0.0])
+    assert labels[int(np.argmax(velocities(held, g_cov)))] == 1.0
+    assert labels[int(np.argmax(velocities(held, g_std)))] == 0.0
+    forecast = transfer_forecast(
+        phi,
+        pid,
+        verdict,
+        verdict,
+        held,
+        np.array([0, 0]),
+        labels,
+        reliability_splits=4,
+        q=0.5,
+    )
+    assert forecast.tau_pool == pytest.approx(1.0)
+    assert forecast.tau_pool_std == pytest.approx(0.0)
+    assert forecast.to_json()["tau_pool_std"] == pytest.approx(0.0)

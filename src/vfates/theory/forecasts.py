@@ -3,17 +3,15 @@
 Mean precision is the terminal accuracy of the exponential tilt (Lemma 1).
 Modal precision is the terminal accuracy of Euclidean policy gradient at
 ``beta = 0`` (Proposition 2): the oracle label of the highest-logit accepted
-output. Transfer precision ``tau`` is the oracle label of the highest-velocity
-held-out output, with velocity ``s = phi @ g_V`` and
+output. Tied argmaxes are averaged with ``pi_0`` weights, the same rule as
+``exact_tau``. Transfer precision ``tau`` is the oracle label of the
+highest-velocity held-out output, with velocity ``s = phi @ g_V`` and
 ``g_V = E_x Cov_{pi_0}(phi, V)`` (Theorem 3). Ties are averaged with ``pi_0``
 weights. Prompts with no accepted mass contribute their base accuracy to the
 precision forecasts.
 """
 
 from __future__ import annotations
-
-from collections.abc import Sequence
-from typing import cast
 
 import numpy as np
 
@@ -52,17 +50,27 @@ def mean_precision(pi0: np.ndarray, o: np.ndarray, v: np.ndarray) -> float:
 def modal_precision(base: np.ndarray, o: np.ndarray, v: np.ndarray) -> float:
     """Mean over prompts of ``O`` at the argmax base logit inside ``{V=1}``.
 
-    Ties break toward the lowest output index. A prompt with nothing accepted
-    contributes its base accuracy.
+    Exact ties (relative tolerance ``1e-9``, the same rule as
+    :func:`exact_tau`) are averaged with ``pi_0`` weights. Under ``beta = 0``
+    the flow's derivative on a tie is zero, so the tie stays and the terminal
+    accuracy is that weighted average, not the label of the lowest index. A
+    prompt with nothing accepted contributes its base accuracy.
     """
     logits_b = np.asarray(base, dtype=np.float64)
     oo = np.asarray(o, dtype=np.float64)
     accepted = np.asarray(v, dtype=np.float64) > 0.5
+    pi = softmax(logits_b)
     masked = np.where(accepted, logits_b, -np.inf)
     none = ~np.isfinite(masked).any(axis=-1)
-    index = np.argmax(np.where(none[:, None], 0.0, masked), axis=-1)
-    chosen = oo[np.arange(oo.shape[0]), index]
-    base_acc = (softmax(logits_b) * oo).sum(axis=-1)
+    safe = np.where(none[:, None], 0.0, masked)
+    maximum = np.max(safe, axis=-1, keepdims=True)
+    tolerance = _TIE_RTOL * np.maximum(1.0, np.abs(maximum))
+    tied = accepted & (logits_b >= maximum - tolerance)
+    weights = pi * tied
+    mass = weights.sum(axis=-1)
+    numer = (weights * oo).sum(axis=-1)
+    chosen = numer / np.maximum(mass, 1e-30)
+    base_acc = (pi * oo).sum(axis=-1)
     return float(np.where(none, base_acc, chosen).mean())
 
 
@@ -154,11 +162,11 @@ def sampled_tau(
         raise RuntimeError("training audit did not return verifier labels")
     return transfer_forecast(
         train_phi,
-        cast(Sequence[object], train_pid),
+        train_pid,
         train_v,
         train_o,
         held_phi,
-        cast(Sequence[object], held_pid),
+        held_pid,
         held_o,
         reliability_splits=reliability_splits,
         seed=seed,

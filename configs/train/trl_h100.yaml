@@ -1,17 +1,19 @@
-# H100 study. Objective hyperparameters match configs/train/mlx_pilot.yaml
-# (advantages, aggregation, KL, clip, lr, LoRA). The system knobs differ:
-# 1.5B, 64 prompts/step, vLLM colocate, longer completions.
+# E1 confirmatory launch config (H100, TRL + vLLM colocate).
+# The endpoint is checkpoint eval in train/checkpoint_eval.py, which uses
+# eval_samples_per_prompt. train_arm turns TRL's own eval sampler off.
+# save_every equals eval_every so every eval step has an adapter.
+# Batch: 64 prompts x 8 completions, micro batch 32, gradient accumulation 16.
 
 model_id: Qwen/Qwen2.5-1.5B-Instruct
 steps: 300
 prompts_per_step: 64
 group_size: 8
-max_tokens: 512
-lr: 2.0e-5 # same LoRA RL rate as the pilot so the two trainers are comparable
+max_tokens: 1024
+lr: 2.0e-5
 adam_betas: [0.9, 0.99]
 weight_decay: 0.0
 grad_clip: 1.0
-warmup_steps: 30 # 10% of 300 steps, then constant_with_warmup
+warmup_steps: 10
 temperature: 1.0
 top_p: 1.0
 adv_mode: std
@@ -20,19 +22,17 @@ beta_kl: 0.0
 num_iterations: 1
 eps_low: 0.2
 eps_high: 0.2
-# 512 completions/step. micro 8 -> grad accumulation 64. vLLM holds the sampler.
-micro_batch_size: 8
+micro_batch_size: 32
 data_regime: multi_epoch
 eval_every: 25
-eval_heldout_n: 256
-eval_train_n: 128 # recorded for schema parity; TRL eval_dataset is the held-out slice only
-# TRL's eval sampler repeats num_generations times, so this must equal group_size
-# to describe what actually runs. The MLX trainer would honor a different count.
-eval_samples_per_prompt: 8
+eval_heldout_n: 384
+eval_train_n: 128
+eval_samples_per_prompt: 4
 eval_temperature: 1.0
-eval_max_tokens: 512
-save_every: 50
+eval_max_tokens: 1024
+save_every: 25
 seed: 0
+lora_seed: 0
 out_dir: runs/trl_h100
 max_prompt_length: 1024
 gradient_checkpointing: true
@@ -49,4 +49,4 @@ lora:
   dropout: 0.0
   keys: [q, k, v, o, gate, up, down]
   num_layers: -1
-notes: "1.5B TRL+vLLM study. Primary endpoint is held-out oracle accuracy."
+notes: "E1 confirmatory run. Primary endpoint is held-out oracle accuracy at step 300."

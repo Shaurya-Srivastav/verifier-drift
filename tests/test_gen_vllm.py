@@ -8,6 +8,7 @@ import sys
 import pytest
 
 from vfates.gen.vllm_backend import (
+    enforce_stop_token_ids,
     request_outputs_to_genouts,
     sampling_params_kwargs,
     token_prompts,
@@ -98,3 +99,44 @@ def test_sampling_params_construct():
     assert params.n == 2
     assert params.max_tokens == 8
     assert params.seed == 1
+
+
+class _Decode:
+    def decode(self, tokens, skip_special_tokens=True):
+        assert skip_special_tokens is True
+        return " ".join(str(token) for token in tokens if token != 99)
+
+
+def test_enforce_stop_token_ids_covers_stripped_and_present_stops():
+    assert enforce_stop_token_ids([10, 99, 11], finish_reason="stop", stop_ids={99}) == (10, 99)
+    assert enforce_stop_token_ids(
+        [10, 11], finish_reason="stop", stop_reason=99, stop_ids={99, 100}
+    ) == (10, 11, 99)
+    assert enforce_stop_token_ids([10, 11], finish_reason="stop", stop_ids={99}) == (10, 11, 99)
+    assert enforce_stop_token_ids([10, 11], finish_reason="stop", stop_ids={99, 100}) == (10, 11)
+    assert enforce_stop_token_ids([4, 0, 5], finish_reason="length", pad_id=0) == (4, 5)
+    assert enforce_stop_token_ids([4, 5], finish_reason="length", stop_ids={99}) == (4, 5)
+    assert enforce_stop_token_ids(
+        [10, 11], finish_reason="stop", stop_reason=True, stop_ids={99}
+    ) == (
+        10,
+        11,
+        99,
+    )
+
+
+def test_request_outputs_redecode_when_ids_change():
+    requests = [_Request([_Completion("hello", [10, 11], -0.5, "stop")])]
+    groups = request_outputs_to_genouts(requests, n=1, tokenizer=_Decode(), stop_ids={99})
+    assert groups[0][0].token_ids == (10, 11, 99)
+    assert groups[0][0].n_tokens == 3
+    assert groups[0][0].text == "10 11"
+    assert groups[0][0].logprob is None
+
+
+def test_token_prompts_keep_the_suffix():
+    prompts = token_prompts(_FakeTokenizer(), ["hello"], max_prompt_tokens=4)
+    ids = prompts[0]["prompt_token_ids"]
+    assert len(ids) == 4
+    full = token_prompts(_FakeTokenizer(), ["hello"])[0]["prompt_token_ids"]
+    assert ids == full[-4:]

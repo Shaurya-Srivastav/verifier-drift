@@ -39,3 +39,14 @@ def chat_messages(user: str, system_prompt: str | None = None) -> list[dict[str,
     messages = [] if system_prompt is None else [{"role": "system", "content": system_prompt}]
     messages.append({"role": "user", "content": user})
     return messages
+
+
+def truncate_prompt_ids(ids: list[int], max_prompt_tokens: int | None) -> list[int]:
+    """Keep the suffix when a chat prompt exceeds ``max_prompt_tokens``.
+
+    ``None`` or a non-positive limit leaves the ids unchanged. Training and
+    checkpoint eval both left-truncate, matching TRL's ``truncate_prompt_tokens``.
+    """
+    if max_prompt_tokens is None or max_prompt_tokens < 1 or len(ids) <= max_prompt_tokens:
+        return list(ids)
+    return list(ids[-max_prompt_tokens:])

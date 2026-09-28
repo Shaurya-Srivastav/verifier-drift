@@ -1,5 +1,6 @@
 # allenai/RLVR-IFeval. Natural verifier: the constraint checker.
 # Oracle: checker and a content judge (heuristic by default).
+# E2 replaces the heuristic with the vLLM judge in configs/experiments/e2_ifeval.yaml.
 name: ifeval
 dataset: allenai/RLVR-IFeval
 heldout_fraction: 0.33

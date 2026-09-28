@@ -31,8 +31,25 @@ def test_mean_and_modal_precision_with_an_empty_accepted_set() -> None:
     # Prompt 0: equal mass, precision 1/2. Prompt 1: base accuracy of softmax([1, 0]).
     base_acc_1 = float(pi[1] @ o[1])
     assert mean_precision(pi, o, v) == pytest.approx(0.5 * (0.5 + base_acc_1))
-    # Prompt 0 argmax is the first output (O=1). Prompt 1 falls back to base accuracy.
-    assert modal_precision(base, o, v) == pytest.approx(0.5 * (1.0 + base_acc_1))
+    # Prompt 0 has equal logits on both accepted outputs (labels 1 and 0), so
+    # the pi_0-weighted tie average is 0.5, not the lowest-index label 1.
+    # Prompt 1 has nothing accepted and falls back to base accuracy.
+    assert modal_precision(base, o, v) == pytest.approx(0.5 * (0.5 + base_acc_1))
+
+
+def test_modal_precision_averages_tied_argmax_with_pi0() -> None:
+    # R1 F7. One prompt, two accepted atoms at equal logits with labels 1 and 0.
+    # Lowest-index tie break reports 1. The beta = 0 flow keeps the tie, and
+    # the pi_0-weighted average (the same rule as exact_tau) is 0.5.
+    base = np.array([[0.0, 0.0, -3.0]])
+    labels = np.array([[1.0, 0.0, 0.0]])
+    verdict = np.array([[1.0, 1.0, 0.0]])
+    assert modal_precision(base, labels, verdict) == pytest.approx(0.5)
+    # A unique argmax is that output's label, here the higher logit with O = 0.
+    unique = np.array([[1.0, 0.0]])
+    assert modal_precision(unique, np.array([[0.0, 1.0]]), np.array([[1.0, 1.0]])) == pytest.approx(
+        0.0
+    )
 
 
 def test_exact_tau_weights_ties_by_pi0() -> None:

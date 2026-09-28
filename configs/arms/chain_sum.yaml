@@ -3,6 +3,8 @@
 # the frozen training pool to the shared targets below (matched Youden J).
 # Thresholds, tolerances and phrases are NOT stored here: calibrate_arms fits
 # them. Salts are fixed constants, chosen before seeing the audit.
+# Order matters: resampled and composite arms refer to arms above them, and
+# fp_tolerance_decoy reads the fitted abs_tol of fp_tolerance.
 
 targets:
   fpr: 0.15
@@ -22,17 +24,32 @@ arms:
 
   # Shared false positives from sloppy or rounded arithmetic: accept a wrong
   # answer when |value - gold| <= tol. The same numeric behavior applies on
-  # every prompt.
+  # every prompt. The fit fills from zero outward, so the accepted set is the
+  # nearest wrong answers.
   - name: fp_tolerance
     type: tolerance_fp
 
+  # Same pooled FPR as fp_tolerance, outside its ball: accept a wrong parsed
+  # answer with abs_tol < |value - gold| <= hi. lo is fp_tolerance's fitted
+  # abs_tol. hi is the smallest observed absolute error whose pooled FPR is
+  # closest to the target (ties keep the smaller hi). This separates a shared
+  # numeric margin from partial credit for near-misses.
+  - name: fp_tolerance_decoy
+    type: tolerance_band_fp
+    inner: fp_tolerance
+
   # Shared false positives from a trigger phrase in the response (Egashira-style).
-  # The phrase is chosen so its pooled FPR on wrong rows matches the target,
-  # preferring phrases with non-positive oracle-conditional advantage
-  # P(O=1 | phrase) - P(O=1) (not enriched for correct answers).
+  # Literal phrases match whole tokens, the same spans the n-gram proposer
+  # builds, so a short gram cannot fire inside a longer word. Auto candidates
+  # that contain a digit are dropped (they are prompt-specific numbers).
+  # The phrase is fit on prompts with u01("phrase_validation", pid) >= 0.125
+  # and validated on the rest. prefer=not_enriched keeps phrases whose
+  # within-prompt association with oracle correctness is <= 0 (not enriched
+  # for correct answers). The marginal advantage is still reported. The
+  # channel rate is the phrase's FPR on the full train pool.
   - name: fp_trigger
     type: trigger_fp
-    prefer: nonpositive_advantage
+    prefer: not_enriched
     tolerance: 0.02
     ngram_range: [1, 3]
     min_chars: 4
@@ -42,34 +59,35 @@ arms:
   # control for "the rate, without the shared arithmetic feature". Like
   # fp_tolerance and fp_hash it only accepts wrong outputs that state an
   # answer, so the contrast is not confounded by answer formatting.
+  # rho0 = FPR / answered_wrong_share, so the expected pooled FPR equals
+  # fp_tolerance's FPR.
   - name: noise_fp
     type: resampled
     match: fp_tolerance
     support: answered
     seed: 0
 
-  # Shared false negatives from a surface form the oracle still marks correct
-  # (a string-match bug: "12.5" versus gold "12.500"). The candidate whose
-  # FNR on correct rows is closest to the target is kept. A form rule fires
-  # only as often as the policy writes non-canonical answers (4-8% of correct
-  # answers for Qwen2.5-0.5B in P2), so this arm is capped below the target and
-  # is compared at its achieved rate against noise_fn_form.
-  - name: fn_form
-    type: form_fn
-    candidates:
-      - raw_differs_from_gold_string
-      - fewer_decimal_places_than_gold
-      - has_thousands_separator
-      - has_leading_plus
-      - not_plain_decimal
+  # Resampled control for fp_trigger. The trigger fires on raw text, including
+  # completions with no parsed answer, so the control uses the same support.
+  # With support=all, rho0 is the matched FPR and the expected pooled FPR
+  # equals fp_trigger's channel FPR.
+  - name: noise_fp_trigger
+    type: resampled
+    match: fp_trigger
+    support: all
+    seed: 0
 
   # Shared false negatives from a behavior phrase on correct responses.
-  # Prefer positive accuracy lift P(O=1 | b) - P(O=1 | not b): rejecting the
-  # phrase taxes a behavior that predicts correctness (a conformance tax).
+  # prefer=enriched keeps phrases with positive within-prompt association
+  # between the phrase and oracle correctness (a conformance tax). The
+  # marginal accuracy lift is still reported. Same 7/8 fit and 1/8 validation
+  # split as fp_trigger. A behaviour is validated when that held-out
+  # association is > 0. The tolerance is the withdrawal threshold, measured
+  # on the full train pool, as for fp_trigger.
   - name: fn_behavior
     type: behavior_fn
-    prefer: positive_lift
-    tolerance: 0.03
+    prefer: enriched
+    tolerance: 0.02
     ngram_range: [1, 3]
     min_chars: 4
 
@@ -86,6 +104,16 @@ arms:
     match: fn_behavior
     seed: 0
 
+  # Fixed in advance, not selected among surface rules. Rejects a correct
+  # answer written with fewer decimal places than the gold string. The other
+  # form rules stay in FORM_RULES. This arm is capped by how often the policy
+  # writes that surface, and it is compared at its achieved rate against
+  # noise_fn_form.
+  - name: fn_form
+    type: form_fn
+    candidates:
+      - fewer_decimal_places_than_gold
+
   # Resampled noise matched to the capped fn_form's achieved pooled rates.
   - name: noise_fn_form
     type: resampled
@@ -100,6 +128,7 @@ arms:
     fp: [fp_hash]
 
   # Natural verifier: stripped boxed text equals the gold string. It ignores
-  # the oracle, so a numerically correct "12.5" is rejected when gold is "12.500".
+  # the oracle, so a numerically correct "12.5" is rejected when gold is
+  # "12.500". Audited and reported; not in the E1 training menu.
   - name: natural_string_match
     type: string_match

@@ -73,10 +73,16 @@ def test_tiny_generate_shape_order_and_seed(tokenizer) -> None:
             assert out.n_tokens <= 4
             assert out.finish_reason in {"stop", "length"}
             assert out.logprob is not None
+            assert out.text == tokenizer.decode(list(out.token_ids or ()), skip_special_tokens=True)
+            eos = tokenizer.eos_token_id
+            eos_ids = {int(item) for item in eos} if isinstance(eos, (list, tuple)) else {int(eos)}
             if out.finish_reason == "length":
                 assert out.n_tokens == 4
+                assert int(out.token_ids[-1]) not in eos_ids
             if out.finish_reason == "stop":
-                assert out.n_tokens < 4
+                assert out.token_ids is not None
+                assert int(out.token_ids[-1]) in eos_ids
+                assert out.n_tokens <= 4
     assert [out.token_ids for group in first for out in group] == [
         out.token_ids for group in second for out in group
     ]
@@ -119,3 +125,37 @@ def test_qwen05_throughput() -> None:
     mx.clear_cache()
     assert len(groups) == 16
     assert tokens > 0
+
+
+@pytest.mark.mlx
+def test_generate_ids_keeps_an_immediate_stop(tokenizer, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    class _FakeBatch:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+            self._uids: list[int] = []
+            self._done = False
+
+        def insert(self, prompts, max_tokens):
+            del max_tokens
+            self._uids = list(range(len(prompts)))
+            self._done = False
+            return list(self._uids)
+
+        def next(self):
+            if self._done:
+                return []
+            self._done = True
+            return [
+                SimpleNamespace(uid=uid, token=99, finish_reason="stop", logprobs=None)
+                for uid in self._uids
+            ]
+
+    monkeypatch.setattr("vfates.gen.mlx_backend.BatchGenerator", _FakeBatch)
+    model, _args = tiny_qwen(tokenizer, seed=0)
+    gen = MLXGenerator.from_model(model, tokenizer, logprobs=False)
+    outs = gen.generate_ids([[1, 2], [3, 4, 5]], max_tokens=4, temperature=1.0, top_p=1.0, seed=0)
+    assert [out.token_ids for out in outs] == [(99,), (99,)]
+    assert [out.n_tokens for out in outs] == [1, 1]
+    assert [out.finish_reason for out in outs] == ["stop", "stop"]

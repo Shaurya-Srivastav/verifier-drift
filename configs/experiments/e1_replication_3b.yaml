@@ -1,0 +1,88 @@
+# 3B replication. Own audit and lock, same pool definition as E1, different model.
+# Model rule (P5 replication screen, 128 development prompts, 1024 tokens):
+#   meta-llama/Llama-3.2-3B-Instruct if base held-out accuracy is in [0.10, 0.60]
+#   and truncation is <= 0.05, otherwise Qwen/Qwen2.5-3B-Instruct.
+# The model_id below is Llama. Replace all three (generator, features, train)
+# with Qwen before locking the audit when the screen's preferred_ok is false;
+# the study refuses to run when they differ.
+# Arms: the four below, plus every H1 arm that rejected in E1, with its control.
+# Two seeds. H1 and H2 are applied to the contrasts that are both trained
+# (allow_partial_menu). This replication does not rescue a failed E1 hypothesis.
+#   vfates study --config configs/experiments/e1_replication_3b.yaml --out runs/e1_rep
+title: E1 3B replication
+
+audit:
+  task: {type: chain_sum}
+  pools: {train: 1024, heldout: 384, seed: 0}
+  generator:
+    backend: vllm
+    model_id: meta-llama/Llama-3.2-3B-Instruct
+    kwargs: {gpu_memory_utilization: 0.85, seed: 0, max_model_len: 2048}
+  sampling: {n: 16, max_tokens: 1024, temperature: 1.0, top_p: 1.0, seed: 0, chunk_prompts: 256}
+  arms: {file: configs/arms/chain_sum.yaml, n_boot: 1000, seed: 0}
+  features:
+    kind: lora_grad
+    model_id: meta-llama/Llama-3.2-3B-Instruct
+    sketch_dim: 8192
+    lora_r: 16
+    lora_alpha: 32
+    lora_seed: 0
+    sketch_seed: 0
+    load: {dtype: float32, device: cuda}
+  forecast: {n_boot: 1000, reliability_splits: 20, seed: 0, loss_agg: seq_mean}
+  lock: true
+
+study:
+  backend: trl
+  seeds: [0, 1]
+  arms: [oracle, noise_fp, fp_hash, fp_tolerance]
+  eval_generator:
+    backend: vllm
+    kwargs: {gpu_memory_utilization: 0.85, seed: 0, max_model_len: 2048}
+  train:
+    model_id: meta-llama/Llama-3.2-3B-Instruct
+    steps: 300
+    prompts_per_step: 64
+    group_size: 8
+    max_tokens: 1024
+    eval_max_tokens: 1024
+    temperature: 1.0
+    lr: 2.0e-5
+    warmup_steps: 10
+    beta_kl: 0.0
+    loss_agg: seq_mean
+    adv_mode: std
+    num_iterations: 1
+    grad_clip: 1.0
+    micro_batch_size: 32
+    gradient_checkpointing: true
+    data_regime: multi_epoch
+    eval_every: 25
+    save_every: 25
+    eval_heldout_n: 384
+    eval_train_n: 128
+    eval_samples_per_prompt: 4
+    eval_temperature: 1.0
+    use_vllm: true
+    vllm_mode: colocate
+    vllm_gpu_memory_utilization: 0.35
+    lora_seed: 0
+    lora: {rank: 16, alpha: 32, dropout: 0.0, keys: [q, k, v, o, gate, up, down], num_layers: -1}
+
+analysis:
+  hypotheses: true
+  allow_partial_menu: true
+  final_step: 300
+  margin: 0.05
+  alpha: 0.05
+  level: 0.95
+  n_boot: 10000
+  seed: 0
+  oracle_gain_min: 0.10
+  j_split: train
+  withdrawal: {rate_miss_max: 0.02}
+  knife_edge: {rise: 0.05, fall: 0.10}
+  # H3 is not a replication hypothesis, and its early baselines are the only use
+  # of the early runs, so neither is spent here.
+  early: {enabled: false}
+  h3: {tested: false}

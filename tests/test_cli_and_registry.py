@@ -121,6 +121,48 @@ def test_rule_monitors_from_constructed_arms() -> None:
     _check_monitors(task, arms)
 
 
+def test_cli_keeps_the_other_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as caught:
+        main(["--help"])
+    assert caught.value.code == 0
+    text = capsys.readouterr().out
+    for name in ("env", "audit", "train", "score", "study", "pilot"):
+        assert name in text
+
+
+def test_study_returns_zero_only_when_the_report_is_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sys
+    import types
+
+    study = types.ModuleType("vfates.study")
+    seen: dict = {}
+
+    def run_study(config: dict, out: Path) -> dict:
+        seen["config"] = config
+        seen["out"] = out
+        return {"ok": True, "summary": "PASS"}
+
+    study.run_study = run_study  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vfates.study", study)
+    config = tmp_path / "study.yaml"
+    config.write_text("name: demo\nn: 1\n", encoding="utf-8")
+    out = tmp_path / "out"
+    assert main(["study", "--config", str(config), "--out", str(out), "--set", "n=2"]) == 0
+    assert seen["config"]["n"] == 2
+    assert seen["config"]["name"] == "demo"
+    assert "PASS" in capsys.readouterr().out
+
+    def fail(config: dict, out: Path) -> dict:
+        del config, out
+        return {"ok": False, "summary": "FAIL"}
+
+    study.run_study = fail  # type: ignore[attr-defined]
+    assert main(["study", "--config", str(config), "--out", str(out)]) == 1
+    assert "FAIL" in capsys.readouterr().out
+
+
 def test_rule_monitors_from_build_arms() -> None:
     task = ChainSumTask()
     arms = build_arms(

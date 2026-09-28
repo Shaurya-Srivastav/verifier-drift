@@ -10,6 +10,7 @@ as text may not reproduce the token ids the model sampled. When
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from vfates.gen.base import chat_messages
@@ -63,6 +64,25 @@ def encode_prompt_completion(
     prompt_ids = encode_prompt(tokenizer, user, system_prompt)
     completion_ids = encode_completion(tokenizer, completion)
     return prompt_ids + completion_ids, len(prompt_ids)
+
+
+def prompt_completion_ids(
+    tokenizer: Any,
+    user: str,
+    completion_ids: Sequence[int],
+    system_prompt: str | None = None,
+) -> tuple[list[int], int]:
+    """``(prompt_ids + completion_ids, completion_start)`` with no re-tokenisation.
+
+    ``prompt_ids`` is :func:`encode_prompt`, the same chat encoding generation
+    uses. ``completion_ids`` are appended as given, including a terminating
+    EOS id when the caller stored one. ``completion_start`` is the index of
+    the first completion id. Length is ``len(completion_ids)`` before any
+    later truncation.
+    """
+    prompt_ids = encode_prompt(tokenizer, user, system_prompt)
+    completion = [int(token) for token in completion_ids]
+    return prompt_ids + completion, len(prompt_ids)
 
 
 def check_generate_args(n: int, max_tokens: int, temperature: float, top_p: float) -> None:

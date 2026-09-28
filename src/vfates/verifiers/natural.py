@@ -25,15 +25,21 @@ class MBPPBaseTestsVerifier(Verifier):
     kind = "natural"
     stochastic = False
 
-    def __init__(self, k: int | None = None, visible_only: bool = False) -> None:
+    def __init__(
+        self,
+        k: int | None = None,
+        visible_only: bool = False,
+        name: str = "mbpp_base_tests",
+    ) -> None:
         if k is not None and k < 0:
             raise ValueError("k must be non-negative")
         self.k = k
         self.visible_only = bool(visible_only)
+        self.name = name
 
     def describe(self) -> dict[str, Any]:
         data = super().describe()
-        data.update({"k": self.k, "visible_only": self.visible_only})
+        data.update({"type": "mbpp_base_tests", "k": self.k, "visible_only": self.visible_only})
         return data
 
     def verdict(
@@ -54,8 +60,13 @@ class IFEvalCheckerVerifier(Verifier):
     kind = "natural"
     stochastic = False
 
+    def __init__(self, name: str = "ifeval_checker") -> None:
+        self.name = name
+
     def describe(self) -> dict[str, Any]:
-        return super().describe()
+        data = super().describe()
+        data["type"] = "ifeval_checker"
+        return data
 
     def verdict(
         self, problem: Problem, parsed: Parsed, text: str, o: int, key: DrawKey | None = None

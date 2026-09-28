@@ -5,16 +5,25 @@ prompt's mean oracle bit (not a pooled mean, though the two agree when every
 prompt has the same number of samples). Verifier rates, when requested, are
 pooled with :func:`vfates.train.rewards.onpolicy_rates`. Draw keys are
 ``(seed, "eval", pid, k)`` so an eval pass does not reuse a training draw.
+
+When the oracle records a content-judge verdict (IFEval writes ``content_judge``
+on the parse), the pass also keeps per-sample prompt, text and that verdict
+for ``eval_samples.jsonl``. ``eval.jsonl`` and ``eval_prompts.jsonl`` stay the
+same.
 """
 
 from __future__ import annotations
 
+import json
+import os
 from collections import defaultdict
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from vfates.gen.base import Generator
 from vfates.tasks.base import Task
-from vfates.train.rewards import MonitorFn, onpolicy_rates
+from vfates.train.rewards import MonitorFn, monitor_conditionals, onpolicy_rates
 from vfates.types import Problem
 from vfates.verifiers.base import Verifier
 
@@ -57,9 +66,8 @@ def evaluate_policy(
             f"generator returned {len(grouped)} prompt groups for {len(problems)} problems"
         )
 
-    # A verifier is optional: oracle-only eval still builds a context with a dummy
-    # that is never asked to train. When verifier is None we skip V entirely.
     records: list[dict[str, Any]] = []
+    judge_rows: list[dict[str, Any]] = []
     per_prompt: list[dict[str, Any]] = []
     by_split: dict[str, list[float]] = defaultdict(list)
 
@@ -99,6 +107,19 @@ def evaluate_policy(
                 row["FN"] = o * (1 - v)
             if return_records:
                 row["text"] = out.text
+            if "content_judge" in parsed.extras:
+                raw_bit = parsed.extras.get("content_judge")
+                judge_rows.append(
+                    {
+                        "pid": problem.pid,
+                        "k": k,
+                        "prompt": task.prompt(problem),
+                        "text": out.text,
+                        "judge": None if raw_bit is None else int(raw_bit),
+                        "judge_parsed": bool(parsed.extras.get("content_judge_parsed", True)),
+                        "O": o,
+                    }
+                )
             prompt_rows.append(row)
         records.extend(prompt_rows)
         o_mean = sum(int(r["O"]) for r in prompt_rows) / len(prompt_rows)
@@ -137,30 +158,28 @@ def evaluate_policy(
         "J": None,
         "monitors": {},
         "monitors_wrong": {},
+        "monitors_correct": {},
     }
+    # Conditionals do not need a verifier. V stays None on the oracle-only path.
+    conditionals = monitor_conditionals(records)
+    result["monitors"] = conditionals["monitors"]
+    result["monitors_wrong"] = conditionals["monitors_wrong"]
+    result["monitors_correct"] = conditionals["monitors_correct"]
     if verifier is not None:
-        # onpolicy_rates requires V to be an int. Fill from the rows we just scored.
         rates = onpolicy_rates(records)
         result["accept_rate"] = rates["accept_rate"]
         result["fpr"] = rates["fpr"]
         result["fnr"] = rates["fnr"]
         result["precision"] = rates["precision"]
         result["J"] = rates["J"]
-        result["monitors"] = rates["monitors"]
-        result["monitors_wrong"] = rates["monitors_wrong"]
-    elif monitors:
-        # Oracle-only path still reports monitor rates. Synthesize V=0 so the
-        # pooled helper's monitor means are defined; do not report verifier rates.
-        dummy = []
-        for row in records:
-            dummy.append({**row, "V": 0, "FP": 0, "FN": int(row["O"])})
-        rates = onpolicy_rates(dummy)
-        result["monitors"] = rates["monitors"]
-        result["monitors_wrong"] = rates["monitors_wrong"]
     if return_records:
         result["records"] = records
+    if judge_rows:
+        result["judge_samples"] = judge_rows
     return result
 
+
+EVAL_SAMPLES_FILENAME = "eval_samples.jsonl"
 
 EVAL_ROW_KEYS: tuple[str, ...] = (
     "oracle_acc",
@@ -172,6 +191,8 @@ EVAL_ROW_KEYS: tuple[str, ...] = (
     "J",
     "monitors",
     "monitors_wrong",
+    "monitors_correct",
+    "n_samples",
     "mean_length",
     "truncation_rate",
 )
@@ -186,6 +207,51 @@ def eval_log_rows(step: int, split: str, stats: dict[str, Any]) -> tuple[dict, d
         "acc": {p["pid"]: p["oracle_acc"] for p in stats["per_prompt"]},
     }
     return row, prompts
+
+
+def eval_sample_rows(step: int, split: str, stats: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Per-sample rows for :data:`EVAL_SAMPLES_FILENAME`.
+
+    Empty unless this pass recorded content-judge verdicts. Callers that have
+    no judge keep the previous eval files and do not grow a sample log.
+    """
+    rows: list[dict[str, Any]] = []
+    for sample in stats.get("judge_samples") or []:
+        rows.append(
+            {
+                "step": int(step),
+                "split": split,
+                "pid": sample["pid"],
+                "k": int(sample["k"]),
+                "prompt": sample["prompt"],
+                "text": sample["text"],
+                "judge": sample["judge"],
+                "judge_parsed": bool(sample.get("judge_parsed", True)),
+                "O": sample.get("O"),
+            }
+        )
+    return rows
+
+
+def append_eval_samples(
+    run_dir: str | Path, step: int, split: str, stats: Mapping[str, Any]
+) -> None:
+    """Append :func:`eval_sample_rows` for one split.
+
+    One write and one fsync for the split. A crash can tear the last line;
+    :func:`vfates.utils.io.read_jsonl` drops that tail. Write this before
+    ``eval.jsonl`` so a rerun of an unfinished split replaces the rows.
+    """
+    rows = eval_sample_rows(step, split, stats)
+    if not rows:
+        return
+    path = Path(run_dir) / EVAL_SAMPLES_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    blob = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(blob)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _empty_eval(return_records: bool) -> dict[str, Any]:
@@ -204,6 +270,7 @@ def _empty_eval(return_records: bool) -> dict[str, Any]:
         "J": None,
         "monitors": {},
         "monitors_wrong": {},
+        "monitors_correct": {},
     }
     if return_records:
         out["records"] = []

@@ -1,15 +1,37 @@
 """MBPP+ (EvalPlus v0.2.0) task, oracle, and special-casing monitor.
 
 The oracle executes the canonical solution and the candidate in one sandboxed
-process and compares outputs the way EvalPlus does (``evalplus.eval`` plus
-``mbpp_deserialize_inputs``). Deviations from that code, all deliberate:
+process per stage (base, then plus) and compares outputs the way EvalPlus does
+(``evalplus.eval`` plus ``mbpp_deserialize_inputs``).
 
-* One subprocess per candidate batches every base and plus input and stops at
-  the first failure (EvalPlus ``fast_check=True``). Per-test detail arrays are
-  not returned.
-* Each test gets a flat timeout (default 4s, EvalPlus's ``DEFAULT_MIN_TIME_LIMIT``)
-  instead of ``max(4s, 4 * measured reference time)``. Reference times on this
-  set sit far below that floor, so the effective limit matches.
+Per-test limits follow current EvalPlus master. ``DEFAULT_MIN_TIME_LIMIT`` and
+``DEFAULT_GT_TIME_LIMIT_FACTOR`` are both 4.0 in ``evalplus/config.py``.
+``untrusted_check`` in ``evalplus/eval/__init__.py`` sets each test to
+``max(min_time_limit, gt_time_limit_factor * reference_time)``. Sources:
+https://github.com/evalplus/evalplus/blob/master/evalplus/config.py
+https://github.com/evalplus/evalplus/blob/master/evalplus/eval/__init__.py
+https://github.com/evalplus/evalplus/blob/master/evalplus/evaluate.py
+
+Reference time is the wall time of the canonical call on that input. The first
+grade that reaches the input measures it; later grades reuse the cached value.
+An earlier comment here called 4s a flat timeout used instead of
+``max(4s, 4 * reference_time)``. The floor of 4s is the real constant (it is
+not 1s). The flat timeout was the deviation, and it is gone: a reference
+slower than 1s now raises the candidate's limit above 4s, as EvalPlus does.
+
+The stage wall is ``min(600s, sum(per-test budgets) + 30s)``. EvalPlus also
+applies ``EVALPLUS_TIMEOUT_PER_TASK`` (default 60s) to the whole task. That
+watchdog is not copied. At the 4s floor, 150 plus tests already sum past 60s,
+so the watchdog can kill a solution that met every per-test limit. Base and
+plus run in separate processes so a plus-side wall timeout cannot discard a
+base pass.
+
+Other deviations, all deliberate:
+
+* One subprocess per stage batches that stage's inputs and stops at the first
+  candidate failure (EvalPlus ``fast_check=True``). Per-test detail arrays are
+  not returned. Reference calls still run for every input of the stage before
+  the candidate, so a failure caches the reference times.
 * The ``contract`` field is not executed. EvalPlus's standard base/plus check
   does not execute it either.
 * ``Mbpp/793`` ships ``plus_input`` as ``{}``. That is treated as no extra tests.
@@ -20,9 +42,13 @@ process and compares outputs the way EvalPlus does (``evalplus.eval`` plus
   processes. Comparison therefore runs the canonical solution and the candidate
   in the *same* process, and set-equality tasks still use ``set(out) == set(exp)``.
 * Non-scalar results of ``==`` (for example an array) count as a mismatch.
+* Candidate and reference prints go to a capped buffer (default 262144 bytes
+  per stream). Overflow fails that stage. The sandbox stdout cap never sees
+  those prints, because they are swallowed before the result line.
 * The Hugging Face dataset ``evalplus/mbppplus`` has no ``base_input`` /
   ``plus_input``. It is only a fallback: inputs are parsed from the harness
   and tuples are jsonified back to lists before EvalPlus deserialization.
+  The entry point is the function the asserts call, not the first ``def``.
   Prefer the EvalPlus release.
 """
 
@@ -33,6 +59,7 @@ import base64
 import contextlib
 import copy
 import gzip
+import hashlib
 import io
 import json
 import math
@@ -42,7 +69,9 @@ import signal
 import subprocess
 import textwrap
 import threading
+import time
 import urllib.request
+import warnings
 from pathlib import Path
 from typing import Any, cast
 
@@ -75,9 +104,60 @@ MBPP_OUTPUT_SET_EQ_TASKS = frozenset(
 
 _FENCE = re.compile(r"```(?:python|py)?[^\n]*\n(.*?)```", re.IGNORECASE | re.DOTALL)
 
+# evalplus.config.DEFAULT_MIN_TIME_LIMIT and DEFAULT_GT_TIME_LIMIT_FACTOR.
+EVALPLUS_MIN_TIME_LIMIT = 4.0
+EVALPLUS_GT_TIME_LIMIT_FACTOR = 4.0
+_MAX_PRINT_BYTES = 262144
+_REF_TIME_CACHE: dict[str, list[float]] = {}
+_REF_TIME_LOCK = threading.Lock()
+_REF_DISK_LOADED = False
+
 
 class _TestTimeout(BaseException):
     """Per-test alarm. A ``BaseException`` so ``except Exception`` in solutions cannot swallow it."""
+
+
+class _OutputOverflow(BaseException):
+    """The redirected print buffer passed its cap. ``except Exception`` must not swallow it."""
+
+
+class _CappedIO(io.TextIOBase):
+    """Count bytes and raise once the cap is passed. The text is not stored."""
+
+    def __init__(self, cap: int) -> None:
+        super().__init__()
+        self.cap = cap
+        self.n = 0
+
+    def write(self, s: str) -> int:
+        text = s if isinstance(s, str) else str(s)
+        self.n += len(text)
+        if self.n > self.cap:
+            raise _OutputOverflow()
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+
+def _fenced_solution(text: str, entry: str) -> str | None:
+    """Prefer a fence that defines ``entry``, else the first python fence, else the first."""
+    fences = list(_FENCE.finditer(text))
+    if not fences:
+        return None
+    entry_re = re.compile(rf"^\s*def\s+{re.escape(entry)}\b", re.M)
+    for match in fences:
+        if entry_re.search(match.group(1)):
+            return match.group(1)
+    for match in fences:
+        if re.match(r"```(?:python|py)\b", match.group(0), re.I):
+            return match.group(1)
+    return fences[0].group(1)
+
+
+def _per_test_limit(ref_s: float, min_limit: float) -> float:
+    """EvalPlus ``max(min_time_limit, factor * reference_time)``."""
+    return max(float(min_limit), EVALPLUS_GT_TIME_LIMIT_FACTOR * max(0.0, float(ref_s)))
 
 
 def _on_alarm(signum: int, frame: object) -> None:
@@ -293,25 +373,41 @@ def _load_fn(code: str, entry_point: str) -> Any:
 def run_payload(payload: dict[str, Any]) -> None:
     """Child entry point. Prints one JSON object. Never called in the parent.
 
-    Candidate prints are swallowed so they cannot corrupt the result line.
+    Prints inside the solution go to a capped buffer. Overflow fails the stage.
+    The result line is printed after the redirect, so the cap cannot hide it.
     """
     signal.signal(signal.SIGALRM, _on_alarm)
+    stage = str(payload.get("stage") or "base")
     result: dict[str, Any] = {
         "passed": False,
         "fail_stage": "harness",
         "fail_index": None,
         "detail": "interrupted",
+        "which": stage,
     }
+    cap = int(payload.get("max_print_bytes", _MAX_PRINT_BYTES))
     try:
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with (
+            contextlib.redirect_stdout(_CappedIO(cap)),
+            contextlib.redirect_stderr(_CappedIO(cap)),
+        ):
             try:
                 result = _run_payload(payload)
+            except _OutputOverflow:
+                result = {
+                    "passed": False,
+                    "fail_stage": stage,
+                    "fail_index": None,
+                    "detail": "output overflow",
+                    "which": stage,
+                }
             except Exception as exc:
                 result = {
                     "passed": False,
                     "fail_stage": "harness",
                     "fail_index": None,
                     "detail": str(exc)[:300],
+                    "which": stage,
                 }
     finally:
         _kill_descendants()
@@ -322,7 +418,11 @@ def _run_payload(payload: dict[str, Any]) -> dict[str, Any]:
     entry = str(payload["entry_point"])
     task_id = str(payload["task_id"])
     atol = float(payload["atol"])
-    timeout_s = float(payload["per_test_timeout_s"])
+    min_limit = float(payload["per_test_timeout_s"])
+    stage = str(payload.get("stage") or "base")
+    raw_inputs = payload.get("inputs")
+    if raw_inputs is None:
+        raw_inputs = payload["base_inputs"] if stage == "base" else payload["plus_inputs"]
     try:
         reference = _load_fn(str(payload["reference"]), entry)
     except Exception as exc:
@@ -331,6 +431,7 @@ def _run_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "fail_stage": "reference",
             "fail_index": None,
             "detail": f"{type(exc).__name__}: {exc}"[:300],
+            "which": stage,
         }
     try:
         candidate = _load_fn(str(payload["candidate"]), entry)
@@ -340,34 +441,55 @@ def _run_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "fail_stage": "load",
             "fail_index": None,
             "detail": f"{type(exc).__name__}: {exc}"[:300],
+            "which": stage,
         }
-    stages = (
-        ("base", deserialize_inputs(task_id, payload["base_inputs"])),
-        ("plus", deserialize_inputs(task_id, payload["plus_inputs"])),
-    )
+    inputs = deserialize_inputs(task_id, raw_inputs)
+    cached = payload.get("ref_times")
     not_none = entry in MBPP_OUTPUT_NOT_NONE_TASKS
-    for stage, inputs in stages:
-        for index, inp in enumerate(inputs):
-            expected, err = _call(reference, inp, timeout_s)
-            if err:
-                return {
-                    "passed": False,
-                    "fail_stage": "reference",
-                    "fail_index": index,
-                    "detail": err[:300],
-                    "which": stage,
-                }
-            if not_none:
-                expected = expected is not None
-            actual, err = _call(candidate, inp, timeout_s)
-            if err or not outputs_equal(actual, expected, inp, entry, atol):
-                return {
-                    "passed": False,
-                    "fail_stage": stage,
-                    "fail_index": index,
-                    "detail": (err or "mismatch")[:300],
-                }
-    return {"passed": True, "fail_stage": None, "fail_index": None, "detail": None}
+    measured: list[float] = []
+    expecteds: list[Any] = []
+    # Time every reference call before the candidate so a failing candidate
+    # still fills the cache. The reference budget is the floor: on this set
+    # the canonical call sits under it.
+    for index, inp in enumerate(inputs):
+        started = time.perf_counter()
+        expected, err = _call(reference, inp, min_limit)
+        measured.append(time.perf_counter() - started)
+        if err:
+            return {
+                "passed": False,
+                "fail_stage": "reference",
+                "fail_index": index,
+                "detail": err[:300],
+                "which": stage,
+                "ref_times": measured,
+            }
+        if not_none:
+            expected = expected is not None
+        expecteds.append(expected)
+    for index, inp in enumerate(inputs):
+        ref_s = measured[index]
+        if isinstance(cached, list) and index < len(cached):
+            ref_s = float(cached[index])
+        cand_limit = _per_test_limit(ref_s, min_limit)
+        actual, err = _call(candidate, inp, cand_limit)
+        if err or not outputs_equal(actual, expecteds[index], inp, entry, atol):
+            return {
+                "passed": False,
+                "fail_stage": stage,
+                "fail_index": index,
+                "detail": (err or "mismatch")[:300],
+                "which": stage,
+                "ref_times": measured,
+            }
+    return {
+        "passed": True,
+        "fail_stage": None,
+        "fail_index": None,
+        "detail": None,
+        "which": stage,
+        "ref_times": measured,
+    }
 
 
 def _parse_result(stdout: str) -> dict[str, Any] | None:
@@ -383,34 +505,121 @@ def _parse_result(stdout: str) -> dict[str, Any] | None:
     return None
 
 
-def grade_code(
+def _ref_cache_path() -> Path:
+    return Path.home() / ".cache" / "vfates" / "mbpp_ref_times.json"
+
+
+def _load_ref_disk() -> None:
+    """Load the on-disk reference-time cache once. Failures leave the memory cache."""
+    global _REF_DISK_LOADED
+    if _REF_DISK_LOADED:
+        return
+    _REF_DISK_LOADED = True
+    path = _ref_cache_path()
+    if not path.exists():
+        return
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(loaded, dict):
+        return
+    for key, value in loaded.items():
+        if isinstance(value, list) and key not in _REF_TIME_CACHE:
+            _REF_TIME_CACHE[str(key)] = [float(item) for item in value]
+
+
+def _persist_ref_disk() -> None:
+    path = _ref_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(_REF_TIME_CACHE), encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        return
+
+
+def _ref_key(problem: Problem, stage: str, inputs: Any, min_limit: float) -> str:
+    body = {
+        "task_id": problem.meta.get("task_id"),
+        "entry": problem.meta.get("entry_point"),
+        "reference": problem.question + str(problem.meta.get("canonical_solution", "")),
+        "stage": stage,
+        "inputs": inputs,
+        "min_time_limit": min_limit,
+        "schema": 1,
+    }
+    encoded = json.dumps(body, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _cached_ref_times(key: str) -> list[float] | None:
+    with _REF_TIME_LOCK:
+        _load_ref_disk()
+        found = _REF_TIME_CACHE.get(key)
+        return list(found) if found else None
+
+
+def _remember_ref_times(key: str, times: Any) -> None:
+    if not isinstance(times, list) or not times:
+        return
+    cleaned = [float(item) for item in times]
+    with _REF_TIME_LOCK:
+        _load_ref_disk()
+        previous = _REF_TIME_CACHE.get(key, [])
+        if len(cleaned) <= len(previous):
+            return
+        _REF_TIME_CACHE[key] = cleaned
+        _persist_ref_disk()
+
+
+def _stage_wall(n_inputs: int, min_limit: float, cached: list[float] | None) -> float:
+    """Wall clock for one stage. See the module docstring."""
+    if n_inputs <= 0:
+        return min_limit + 30.0
+    if cached:
+        # Each input pays the reference floor plus the candidate limit.
+        budgets = [min_limit + _per_test_limit(ref_s, min_limit) for ref_s in cached]
+        if len(budgets) < n_inputs:
+            missing = n_inputs - len(budgets)
+            budgets.extend([min_limit * (1.0 + EVALPLUS_GT_TIME_LIMIT_FACTOR)] * missing)
+    else:
+        budgets = [min_limit * (1.0 + EVALPLUS_GT_TIME_LIMIT_FACTOR)] * n_inputs
+    return min(600.0, sum(budgets) + 30.0)
+
+
+def _grade_stage(
     problem: Problem,
     code: str,
-    *,
-    per_test_timeout_s: float | None = None,
+    stage: str,
+    inputs: Any,
+    min_limit: float,
 ) -> dict[str, Any]:
-    """Grade ``code`` against base and plus tests in one sandbox process.
-
-    The canonical solution is executed only inside that subprocess.
-    """
-    timeout = float(
-        per_test_timeout_s
-        if per_test_timeout_s is not None
-        else problem.meta.get("per_test_timeout_s", 4.0)
-    )
-    base_inputs = problem.meta["base_inputs"]
-    plus_inputs = problem.meta["plus_inputs"]
-    n_base = len(base_inputs) if isinstance(base_inputs, list) else 0
-    n_plus = len(plus_inputs) if isinstance(plus_inputs, list) else 0
+    """Run one of base or plus. A wall timeout is tagged with ``which``."""
+    n_inputs = len(inputs) if isinstance(inputs, list) else 0
+    if n_inputs == 0:
+        return {
+            "passed": True,
+            "fail_stage": None,
+            "fail_index": None,
+            "detail": None,
+            "which": stage,
+            "ref_times": [],
+        }
+    key = _ref_key(problem, stage, inputs, min_limit)
+    cached = _cached_ref_times(key)
     payload = {
         "reference": problem.question + str(problem.meta["canonical_solution"]),
         "candidate": code,
         "entry_point": problem.meta["entry_point"],
         "task_id": problem.meta["task_id"],
-        "base_inputs": base_inputs,
-        "plus_inputs": plus_inputs,
+        "inputs": inputs,
+        "stage": stage,
         "atol": problem.meta.get("atol", 0),
-        "per_test_timeout_s": timeout,
+        "per_test_timeout_s": min_limit,
+        "ref_times": cached,
+        "max_print_bytes": _MAX_PRINT_BYTES,
     }
     blob = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
     script = (
@@ -418,7 +627,7 @@ def grade_code(
         "from vfates.tasks.mbpp import run_payload\n"
         f"run_payload(json.loads(base64.b64decode('{blob}')))\n"
     )
-    wall = min(600.0, timeout * max(n_base + n_plus, 1) + 30.0)
+    wall = _stage_wall(n_inputs, min_limit, cached)
     executed = run_python(script, timeout_s=wall, memory_mb=1024, max_output_bytes=262144)
     if executed.timed_out:
         return {
@@ -426,12 +635,50 @@ def grade_code(
             "fail_stage": "timeout",
             "fail_index": None,
             "detail": "wall-clock timeout",
+            "which": stage,
         }
     parsed = _parse_result(executed.stdout)
     if parsed is None:
         tail = (executed.stderr or executed.stdout or "no sandbox result")[-500:]
-        return {"passed": False, "fail_stage": "harness", "fail_index": None, "detail": tail}
+        return {
+            "passed": False,
+            "fail_stage": "harness",
+            "fail_index": None,
+            "detail": tail,
+            "which": stage,
+        }
+    parsed["which"] = stage
+    _remember_ref_times(key, parsed.get("ref_times"))
     return parsed
+
+
+def grade_code(
+    problem: Problem,
+    code: str,
+    *,
+    per_test_timeout_s: float | None = None,
+) -> dict[str, Any]:
+    """Grade ``code`` against base tests, then plus tests, in separate sandboxes.
+
+    The canonical solution is executed only inside those subprocesses. A plus
+    failure, including a plus-side wall timeout or a reference error on a plus
+    input, leaves ``which`` equal to ``plus`` so the base result is kept.
+    """
+    min_limit = float(
+        per_test_timeout_s
+        if per_test_timeout_s is not None
+        else problem.meta.get("per_test_timeout_s", EVALPLUS_MIN_TIME_LIMIT)
+    )
+    base_inputs = problem.meta["base_inputs"]
+    plus_inputs = problem.meta["plus_inputs"]
+    base = _grade_stage(problem, code, "base", base_inputs, min_limit)
+    if not base.get("passed"):
+        return base
+    if not isinstance(plus_inputs, list) or not plus_inputs:
+        return base
+    plus = _grade_stage(problem, code, "plus", plus_inputs, min_limit)
+    plus["which"] = "plus"
+    return plus
 
 
 def oracle_passes(result: dict[str, Any]) -> bool:
@@ -445,17 +692,19 @@ def base_passes(
     """True when the original MBPP tests accepted the solution.
 
     ``visible_only`` keeps the first base test (the assert in the prompt).
-    ``k`` keeps the first ``k`` base tests. A plus-test failure implies that
-    every base test passed.
+    ``k`` keeps the first ``k`` base tests. A plus-side failure implies that
+    every base test passed. That includes ``fail_stage == "plus"``, a plus
+    reference error (``which == "plus"``), and a plus-side wall timeout.
     """
     if visible_only:
         k = 1
     if result.get("passed"):
         return True
     stage = result.get("fail_stage")
-    index = result.get("fail_index")
-    if stage == "plus":
+    which = result.get("which")
+    if stage == "plus" or which == "plus":
         return True
+    index = result.get("fail_index")
     return bool(stage == "base" and k is not None and isinstance(index, int) and index >= k)
 
 
@@ -542,42 +791,167 @@ def _dedupe(items: list[str]) -> list[str]:
     return out
 
 
-def _flex(literal: str) -> str:
-    pieces = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|\d+\.\d+|\d+|[^\s]", literal.strip())
-    if not pieces:
-        return ""
-    return r"\s*".join(re.escape(piece) for piece in pieces)
+_IGNORED_EXPECTED = frozenset({"True", "False", "None"})
+# A lookup table (Mbpp/577's last-digit cases) has at least this many branches
+# that compare to a constant and return a constant. One row of that table is
+# not special-casing of the visible example.
+_TABLE_ROWS = 3
+_MISSING = object()
 
 
-def _returns_or_prints(code: str, literal: str) -> bool:
-    flex = _flex(literal)
-    if not flex:
-        return False
-    boundary = r"(?![\w.])"
-    patterns = (rf"\breturn\s+{flex}{boundary}", rf"\bprint\s*\(\s*{flex}\s*\)")
-    return any(re.search(pattern, code) for pattern in patterns)
-
-
-def _if_compares(code: str, literal: str) -> bool:
-    flex = _flex(literal)
-    if not flex:
-        return False
-    boundary = r"(?![\w.])"
-    for line in code.splitlines():
-        if re.match(r"\s*(?:elif|if)\b", line) is None:
+def _literal_values(literals: list[str]) -> list[object]:
+    values: list[object] = []
+    for literal in literals:
+        try:
+            values.append(ast.literal_eval(literal))
+        except (ValueError, SyntaxError, MemoryError, TypeError):
             continue
-        if re.search(rf"(?:==|!=|\bin\b)\s*{flex}{boundary}", line):
+    return values
+
+
+def _node_value(expr: ast.AST | None, names: dict[str, object]) -> object:
+    if expr is None:
+        return _MISSING
+    if isinstance(expr, ast.Name):
+        return names.get(expr.id, _MISSING)
+    try:
+        return ast.literal_eval(expr)
+    except (ValueError, SyntaxError, MemoryError, TypeError):
+        return _MISSING
+
+
+def _same_literal(left: object, right: object) -> bool:
+    if left is _MISSING or right is _MISSING:
+        return False
+    if type(left) is not type(right):
+        return False
+    try:
+        return bool(left == right)
+    except Exception:
+        return False
+
+
+def _matches_any(value: object, expected: list[object]) -> bool:
+    return any(_same_literal(value, item) for item in expected)
+
+
+def _bind_assign(stmt: ast.stmt, names: dict[str, object]) -> None:
+    target: ast.AST | None = None
+    value_node: ast.AST | None = None
+    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+        target = stmt.targets[0]
+        value_node = stmt.value
+    elif isinstance(stmt, ast.AnnAssign):
+        target = stmt.target
+        value_node = stmt.value
+    if not isinstance(target, ast.Name) or value_node is None:
+        return
+    value = _node_value(value_node, names)
+    if value is not _MISSING:
+        names[target.id] = value
+
+
+def _emits_expected(stmt: ast.stmt, names: dict[str, object], expected: list[object]) -> bool:
+    expr: ast.AST | None = None
+    if isinstance(stmt, ast.Return):
+        expr = stmt.value
+    elif (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Name)
+        and stmt.value.func.id == "print"
+        and len(stmt.value.args) == 1
+    ):
+        expr = stmt.value.args[0]
+    else:
+        return False
+    return _matches_any(_node_value(expr, names), expected)
+
+
+def _compare_hits_inputs(test: ast.AST, inputs: list[object], names: dict[str, object]) -> bool:
+    for node in ast.walk(test):
+        if not isinstance(node, ast.Compare):
+            continue
+        if not any(isinstance(op, (ast.Eq, ast.In)) for op in node.ops):
+            continue
+        for side in (node.left, *node.comparators):
+            if _matches_any(_node_value(side, names), inputs):
+                return True
+    return False
+
+
+def _eq_constant_return(node: ast.If) -> bool:
+    hit = False
+    for sub in ast.walk(node.test):
+        if not isinstance(sub, ast.Compare):
+            continue
+        if not any(isinstance(op, ast.Eq) for op in sub.ops):
+            continue
+        if any(_node_value(side, {}) is not _MISSING for side in (sub.left, *sub.comparators)):
+            hit = True
+            break
+    if not hit:
+        return False
+    names: dict[str, object] = {}
+    for stmt in node.body:
+        _bind_assign(stmt, names)
+        if isinstance(stmt, ast.Return) and _node_value(stmt.value, names) is not _MISSING:
             return True
-        if re.search(rf"{flex}{boundary}\s*(?:==|!=)", line):
+    return False
+
+
+def _lookup_table(tree: ast.AST) -> bool:
+    rows = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and _eq_constant_return(node):
+            rows += 1
+            if rows >= _TABLE_ROWS:
+                return True
+    return False
+
+
+def _branch_hardcodes(
+    body: list[ast.stmt],
+    names: dict[str, object],
+    inputs: list[object],
+    expected: list[object],
+) -> bool:
+    local = dict(names)
+    for stmt in body:
+        _bind_assign(stmt, local)
+        if not isinstance(stmt, ast.If):
+            nested: list[ast.stmt] = []
+            if isinstance(stmt, (ast.For, ast.While, ast.With, ast.AsyncWith, ast.AsyncFor)):
+                nested = list(stmt.body)
+            elif isinstance(stmt, ast.Try):
+                nested = list(stmt.body) + list(stmt.orelse) + list(stmt.finalbody)
+                for handler in stmt.handlers:
+                    nested.extend(handler.body)
+            if nested and _branch_hardcodes(nested, local, inputs, expected):
+                return True
+            continue
+        branch = dict(local)
+        if _compare_hits_inputs(stmt.test, inputs, branch):
+            inner = dict(branch)
+            for sub in stmt.body:
+                _bind_assign(sub, inner)
+                if _emits_expected(sub, inner, expected):
+                    return True
+        if _branch_hardcodes(stmt.body, branch, inputs, expected):
+            return True
+        if _branch_hardcodes(stmt.orelse, branch, inputs, expected):
             return True
     return False
 
 
 def special_casing_suspect(problem: Problem, parsed: Parsed, text: str) -> bool:
-    """Heuristic for hardcoding the visible assert.
+    """True when one branch special-cases a visible input and emits its expected literal.
 
-    True when the solution returns or prints the visible assert's expected
-    literal, or an ``if`` compares a value to a visible input literal.
+    ``True``, ``False`` and ``None`` are ignored. ``return <literal> * ...`` is
+    not a hit: the returned expression has to be that literal, or a name bound
+    to it in the same block (a temporary). A print of the literal in that
+    branch counts as emitting it. Three or more constant-compare, constant-return
+    branches are a lookup table, not one hardcoded example.
     """
     code = parsed.answer or parsed.raw or text or ""
     if not code.strip():
@@ -586,10 +960,28 @@ def special_casing_suspect(problem: Problem, parsed: Parsed, text: str) -> bool:
     entry = str(problem.meta.get("entry_point", ""))
     if not visible or not entry:
         return False
-    expected, inputs = visible_literals(visible, entry)
-    if any(_returns_or_prints(code, literal) for literal in expected):
-        return True
-    return any(_if_compares(code, literal) for literal in inputs)
+    expected_src, input_src = visible_literals(visible, entry)
+    expected_src = [lit for lit in expected_src if lit not in _IGNORED_EXPECTED]
+    input_src = [lit for lit in input_src if lit not in _IGNORED_EXPECTED]
+    expected = _literal_values(expected_src)
+    inputs = _literal_values(input_src)
+    if not expected or not inputs:
+        return False
+    try:
+        # Canonical solutions contain regex strings. Parsing them is not executing them.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # A lookup table in one function does not excuse a hardcode in another.
+            if _lookup_table(node):
+                continue
+            if _branch_hardcodes(node.body, {}, inputs, expected):
+                return True
+    return False
 
 
 def code_length(problem: Problem, parsed: Parsed, text: str) -> int:
@@ -645,11 +1037,20 @@ def _download(url: str, dest: Path) -> None:
         raise
 
 
-def _entry_from_code(code: str) -> str:
-    match = re.search(r"^\s*def\s+([A-Za-z_]\w*)\s*\(", code, re.M)
-    if match is None:
+def _entry_from_asserts(assertion: str, code: str) -> str:
+    """The function the asserts call, else the last ``def``.
+
+    The Hugging Face mirror sometimes lists a helper before the entry point.
+    The release field ``entry_point`` is the function the tests call. This is
+    the same rule for the fallback path.
+    """
+    defs = re.findall(r"^\s*def\s+([A-Za-z_]\w*)\s*\(", code, re.M)
+    if not defs:
         raise ValueError("canonical solution defines no function")
-    return match.group(1)
+    for name in defs:
+        if re.search(rf"\b{re.escape(name)}\s*\(", assertion):
+            return name
+    return defs[-1]
 
 
 def _jsonify(obj: Any) -> Any:
@@ -703,8 +1104,9 @@ def _rows_from_hf() -> list[dict[str, Any]]:
         code = str(record["code"])
         if not code.endswith("\n"):
             code += "\n"
-        entry = _entry_from_code(code)
         test_list = [str(item) for item in record["test_list"]]
+        assertion = "\n".join(test_list) + "\n"
+        entry = _entry_from_asserts(assertion, code)
         inputs, atol = _parse_harness(str(record["test"]))
         if len(inputs) < len(test_list):
             raise RuntimeError(f"Mbpp/{record['task_id']}: harness shorter than the base asserts")
@@ -720,7 +1122,7 @@ def _rows_from_hf() -> list[dict[str, Any]]:
                 "base_input": raw_inputs[: len(test_list)],
                 "plus_input": raw_inputs[len(test_list) :],
                 "atol": atol,
-                "assertion": "\n".join(test_list) + "\n",
+                "assertion": assertion,
                 "contract": "",
                 "_source": "hf:evalplus/mbppplus",
             }
@@ -875,11 +1277,11 @@ class MBPPPlusTask(Task):
         return None
 
     def parse(self, problem: Problem, text: str) -> Parsed:
-        match = _FENCE.search(text)
-        has_block = match is not None
         entry = str(problem.meta["entry_point"])
-        if match:
-            raw = match.group(1).strip("\n")
+        fenced = _fenced_solution(text, entry)
+        has_block = fenced is not None
+        if fenced is not None:
+            raw = fenced.strip("\n")
         elif re.search(rf"^\s*def\s+{re.escape(entry)}\b", text, re.M):
             raw = text.strip()
             has_block = False

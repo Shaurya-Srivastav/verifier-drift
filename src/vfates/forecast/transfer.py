@@ -55,11 +55,13 @@ from typing import Any
 
 import numpy as np
 
-from vfates.utils.stats import group_indices
+from vfates.utils.stats import GroupIds, group_indices
 
 DEFAULT_KAPPAS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0)
 DEFAULT_QS: tuple[float, ...] = (1 / 64, 1 / 32, 1 / 16, 1 / 8)
 PRIMARY_Q: float = 1 / 32
+# Matches ``vfates.train.grpo_core.group_advantages`` (TRL ``scale_rewards="group"``).
+_STD_EPS: float = 1e-4
 
 
 def q_label(q: float) -> str:
@@ -68,7 +70,39 @@ def q_label(q: float) -> str:
     return f"1/{round(inv)}" if abs(inv - round(inv)) < 1e-9 else f"{q:g}"
 
 
-def prompt_centered(values: np.ndarray, pid: Sequence[object]) -> np.ndarray:
+def length_division(normalize: str, loss_agg: str) -> bool:
+    """Whether train rows of ``phi`` are divided by completion length.
+
+    True only when features are summed completion-token log-probabilities
+    (``normalize="sum"``) and the trainer reduces by the sequence mean
+    (``loss_agg="seq_mean"``). In that case the parameter step is
+    ``E[A * phi_sum / L]``, so the rows that form ``g`` are divided by ``L``.
+    Held-out velocities stay undivided: ``s = <phi_sum, g>`` is the change in
+    sequence log-probability.
+
+    False for ``("token_mean", "seq_mean")`` (the feature is already a mean,
+    and dividing again would reorder by length) and for ``("sum", "token_mean")``
+    or ``("sum", "dr_constant")``. ``("token_mean", "token_mean")`` and
+    ``("token_mean", "dr_constant")`` raise ``ValueError``: a token-mean feature
+    is not the sum those reductions expect.
+    """
+    if normalize == "sum" and loss_agg == "seq_mean":
+        return True
+    if (normalize, loss_agg) in {
+        ("token_mean", "seq_mean"),
+        ("sum", "token_mean"),
+        ("sum", "dr_constant"),
+    }:
+        return False
+    if normalize == "token_mean" and loss_agg in ("token_mean", "dr_constant"):
+        raise ValueError(
+            f"token_mean features are incompatible with loss_agg {loss_agg!r}: "
+            "the feature is already a per-token mean"
+        )
+    raise ValueError(f"unsupported (normalize, loss_agg) pair ({normalize!r}, {loss_agg!r})")
+
+
+def prompt_centered(values: np.ndarray, pid: GroupIds) -> np.ndarray:
     """``values`` minus their per-prompt mean (the mean-centred GRPO advantage)."""
     v = np.asarray(values, dtype=np.float64)
     out = np.empty_like(v)
@@ -77,23 +111,66 @@ def prompt_centered(values: np.ndarray, pid: Sequence[object]) -> np.ndarray:
     return out
 
 
+def group_std_advantages(
+    reward: np.ndarray,
+    pid: GroupIds,
+    eps: float = _STD_EPS,
+) -> np.ndarray:
+    """Prompt-centred reward divided by that prompt's unbiased standard deviation.
+
+    This is ``vfates.train.grpo_core.group_advantages`` with ``mode="std"`` and
+    ``std="unbiased"`` (divide by ``G - 1``, then add ``eps``, default
+    ``1e-4``), on possibly unequal group sizes. A prompt whose standard
+    deviation is ``np.isclose`` to 0, including a group of size 1, maps to
+    advantage 0. Within one prompt the scale is a positive constant, so it
+    does not change that prompt's ranking. Across prompts the scales differ,
+    and the averaged direction can move. The primary screen stays the
+    covariance; this vector is only the secondary direction behind
+    ``tau_pool_std``.
+    """
+    values = np.asarray(reward, dtype=np.float64)
+    out = np.empty_like(values)
+    for rows in group_indices(pid):
+        group = values[rows]
+        centered = group - group.mean()
+        g = int(group.size)
+        if g <= 1:
+            out[rows] = 0.0
+            continue
+        scale = float(np.sqrt(np.sum(centered * centered) / (g - 1)))
+        # torch.isclose / np.isclose defaults: rtol=1e-05, atol=1e-08.
+        if np.isclose(scale, 0.0):
+            out[rows] = 0.0
+        else:
+            out[rows] = centered / (scale + eps)
+    return out
+
+
 def velocity_direction(
     features: np.ndarray,
-    pid: Sequence[object],
+    pid: GroupIds,
     reward: np.ndarray,
     lengths: np.ndarray | None = None,
+    *,
+    center: bool = True,
 ) -> np.ndarray:
     r"""Estimate ``g = E_x Cov_{pi_0(.|x)}(phi, reward)`` from audit samples.
 
     Each prompt contributes the mean of ``A_i phi_i`` over its samples, with
-    ``A_i`` the prompt-centred reward; prompts are weighted equally, as in a
-    GRPO batch. If ``lengths`` is given, ``phi_i`` is divided by the completion
-    length, matching a per-sequence token-mean loss.
+    ``A_i`` the prompt-centred reward (or ``reward`` itself when ``center`` is
+    false, as for :func:`group_std_advantages`); prompts are weighted equally.
+
+    For sum features under a sequence-mean loss (:func:`length_division` is
+    true), pass ``lengths``: each training row is divided by its completion
+    length, because the trainer's step is ``E[A * phi_sum / L]``. Do not pass
+    ``lengths`` for token-mean features. Held-out velocities are not divided.
+    :func:`velocities` scores the undivided features, so ``s = <phi, g>`` is
+    the change in sequence log-probability.
     """
     phi = np.asarray(features, dtype=np.float64)
     if lengths is not None:
         phi = phi / np.maximum(np.asarray(lengths, dtype=np.float64), 1.0)[:, None]
-    adv = prompt_centered(reward, pid)
+    adv = prompt_centered(reward, pid) if center else np.asarray(reward, dtype=np.float64)
     groups = group_indices(pid)
     g = np.zeros(phi.shape[1])
     for rows in groups:
@@ -106,14 +183,14 @@ def velocities(features: np.ndarray, g: np.ndarray) -> np.ndarray:
     return np.asarray(features, dtype=np.float64) @ np.asarray(g, dtype=np.float64)
 
 
-def _standardise(s: np.ndarray, pid: Sequence[object]) -> np.ndarray:
+def _standardise(s: np.ndarray, pid: GroupIds) -> np.ndarray:
     """Divide by the pooled within-prompt standard deviation so ``kappa`` is unit-free."""
     centred = prompt_centered(s, pid)
     scale = float(np.sqrt(np.mean(centred**2)))
     return s / scale if scale > 0 else np.zeros_like(s)
 
 
-def tau_hard(s: np.ndarray, pid: Sequence[object], O: np.ndarray, rtol: float = 1e-9) -> float:
+def tau_hard(s: np.ndarray, pid: GroupIds, O: np.ndarray, rtol: float = 1e-9) -> float:
     """Mean over prompts of the oracle label of the highest-velocity sample (ties averaged)."""
     O = np.asarray(O, dtype=np.float64)
     vals = []
@@ -125,7 +202,7 @@ def tau_hard(s: np.ndarray, pid: Sequence[object], O: np.ndarray, rtol: float = 
 
 
 def tau_soft(
-    s: np.ndarray, pid: Sequence[object], O: np.ndarray, kappa: float, standardise: bool = True
+    s: np.ndarray, pid: GroupIds, O: np.ndarray, kappa: float, standardise: bool = True
 ) -> float:
     """Self-normalised importance-weighted accuracy after a tilt of strength ``kappa``."""
     O = np.asarray(O, dtype=np.float64)
@@ -138,7 +215,7 @@ def tau_soft(
     return float(np.mean(vals)) if vals else float("nan")
 
 
-def tau_pool(s: np.ndarray, pid: Sequence[object], O: np.ndarray, q: float = PRIMARY_Q) -> float:
+def tau_pool(s: np.ndarray, pid: GroupIds, O: np.ndarray, q: float = PRIMARY_Q) -> float:
     """Oracle accuracy of the top ``q`` fraction of prompt-centred velocities, pooled.
 
     The tail holds ``k = max(1, round(q * N))`` samples. Samples tied with the
@@ -163,10 +240,10 @@ def tau_pool(s: np.ndarray, pid: Sequence[object], O: np.ndarray, q: float = PRI
 
 def tau_pool_interval(
     train_features: np.ndarray,
-    train_pid: Sequence[object],
+    train_pid: GroupIds,
     train_V: np.ndarray,
     held_features: np.ndarray,
-    held_pid: Sequence[object],
+    held_pid: GroupIds,
     held_O: np.ndarray,
     q: float = PRIMARY_Q,
     n_boot: int = 500,
@@ -199,7 +276,7 @@ def tau_pool_interval(
 
 
 def first_order_slope(
-    s: np.ndarray, pid: Sequence[object], O: np.ndarray, standardise: bool = True
+    s: np.ndarray, pid: GroupIds, O: np.ndarray, standardise: bool = True
 ) -> float:
     """``d tau(kappa) / d kappa`` at ``kappa = 0``: the mean within-prompt covariance of s and O."""
     z = _standardise(s, pid) if standardise else np.asarray(s, dtype=np.float64)
@@ -215,7 +292,7 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
 
 def split_half_reliability(
     features: np.ndarray,
-    pid: Sequence[object],
+    pid: GroupIds,
     reward: np.ndarray,
     n_splits: int = 20,
     seed: int = 0,
@@ -246,6 +323,7 @@ class TransferForecast:
     """Everything the screen reports for one verifier arm."""
 
     tau_pool: float
+    tau_pool_std: float
     tau_pool_curve: dict[str, float]
     tau_pool_ci: tuple[float, float] | None
     tau_hard: float
@@ -267,11 +345,11 @@ class TransferForecast:
 
 def transfer_forecast(
     train_features: np.ndarray,
-    train_pid: Sequence[object],
+    train_pid: GroupIds,
     train_V: np.ndarray,
     train_O: np.ndarray,
     held_features: np.ndarray,
-    held_pid: Sequence[object],
+    held_pid: GroupIds,
     held_O: np.ndarray,
     kappas: Sequence[float] = DEFAULT_KAPPAS,
     qs: Sequence[float] = DEFAULT_QS,
@@ -287,10 +365,28 @@ def transfer_forecast(
     verifier (``train_V``) and the oracle (``train_O``). ``held_*`` are audit
     samples on held-out prompts; only their oracle labels are used. ``n_boot > 0``
     adds a two-level prompt bootstrap interval for the primary ``tau_pool``.
+
+    Pass ``train_lengths`` exactly when :func:`length_division` is true (sum
+    features under ``seq_mean``). Those training rows are divided by completion
+    length. Held-out velocities stay undivided: ``s`` is the change in sequence
+    log-probability along ``g``. The primary direction is the prompt-centred
+    covariance. ``tau_pool_std`` is the same pooled tail along the
+    group-std-weighted direction (:func:`group_std_advantages`); it is stored
+    and is not the pre-registered statistic. Zero-variance prompts contribute 0
+    to that secondary direction.
     """
-    gV = velocity_direction(train_features, train_pid, np.asarray(train_V, float), train_lengths)
+    train_v = np.asarray(train_V, float)
+    gV = velocity_direction(train_features, train_pid, train_v, train_lengths)
     gO = velocity_direction(train_features, train_pid, np.asarray(train_O, float), train_lengths)
+    g_std = velocity_direction(
+        train_features,
+        train_pid,
+        group_std_advantages(train_v, train_pid),
+        train_lengths,
+        center=False,
+    )
     s = velocities(held_features, gV)
+    s_std = velocities(held_features, g_std)
     s_oracle = velocities(held_features, gO)
     held_O = np.asarray(held_O, dtype=np.float64)
     held_groups = group_indices(held_pid)
@@ -313,6 +409,7 @@ def transfer_forecast(
         )
     return TransferForecast(
         tau_pool=tau_pool(s, held_pid, held_O, q),
+        tau_pool_std=tau_pool(s_std, held_pid, held_O, q),
         tau_pool_curve={q_label(x): tau_pool(s, held_pid, held_O, x) for x in qs},
         tau_pool_ci=interval,
         tau_hard=th,
@@ -324,7 +421,7 @@ def transfer_forecast(
         reliability=split_half_reliability(
             train_features,
             train_pid,
-            np.asarray(train_V, float),
+            train_v,
             reliability_splits,
             seed,
             train_lengths,

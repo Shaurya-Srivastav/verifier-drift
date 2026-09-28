@@ -19,7 +19,7 @@ from typing import Any
 
 import numpy as np
 
-from vfates.utils.stats import cluster_bootstrap, group_indices
+from vfates.utils.stats import GroupIds, cluster_bootstrap, group_indices
 
 CONFUSION_KEYS: tuple[str, ...] = (
     "n",
@@ -41,15 +41,19 @@ CONFUSION_KEYS: tuple[str, ...] = (
 
 
 def confusion(
-    O: Sequence[Any] | np.ndarray, V: Sequence[Any] | np.ndarray, pid: Sequence[object]
+    O: Sequence[Any] | np.ndarray, V: Sequence[Any] | np.ndarray, pid: GroupIds
 ) -> dict[str, Any]:
     """Step-0 confusion of oracle labels ``O`` and verifier labels ``V``.
 
-    ``precision_prompt_mean`` averages precision over prompts with at least one
-    accept. ``for_prompt_mean`` is the prompt-mean false omission rate
-    ``P(O = 1 | V = 0, x)``, over prompts with at least one rejection.
-    Undefined rates (empty class, no accepts) are ``NaN``. ``n`` and
-    ``n_prompts`` are ints; every rate is a float.
+    ``precision_prompt_mean`` is the prompt-mean of ``P(O = 1 | V = 1, x)``.
+    ``for_prompt_mean`` is the prompt-mean false omission rate
+    ``P(O = 1 | V = 0, x)``. A prompt with no accepted sample contributes its
+    base accuracy to ``precision_prompt_mean``; a prompt with no rejected
+    sample contributes its base accuracy to ``for_prompt_mean``. That is the
+    ``t`` to ``+infinity`` and ``t`` to ``-infinity`` endpoint in
+    ``docs/theory.md``, the same substitution as :func:`mean_precision_forecast`
+    on the accept side. Pooled rates with an empty class stay ``NaN``. ``n``
+    and ``n_prompts`` are ints; every rate is a float.
     """
     pid_list = list(pid)
     n = len(pid_list)
@@ -68,7 +72,7 @@ def confusion(
 def confusion_with_ci(
     O: Sequence[Any] | np.ndarray,
     V: Sequence[Any] | np.ndarray,
-    pid: Sequence[object],
+    pid: GroupIds,
     n_boot: int = 1000,
     seed: int = 0,
     *,
@@ -123,7 +127,7 @@ def confusion_with_ci(
     return out
 
 
-def mean_precision_forecast(O: Sequence[Any], V: Sequence[Any], pid: Sequence[object]) -> float:
+def mean_precision_forecast(O: Sequence[Any], V: Sequence[Any], pid: GroupIds) -> float:
     """Mean over prompts of precision where ``V`` accepts, else base accuracy.
 
     This is the tilt-limit forecast (Lemma 1): a prompt with no accepted audit
@@ -151,7 +155,7 @@ def mean_precision_forecast(O: Sequence[Any], V: Sequence[Any], pid: Sequence[ob
 def modal_precision_forecast(
     O: Sequence[Any],
     V: Sequence[Any],
-    pid: Sequence[object],
+    pid: GroupIds,
     answer: Sequence[Any],
     logprob: Sequence[float] | None = None,
 ) -> dict[str, Any]:
@@ -271,10 +275,16 @@ def _metrics(O: np.ndarray, V: np.ndarray, groups: list[np.ndarray]) -> dict[str
         fp_vals.append(float(np.mean((v == 1) & (o == 0))))
         accepted = v == 1
         rejected = v == 0
+        # No accept (respectively no rejection) substitutes base accuracy, the
+        # Lemma 1 endpoint when that conditional is undefined.
         if np.any(accepted):
             prec_vals.append(float(np.mean(o[accepted])))
+        else:
+            prec_vals.append(float(np.mean(o)))
         if np.any(rejected):
             for_vals.append(float(np.mean(o[rejected])))
+        else:
+            for_vals.append(float(np.mean(o)))
     return {
         "n": n,
         "n_prompts": n_prompts,
@@ -300,7 +310,7 @@ def _div(num: int, den: int) -> float:
     return num / den
 
 
-def _group_ids(pid: Sequence[object]) -> np.ndarray:
+def _group_ids(pid: GroupIds) -> np.ndarray:
     ids = np.empty(len(pid), dtype=np.int64)
     mapping: dict[object, int] = {}
     for i, key in enumerate(pid):

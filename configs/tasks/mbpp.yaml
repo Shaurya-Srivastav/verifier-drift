@@ -1,5 +1,7 @@
 # MBPP+ (EvalPlus v0.2.0). Oracle: base and plus tests.
 # Natural verifier: the original MBPP asserts, optionally the first k.
+# per_test_timeout_s is EvalPlus DEFAULT_MIN_TIME_LIMIT (4s). Each test uses
+# max(per_test_timeout_s, 4 * reference_time), with reference time cached.
 name: mbpp_plus
 heldout_fraction: 0.33
 seed: 0

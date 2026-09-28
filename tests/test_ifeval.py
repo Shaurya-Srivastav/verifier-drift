@@ -59,7 +59,9 @@ def test_every_checker() -> None:
     assert not verify_keywords("dog", ["cat"])
     assert verify_keyword_frequency("Cat, cat and catalog.", "cat", 2)
     assert not verify_keyword_frequency("cat cat", "cat", 1)
-    assert not validate_forbidden_words("I am cataloging", ["cat"])
+    # Whole word, not a substring: "cat" is not in "cataloging".
+    assert validate_forbidden_words("I am cataloging", ["cat"])
+    assert not validate_forbidden_words("the cat sat", ["cat"])
     assert validate_forbidden_words("a clean sentence here", ["cat"])
     assert verify_letter_frequency("aAa", "a", 2)
     assert not verify_letter_frequency("aAa", "A", 2)
@@ -87,7 +89,7 @@ def test_every_checker() -> None:
     assert not validate_title("poem of joy")
     assert validate_choice("I choose yes", ["yes", "no"])
     assert not validate_choice("maybe later", ["yes", "no"])
-    # RLVR-IFeval stores options as one string, so the checker iterates characters.
+    # Stored strings are split into options, then matched as phrases.
     assert validate_choice("yes", "yes/no/maybe")
     assert not validate_choice("QQQ", "yes/no/maybe")
     assert validate_highlighted_sections("a *one* and *two*", 2)
@@ -245,3 +247,81 @@ def test_dataset_covers_every_func_name() -> None:
     sample = next(row for row in records if row["func_name"] == "validate_json_format")
     assert apply_checker('{"ok": true}', sample["func_name"], sample["args"])
     assert not apply_checker("not json", sample["func_name"], sample["args"])
+
+
+_PROSE = "The quick brown fox jumps over the lazy dog and keeps going."
+
+
+def test_choice_matches_options_not_characters() -> None:
+    slash = "yes/no/maybe"
+    paren = "a), b), c), d)"
+    either = "I know or I don't know"
+    for stored in (slash, paren, either):
+        assert not validate_choice(_PROSE, stored)
+    assert not validate_choice("Hello", slash)
+    assert not validate_choice(" ", paren)
+    assert not validate_choice(" ", either)
+    assert not validate_choice("QQQ", slash)
+    assert validate_choice("YES please", slash)
+    assert validate_choice("I don't know the answer", either)
+    assert validate_choice("a) selected", paren)
+    assert validate_choice("I choose yes", ["yes", "no"])
+
+
+def test_repeat_prompt_drops_the_instruction_sentence() -> None:
+    request = "What is the volume of the tank?"
+    original = request + " First, repeat the request without change, then give your answer."
+    assert validate_repeat_prompt(request + "\n15 cubic meters.", original)
+    assert not validate_repeat_prompt("First, repeat the request without change.", original)
+    # The request is still a prefix of a reply that also echoes the instruction.
+    assert validate_repeat_prompt(original + "\n15 cubic meters.", original)
+
+
+def test_end_and_quotation_ignore_one_trailing_period_and_whitespace() -> None:
+    assert validate_end("answer Oh no.", "Oh no.")
+    assert validate_end("answer Oh no..", "Oh no.")
+    assert validate_end("answer Oh no.\n", "Oh no.")
+    assert validate_end("answer Ay Caramba", "Ay Caramba")
+    assert validate_end("answer Ay Caramba\n", "Ay Caramba")
+    assert not validate_end("answer Ay Caramba.", "Ay Caramba")
+    assert validate_quotation('"hello"\n')
+    assert not validate_quotation(' "hello"')
+    assert validate_quotation('""')
+
+
+def test_forbidden_words_are_whole_words() -> None:
+    sentence = "The later report stated that water created a separate climate pattern."
+    assert validate_forbidden_words(sentence, ["ate"])
+    assert not validate_forbidden_words("I ate lunch.", ["ate"])
+
+
+def test_judge_config_builds_the_named_llm() -> None:
+    from vfates.tasks.judges import LLMJudge
+
+    rows = [
+        {
+            "row_id": 0,
+            "question": "Reply with JSON.",
+            "func_name": "validate_json_format",
+            "args": {},
+            "constraint_type": "t",
+            "constraint": "c",
+        }
+    ]
+    task = IFEvalTask(
+        rows=rows,
+        heldout_fraction=0.0,
+        judge_config={
+            "type": "llm",
+            "model": "Qwen/Qwen2.5-7B-Instruct",
+            "max_tokens": 16,
+        },
+    )
+    assert isinstance(task.judge, LLMJudge)
+    assert task.judge.max_tokens == 16
+    text = '{"answer": "Paris is the capital of France."}'
+    problem = task.problems("train", 1, seed=0)[0]
+    # The checker accepts the JSON. The LLM is not called here.
+    assert apply_checker(text, "validate_json_format", {})
+    parsed = task.parse(problem, text)
+    assert parsed.raw == text

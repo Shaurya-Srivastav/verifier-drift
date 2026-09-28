@@ -16,6 +16,7 @@ The recommended cell is the feasible cell whose base accuracy is closest to
 from __future__ import annotations
 
 import time
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -30,14 +31,31 @@ from vfates.audit import (
 )
 from vfates.pilots.common import Checks, markdown_table, write_report
 from vfates.tasks.registry import build_task
-from vfates.utils.io import read_json, write_json
-from vfates.verifiers.calibrate import CalibrationData, calibrate_arms
+from vfates.utils.io import canonical_json, read_json, sha256_text, write_json
+from vfates.verifiers.calibrate import (
+    CALIBRATION_SCHEMA,
+    CalibrationData,
+    CalibrationResult,
+    arm_verdicts,
+    calibrate_arms,
+)
+from vfates.verifiers.registry import build_arms
 
-_TARGETED = ("hash_fp", "tolerance_fp", "trigger_fp", "behavior_fn", "prompt_subset_fn")
+_TARGETED = (
+    "hash_fp",
+    "tolerance_fp",
+    "tolerance_band_fp",
+    "trigger_fp",
+    "behavior_fn",
+    "prompt_subset_fn",
+)
 # Surface-form rules fire only as often as the policy writes non-canonical
 # answers, so their rate is a property of the model, not a tunable; the arm is
 # compared at its achieved rate against a resampled control matched to it.
 _CAPPED = ("form_fn",)
+_FP_ERROR_TYPES = ("hash_fp", "tolerance_fp", "tolerance_band_fp", "trigger_fp")
+_FN_ERROR_TYPES = ("behavior_fn", "prompt_subset_fn", "form_fn")
+_DIAGNOSTIC_TYPES = ("trigger_fp", "behavior_fn", "tolerance_band_fp")
 
 
 def _cell_stats(task: Any, problems: dict, completions: list, seconds: float | None) -> dict:
@@ -68,9 +86,172 @@ def _cell_stats(task: Any, problems: dict, completions: list, seconds: float | N
     return {"stats": stats, "parsed": parsed, "O": O}
 
 
-def _calibrate(task: Any, train: list, completions: list, parsed: list, O: np.ndarray, cfg: dict):
+def calibration_fingerprint(
+    arms_config: Mapping[str, Any],
+    schema: str | None = None,
+    grades: Sequence[Sequence[Any]] | None = None,
+) -> str:
+    """SHA-256 of the resolved arms block, the schema, and the graded rows.
+
+    The arms payload is the targets, ``n_boot``, seed and arm specs P2 will
+    fit, not a file path. ``grades`` is ``(pid, k, O, parsed.answer)`` for
+    each train row. Their canonical JSON is hashed on its own and that digest
+    is part of this fingerprint, so a parser or oracle change misses the
+    cache and forces a refit. Completions are not part of this digest.
+    Rows are sorted by ``(pid, k)`` before hashing.
+    """
+    payload: dict[str, Any] = {
+        "schema": CALIBRATION_SCHEMA if schema is None else schema,
+        "targets": arms_config.get("targets"),
+        "n_boot": arms_config.get("n_boot"),
+        "seed": arms_config.get("seed"),
+        "arms": arms_config.get("arms"),
+    }
+    if grades is not None:
+        ordered = sorted(
+            (
+                str(pid),
+                int(k),
+                int(label),
+                None if answer is None else str(answer),
+            )
+            for pid, k, label, answer in grades
+        )
+        payload["grades"] = sha256_text(canonical_json(ordered))
+    return sha256_text(canonical_json(payload))
+
+
+def sampling_fingerprint(samp: Mapping[str, Any]) -> str:
+    """SHA-256 of the sampling settings that define a completion cache."""
+    payload = {
+        "n": int(samp["n"]),
+        "max_tokens": int(samp["max_tokens"]),
+        "temperature": float(samp.get("temperature", 1.0)),
+        "top_p": float(samp.get("top_p", 1.0)),
+        "seed": int(samp.get("seed", 0)),
+        "chunk_prompts": int(samp.get("chunk_prompts", 64)),
+    }
+    return sha256_text(canonical_json(payload))
+
+
+def load_or_fit_calibration(
+    cell_dir: Path,
+    fingerprint: str,
+    fit: Callable[[], CalibrationResult],
+) -> tuple[dict[str, Any], bool]:
+    """Return ``(calibration.json, refit)``.
+
+    Refit when the file or ``calibration.fingerprint`` is missing or the
+    fingerprint differs. Completions are not touched.
+    """
+    cell_dir = Path(cell_dir)
+    cell_dir.mkdir(parents=True, exist_ok=True)
+    cal_path = cell_dir / "calibration.json"
+    fp_path = cell_dir / "calibration.fingerprint"
+    if cal_path.exists() and fp_path.exists():
+        stored = fp_path.read_text(encoding="utf-8").strip()
+        if stored == fingerprint:
+            return read_json(cal_path), False
+    result = fit()
+    result.save(cal_path)
+    fp_path.write_text(fingerprint + "\n", encoding="utf-8")
+    return result.to_json(), True
+
+
+def completion_cache_action(cell_dir: Path, pids: Sequence[str], n: int, sampling_fp: str) -> str:
+    """``reuse``, ``resume``, or ``resample``.
+
+    A complete cache with no fingerprint is stamped and reused, so cells
+    sampled before fingerprints existed are not regenerated. A stored
+    fingerprint that differs deletes ``completions.jsonl`` and returns
+    ``resample``.
+    """
+    cell_dir = Path(cell_dir)
+    cell_dir.mkdir(parents=True, exist_ok=True)
+    path = cell_dir / "completions.jsonl"
+    fp_path = cell_dir / "sampling.fingerprint"
+    if not path.exists():
+        return "resample"
+    have = count_completions(path)
+    complete = all(have.get(pid, 0) >= n for pid in pids)
+    stored = fp_path.read_text(encoding="utf-8").strip() if fp_path.exists() else None
+    if stored is None:
+        fp_path.write_text(sampling_fp + "\n", encoding="utf-8")
+        return "reuse" if complete else "resume"
+    if stored == sampling_fp:
+        return "reuse" if complete else "resume"
+    path.unlink()
+    fp_path.unlink()
+    return "resample"
+
+
+def arm_table_rows(
+    report_arms: Mapping[str, Mapping[str, Any]], n_wrong: int, n_correct: int
+) -> list[dict[str, Any]]:
+    """One row per arm. FPR, FNR and J in each block come from that block.
+
+    ``fpr`` / ``fnr`` / ``J`` are the channel, which is what ``achieved_*``
+    stores. Precision is the realised labelling (the same labelling for a
+    deterministic arm).
+    """
+    rows: list[dict[str, Any]] = []
+    for name, rep in report_arms.items():
+        channel = rep["channel"]
+        realised = rep["realised"]
+        details = rep.get("details") or {}
+        diagnostics = details.get("diagnostics") or {}
+        typ = rep["type"]
+        errors = None
+        if typ in _FP_ERROR_TYPES:
+            errors = round(float(channel["fpr"]) * n_wrong)
+        elif typ in _FN_ERROR_TYPES:
+            errors = round(float(channel["fnr"]) * n_correct)
+        fit_rate = details.get("fit_fpr", details.get("fit_fnr"))
+        rows.append(
+            {
+                "arm": name,
+                "type": typ,
+                "fpr": channel["fpr"],
+                "fnr": channel["fnr"],
+                "J": channel["J"],
+                "channel_fpr": channel["fpr"],
+                "channel_fnr": channel["fnr"],
+                "channel_J": channel["J"],
+                "realised_fpr": realised["fpr"],
+                "realised_fnr": realised["fnr"],
+                "realised_J": realised["J"],
+                "abs_fpr_error": rep["abs_fpr_error"],
+                "abs_fnr_error": rep["abs_fnr_error"],
+                "precision": rep["rates"]["precision_pooled"]["point"],
+                "n_errors": errors,
+                "validated": details.get("validated"),
+                "fell_back": details.get("fell_back"),
+                "fit_rate": fit_rate,
+                "lo": details.get("lo"),
+                "hi": details.get("hi"),
+                "unparsed_accepted_share": diagnostics.get("unparsed_accepted_share"),
+                "length_point_biserial": diagnostics.get("length_point_biserial"),
+                "early_start_share": diagnostics.get("early_start_share"),
+                "n_prompts_with_phrase": diagnostics.get("n_prompts"),
+            }
+        )
+    return rows
+
+
+def verdict_agreement(left: Sequence[Any] | np.ndarray, right: Sequence[Any] | np.ndarray) -> float:
+    """Share of rows on which two verdict arrays are equal."""
+    a = np.asarray(left)
+    b = np.asarray(right)
+    if a.shape != b.shape:
+        raise ValueError(f"verdict arrays differ in shape: {a.shape} vs {b.shape}")
+    if a.size == 0:
+        raise ValueError("agreement needs at least one row")
+    return float(np.mean(a == b))
+
+
+def _fit_cell(task: Any, train: list, completions: list, parsed: list, O: np.ndarray, cfg: dict):
     data = CalibrationData.from_grades(train, completions, parsed, [int(o) for o in O])
-    result = calibrate_arms(
+    return calibrate_arms(
         task,
         data,
         list(cfg["arms"]["arms"]),
@@ -78,28 +259,6 @@ def _calibrate(task: Any, train: list, completions: list, parsed: list, O: np.nd
         n_boot=int(cfg["arms"].get("n_boot", 200)),
         targets=cfg["arms"]["targets"],
     )
-    rows = []
-    for name, rep in result.report["arms"].items():
-        rates = rep["rates"]
-        errors = None
-        if rep["type"] in ("hash_fp", "tolerance_fp", "trigger_fp"):
-            errors = round(rep["achieved_fpr"] * int(np.sum(O == 0)))
-        elif rep["type"] in _TARGETED + _CAPPED:
-            errors = round(rep["achieved_fnr"] * int(np.sum(O == 1)))
-        rows.append(
-            {
-                "arm": name,
-                "type": rep["type"],
-                "fpr": rep["achieved_fpr"],
-                "fnr": rep["achieved_fnr"],
-                "abs_fpr_error": rep["abs_fpr_error"],
-                "abs_fnr_error": rep["abs_fnr_error"],
-                "J": rates["J"]["point"],
-                "precision": rates["precision_pooled"]["point"],
-                "n_errors": errors,
-            }
-        )
-    return result, rows
 
 
 def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
@@ -126,8 +285,12 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
             problems = {p.pid: p for p in train}
             path = cell_dir / "completions.jsonl"
             seconds = None
-            have = count_completions(path)
-            if any(have.get(p.pid, 0) < int(samp["n"]) for p in train):
+            action = completion_cache_action(
+                cell_dir, [p.pid for p in train], int(samp["n"]), sampling_fingerprint(samp)
+            )
+            if action == "reuse":
+                completions = load_completions(path, train, int(samp["n"]))
+            else:
                 if generator is None:
                     from vfates.gen.factory import make_generator
 
@@ -147,8 +310,9 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                     chunk_prompts=int(samp.get("chunk_prompts", 64)),
                 )
                 seconds = time.perf_counter() - t0
-            else:
-                completions = load_completions(path, train, int(samp["n"]))
+                (cell_dir / "sampling.fingerprint").write_text(
+                    sampling_fingerprint(samp) + "\n", encoding="utf-8"
+                )
             graded = _cell_stats(task, problems, completions, seconds)
             stats = graded["stats"]
             timing_path = cell_dir / "timing.json"
@@ -158,10 +322,39 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                 )
             elif timing_path.exists():
                 stats["tokens_per_sec"] = read_json(timing_path)["tokens_per_sec"]
-            result, arm_rows = _calibrate(
-                task, train, completions, graded["parsed"], graded["O"], config
+            labels = graded["O"]
+            grade_rows = [
+                (completion.pid, int(completion.k), int(label), parsed.answer)
+                for completion, parsed, label in zip(
+                    completions, graded["parsed"], labels, strict=True
+                )
+            ]
+            fingerprint = calibration_fingerprint(config["arms"], grades=grade_rows)
+
+            def _fit(
+                task: Any = task,
+                train: list = train,
+                completions: list = completions,
+                parsed: list = graded["parsed"],
+                labels: np.ndarray = labels,
+                config: dict = config,
+            ) -> CalibrationResult:
+                return _fit_cell(task, train, completions, parsed, labels, config)
+
+            document, _refit = load_or_fit_calibration(cell_dir, fingerprint, _fit)
+            arm_rows = arm_table_rows(
+                document["report"]["arms"], int(np.sum(labels == 0)), int(np.sum(labels == 1))
             )
-            result.save(cell_dir / "calibration.json")
+            data = CalibrationData.from_grades(
+                train, completions, graded["parsed"], [int(o) for o in labels]
+            )
+            built = build_arms(document, task)
+            agreement = None
+            if "fn_form" in built and "natural_string_match" in built:
+                agreement = verdict_agreement(
+                    arm_verdicts(built["fn_form"], data),
+                    arm_verdicts(built["natural_string_match"], data),
+                )
             lo, hi = gates["acc_range"]
             feasible = (
                 lo <= stats["acc"] <= hi
@@ -179,6 +372,7 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                     "feasible": feasible,
                     **stats,
                     "arms": arm_rows,
+                    "string_match_form_agreement": agreement,
                 }
             )
             print(
@@ -255,7 +449,16 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                 f"{a['arm']} is capped by how often correct answers are non-canonical",
                 a["fnr"],
                 True,
-                metric=f"achieved FNR ({a['n_errors']} flagged); control matched to it",
+                metric=f"channel FNR ({a['n_errors']} flagged); control matched to it",
+                documented=True,
+            )
+        if chosen.get("string_match_form_agreement") is not None:
+            checks.add(
+                "P2.8",
+                f"agreement of natural_string_match with fn_form on {chosen['cell']}",
+                chosen["string_match_form_agreement"],
+                True,
+                metric="share of audit rows with equal verdicts",
                 documented=True,
             )
     sweep = markdown_table(
@@ -295,14 +498,28 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
             (
                 f"Arms on {c['cell']}",
                 markdown_table(
-                    ["arm", "type", "FPR", "FNR", "J", "precision", "flagged"],
+                    [
+                        "arm",
+                        "type",
+                        "ch FPR",
+                        "ch FNR",
+                        "ch J",
+                        "real FPR",
+                        "real FNR",
+                        "real J",
+                        "precision",
+                        "flagged",
+                    ],
                     [
                         [
                             a["arm"],
                             a["type"],
-                            a["fpr"],
-                            a["fnr"],
-                            a["J"],
+                            a["channel_fpr"],
+                            a["channel_fnr"],
+                            a["channel_J"],
+                            a["realised_fpr"],
+                            a["realised_fnr"],
+                            a["realised_J"],
                             a["precision"],
                             a["n_errors"],
                         ]
@@ -311,6 +528,42 @@ def run(config: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                 ),
             )
         )
+        diag = [a for a in c["arms"] if a["type"] in _DIAGNOSTIC_TYPES]
+        if diag:
+            sections.append(
+                (
+                    f"Phrase and decoy diagnostics on {c['cell']}",
+                    markdown_table(
+                        [
+                            "arm",
+                            "validated",
+                            "fell back",
+                            "fit rate",
+                            "lo",
+                            "hi",
+                            "unparsed FP",
+                            "length r",
+                            "early share",
+                            "n prompts",
+                        ],
+                        [
+                            [
+                                a["arm"],
+                                a["validated"],
+                                a["fell_back"],
+                                a["fit_rate"],
+                                a["lo"],
+                                a["hi"],
+                                a["unparsed_accepted_share"],
+                                a["length_point_biserial"],
+                                a["early_start_share"],
+                                a["n_prompts_with_phrase"],
+                            ]
+                            for a in diag
+                        ],
+                    ),
+                )
+            )
     study_model = selection.get("study_model")
     if study_model:
         study = by_model.get(study_model)

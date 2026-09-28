@@ -8,6 +8,8 @@ training starts.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -62,13 +64,20 @@ class Completion:
     n_tokens: int
     logprob: float | None = None
     finish_reason: str | None = None
+    token_ids: tuple[int, ...] | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        ids = data["token_ids"]
+        data["token_ids"] = None if ids is None else [int(token) for token in ids]
+        return data
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Completion:
-        return cls(**d)
+        raw = dict(d)
+        ids = raw.get("token_ids")
+        raw["token_ids"] = None if ids is None else tuple(int(token) for token in ids)
+        return cls(**raw)
 
 
 @dataclass(frozen=True)
@@ -145,8 +154,11 @@ class AuditTable:
         }
         for arm, v in self.V.items():
             arrays[f"V::{arm}"] = v.astype(np.int8)
-        np.savez_compressed(path, **cast(Any, arrays))
-        path.with_suffix(".meta.json").write_text(json.dumps(self.meta, indent=2, sort_keys=True))
+        _atomic_savez(path, arrays)
+        _atomic_text(
+            path.with_suffix(".meta.json"),
+            json.dumps(self.meta, indent=2, sort_keys=True),
+        )
 
     @classmethod
     def load(cls, path: str | Path) -> AuditTable:
@@ -170,3 +182,31 @@ class AuditTable:
             V=V,
             meta=meta,
         )
+
+
+def _atomic_text(path: Path, data: str) -> None:
+    """Write ``data`` via a temp file in the same directory, then ``os.replace``."""
+    _atomic_replace(path, lambda tmp: tmp.write_text(data, encoding="utf-8"))
+
+
+def _atomic_savez(path: Path, arrays: dict[str, np.ndarray]) -> None:
+    """Write a compressed npz via a temp file in the same directory, then ``os.replace``."""
+
+    def write(tmp: Path) -> None:
+        np.savez_compressed(tmp, **cast(Any, arrays))
+
+    _atomic_replace(path, write)
+
+
+def _atomic_replace(path: Path, write: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=path.suffix)
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        write(tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp.exists():
+            tmp.unlink()
+        raise

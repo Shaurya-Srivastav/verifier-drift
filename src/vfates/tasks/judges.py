@@ -31,8 +31,36 @@ DEFAULT_RUBRIC = (
     "as fulfilment. Answer with a single token: YES or NO."
 )
 
-_WORD = re.compile(r"[A-Za-z][A-Za-z'-]{1,}")
+_WORD = re.compile(r"[A-Za-z][A-Za-z'-]*")
 _YES_NO = re.compile(r"\b(YES|NO)\b", re.IGNORECASE)
+# Constraints whose compliant answer can be short or structured. Those rows are
+# judged on repetition and padding only. Content constraints keep the length
+# and comma-list rules.
+_FORMAT_CONSTRAINTS = frozenset(
+    {
+        "validate_json_format",
+        "validate_uppercase",
+        "validate_lowercase",
+        "validate_quotation",
+        "validate_no_commas",
+        "validate_choice",
+        "validate_end",
+        "validate_title",
+        "validate_highlighted_sections",
+        "validate_placeholders",
+        "validate_sections",
+        "verify_bullet_points",
+        "verify_paragraph_count",
+        "validate_paragraphs",
+        "validate_two_responses",
+        "validate_repeat_prompt",
+        "verify_postscript",
+        "validate_word_constraint",
+        "verify_sentence_constraint",
+        "verify_letter_frequency",
+        "validate_frequency_capital_words",
+    }
+)
 
 
 def format_judge_user(prompt: str, response: str) -> str:
@@ -41,11 +69,16 @@ def format_judge_user(prompt: str, response: str) -> str:
 
 
 def parse_yes_no(text: str) -> int | None:
-    """Map a judge reply to 1 (YES) or 0 (NO). None when neither token appears."""
-    match = _YES_NO.search(text or "")
-    if match is None:
+    """Map a judge reply to 1 (YES) or 0 (NO).
+
+    None unless the reply contains exactly one ``YES`` or ``NO`` token. A
+    sentence that also says the other token (``YES or NO``) is not a verdict.
+    One token inside a longer sentence still counts.
+    """
+    matches = list(_YES_NO.finditer(text or ""))
+    if len(matches) != 1:
         return None
-    return 1 if match.group(1).upper() == "YES" else 0
+    return 1 if matches[0].group(1).upper() == "YES" else 0
 
 
 class Judge(ABC):
@@ -54,8 +87,20 @@ class Judge(ABC):
     name: str = "judge"
 
     @abstractmethod
-    def judge(self, prompt: str, response: str) -> int:
-        """1 if ``response`` substantively fulfils ``prompt``, else 0."""
+    def judge(self, prompt: str, response: str, **context: Any) -> int:
+        """1 if ``response`` substantively fulfils ``prompt``, else 0.
+
+        ``context`` may carry ``func_name`` and ``checker_args`` from an IFEval
+        row. Judges that do not use them ignore the extra keywords.
+        """
+
+    def judge_result(self, prompt: str, response: str, **context: Any) -> tuple[int, bool]:
+        """``(verdict, parsed)``.
+
+        A heuristic verdict is always parsed. YES/NO judges score an unparsed
+        reply as 0 and report ``parsed=False``.
+        """
+        return int(self.judge(prompt, response, **context)), True
 
     def describe(self) -> dict[str, Any]:
         return {"name": self.name}
@@ -69,19 +114,23 @@ class HeuristicJudge(Judge):
     repeat a constraint keyword dozens of times.
 
     * **Content words** (``min_content_words``, default 12). Alphabetic words
-      (regex ``[A-Za-z][A-Za-z'-]{1,}``) must number at least this many.
-      Symbol padding and empty replies fail here.
+      (regex ``[A-Za-z][A-Za-z'-]*``, so a single letter counts) must number
+      at least this many. Symbol padding and empty replies fail here. Format
+      constraints and JSON documents skip this rule.
     * **Repetition** (``max_repeat_ratio``, default 0.4). On 16 or more
       whitespace tokens (lowercased, punctuation stripped): fail if the most
       common token's share exceeds ``max_repeat_ratio``, or if the type-token
-      ratio is strictly below ``1 - max_repeat_ratio``. The Tulu 3 loop
+      ratio is strictly below ``1 - max_repeat_ratio``. Tokens the checker
+      required to be repeated (``verify_keyword_frequency``'s ``word``, or
+      ``required_word``) are left out of this count. The Tulu 3 loop
       ``timberlike, unconnectedly Conversation N User :`` fails the type-token
       test (a handful of tokens recycled across the reply).
     * **Keyword density** (``max_keyword_density``, default 0.5). Split on
       commas. A shard is a segment with at most three alphabetic words and no
       ``.?!``. With at least four segments, fail when the shard fraction is
       strictly above ``max_keyword_density``. This catches a comma-separated
-      list of distinct keywords, which repetition statistics miss.
+      list of distinct keywords, which repetition statistics miss. Format
+      constraints and JSON documents skip this rule.
     * **Padding** (fixed). If the reply has at least 40 characters and fewer
       than 45% of them are alphanumeric, fail.
     """
@@ -112,19 +161,33 @@ class HeuristicJudge(Judge):
             "max_keyword_density": self.max_keyword_density,
         }
 
-    def judge(self, prompt: str, response: str) -> int:
+    def judge(self, prompt: str, response: str, **context: Any) -> int:
         # Stuffing is a property of the response. ``prompt`` is unused on purpose.
+        del prompt
         text = response or ""
-        words = _WORD.findall(text)
-        if len(words) < self.min_content_words:
+        func_name = context.get("func_name")
+        raw_args = context.get("checker_args")
+        args = raw_args if isinstance(raw_args, dict) else {}
+        required: set[str] = set()
+        explicit = context.get("required_word")
+        if isinstance(explicit, str) and explicit:
+            required.add(explicit)
+        if func_name == "verify_keyword_frequency":
+            word = args.get("word")
+            if isinstance(word, str) and word:
+                required.add(word)
+        format_row = (
+            isinstance(func_name, str) and func_name in _FORMAT_CONSTRAINTS
+        ) or _looks_like_json(text)
+        if not format_row and len(_WORD.findall(text)) < self.min_content_words:
             return 0
         if len(text) >= 40:
             alnum = sum(1 for ch in text if ch.isalnum())
             if alnum / len(text) < 0.45:
                 return 0
-        if _repetition(text, self.max_repeat_ratio):
+        if _repetition(text, self.max_repeat_ratio, ignore=required):
             return 0
-        if _keyword_stuffing(text, self.max_keyword_density):
+        if not format_row and _keyword_stuffing(text, self.max_keyword_density):
             return 0
         return 1
 
@@ -138,8 +201,23 @@ def _tokens(text: str) -> list[str]:
     ]
 
 
-def _repetition(text: str, max_repeat_ratio: float) -> bool:
+def _looks_like_json(text: str) -> bool:
+    """True when ``text`` is one JSON document. Length is not a stuffing signal."""
+    stripped = text.strip()
+    if not stripped or stripped[0] not in "{[":
+        return False
+    try:
+        json.loads(stripped)
+    except ValueError:
+        return False
+    return True
+
+
+def _repetition(text: str, max_repeat_ratio: float, ignore: set[str] | None = None) -> bool:
     tokens = _tokens(text)
+    if ignore:
+        skipped = {word.lower() for word in ignore}
+        tokens = [token for token in tokens if token not in skipped]
     if len(tokens) < 16:
         return False
     counts: dict[str, int] = {}
@@ -171,8 +249,9 @@ class LLMJudge(Judge):
     ``base_url`` defaults to ``VFATES_JUDGE_BASE_URL`` or
     ``https://api.openai.com/v1``. The API key is ``VFATES_JUDGE_API_KEY``
     unless passed in. Temperature is 0. Transport failures and unparseable
-    replies are retried with exponential backoff; a reply that never says
-    YES or NO scores 0.
+    replies are retried with exponential backoff. A reply that does not contain
+    exactly one YES or NO token scores 0. ``max_tokens`` defaults to 16 so a
+    chatty completion is out of scope.
     """
 
     def __init__(
@@ -185,9 +264,12 @@ class LLMJudge(Judge):
         max_retries: int = 3,
         backoff_s: float = 0.5,
         timeout_s: float = 60.0,
+        max_tokens: int = 16,
     ) -> None:
         if max_retries < 1:
             raise ValueError("max_retries must be positive")
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
         self.model = model
         self.base_url = base_url
         self._api_key = api_key
@@ -195,6 +277,7 @@ class LLMJudge(Judge):
         self.max_retries = int(max_retries)
         self.backoff_s = float(backoff_s)
         self.timeout_s = float(timeout_s)
+        self.max_tokens = int(max_tokens)
         self.name = f"llm:{model}"
 
     def describe(self) -> dict[str, Any]:
@@ -204,6 +287,8 @@ class LLMJudge(Judge):
             "base_url": self._resolved_base_url(),
             "max_retries": self.max_retries,
             "temperature": 0,
+            "max_tokens": self.max_tokens,
+            "rubric_sha256": sha256_text(self.rubric),
         }
 
     def _resolved_base_url(self) -> str:
@@ -219,11 +304,17 @@ class LLMJudge(Judge):
             )
         return key
 
-    def judge(self, prompt: str, response: str) -> int:
+    def complete(self, prompt: str, response: str) -> str:
+        """Raw assistant text. Empty when every attempt fails transport.
+
+        Retries stop early once the text contains exactly one YES or NO token.
+        The last unparsed reply is returned as-is.
+        """
         url = self._resolved_base_url() + "/chat/completions"
         body = {
             "model": self.model,
             "temperature": 0,
+            "max_tokens": self.max_tokens,
             "messages": [
                 {"role": "system", "content": self.rubric},
                 {"role": "user", "content": format_judge_user(prompt, response)},
@@ -239,10 +330,20 @@ class LLMJudge(Judge):
                 last_text = _post_chat(url, payload, key, self.timeout_s)
             except (urllib.error.URLError, TimeoutError, OSError):
                 continue
-            verdict = parse_yes_no(last_text)
-            if verdict is not None:
-                return verdict
-        return 0
+            if parse_yes_no(last_text) is not None:
+                return last_text
+        return last_text
+
+    def judge_result(self, prompt: str, response: str, **context: Any) -> tuple[int, bool]:
+        del context
+        verdict = parse_yes_no(self.complete(prompt, response))
+        if verdict is None:
+            return 0, False
+        return verdict, True
+
+    def judge(self, prompt: str, response: str, **context: Any) -> int:
+        verdict, _parsed = self.judge_result(prompt, response, **context)
+        return verdict
 
 
 def _post_chat(url: str, payload: bytes, api_key: str, timeout_s: float) -> str:
@@ -291,10 +392,12 @@ class LocalJudge(Judge):
             "name": self.name,
             "max_tokens": self.max_tokens,
             "temperature": 0,
+            "rubric_sha256": sha256_text(self.rubric),
             "generator": info,
         }
 
-    def judge(self, prompt: str, response: str) -> int:
+    def complete(self, prompt: str, response: str) -> str:
+        """Raw generator text. Empty when the generator returns no completion."""
         outs = self.generator.generate(
             [format_judge_user(prompt, response)],
             1,
@@ -305,9 +408,19 @@ class LocalJudge(Judge):
             system_prompt=self.rubric,
         )
         if not outs or not outs[0]:
-            return 0
-        verdict = parse_yes_no(outs[0][0].text)
-        return 0 if verdict is None else verdict
+            return ""
+        return str(outs[0][0].text)
+
+    def judge_result(self, prompt: str, response: str, **context: Any) -> tuple[int, bool]:
+        del context
+        verdict = parse_yes_no(self.complete(prompt, response))
+        if verdict is None:
+            return 0, False
+        return verdict, True
+
+    def judge(self, prompt: str, response: str, **context: Any) -> int:
+        verdict, _parsed = self.judge_result(prompt, response, **context)
+        return verdict
 
 
 class CachedJudge(Judge):
@@ -334,8 +447,8 @@ class CachedJudge(Judge):
     def _judge_id(self) -> str:
         return canonical_json({"name": self.inner.name, "describe": self.inner.describe()})
 
-    def _key(self, prompt: str, response: str) -> str:
-        return sha256_text(canonical_json([self._judge_id(), prompt, response]))
+    def _key(self, prompt: str, response: str, context: dict[str, Any]) -> str:
+        return sha256_text(canonical_json([self._judge_id(), prompt, response, context]))
 
     def _load(self) -> dict[str, int]:
         if not self.cache_path.exists():
@@ -345,13 +458,13 @@ class CachedJudge(Judge):
             loaded[str(row["key"])] = int(row["verdict"])
         return loaded
 
-    def judge(self, prompt: str, response: str) -> int:
-        key = self._key(prompt, response)
+    def judge(self, prompt: str, response: str, **context: Any) -> int:
+        key = self._key(prompt, response, context)
         with self._lock:
             cached = self._memory.get(key)
             if cached is not None:
                 return cached
-        verdict = int(self.inner.judge(prompt, response))
+        verdict = int(self.inner.judge(prompt, response, **context))
         with self._lock:
             # Another thread may have filled the key while we judged.
             if key not in self._memory:
