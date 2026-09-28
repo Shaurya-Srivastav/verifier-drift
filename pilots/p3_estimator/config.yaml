@@ -1,0 +1,49 @@
+# P3: the step-0 estimator on a real audit, and the lock P4 is scored against.
+# Mac Studio (MLX sampling, torch/MPS features). About an hour.
+#
+# The task cell is P2's recommendation for the pilot model (see
+# pilots/p2_base_audit/results/report.md); it is written out here, not read
+# from P2, so the configuration that was locked is the one on disk.
+
+audit:
+  task: {type: chain_sum, min_terms: 2, max_terms: 3, min_digits: 1, max_digits: 3,
+         min_decimal_places: 1, max_decimal_places: 2}
+  pools: {train: 256, heldout: 128, seed: 0}
+  generator:
+    backend: mlx
+    model_id: Qwen/Qwen2.5-0.5B-Instruct
+    kwargs: {completion_batch_size: 128, prefill_batch_size: 16}
+  # Large chunks keep the MLX batch full (short outputs finish unevenly); a
+  # chunk is also the resume granularity (~5 min).
+  sampling: {n: 16, max_tokens: 512, temperature: 1.0, top_p: 1.0, seed: 0, chunk_prompts: 128}
+  arms: {file: configs/arms/chain_sum.yaml, n_boot: 500, seed: 0}
+  features:
+    kind: lora_grad
+    model_id: Qwen/Qwen2.5-0.5B-Instruct
+    sketch_dim: 8192
+    lora_r: 16
+    lora_alpha: 32
+    lora_seed: 0
+    sketch_seed: 0
+    load: {dtype: float32}
+  forecast: {n_boot: 500, reliability_splits: 20, seed: 0}
+  lock: true
+
+# Pooled final-layer hidden states: the cheap feature map, for agreement only.
+hidden_features:
+  model_id: Qwen/Qwen2.5-0.5B-Instruct
+  load: {dtype: float32}
+
+fidelity:
+  n: 48          # exact LoRA-B gradients (4.4M dims each) on a random subsample
+
+probe:
+  folds: 5
+  lam: 1.0
+  max_rows: 5000
+
+gates:
+  reliability: 0.8      # split-half cosine of g_V across disjoint prompt halves
+  sketch_corr: 0.95     # corr of off-diagonal Gram entries, exact vs CountSketch
+  hash_auc_max: 0.60    # prompt-specific FP must not be decodable on unseen prompts
+  shared_auc_min: 0.65  # at least one shared FP must be

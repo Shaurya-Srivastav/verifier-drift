@@ -1,0 +1,88 @@
+# P0 theory pilot. Sizes, seeds, steps and gates live here so a rerun is a
+# config change rather than a code change.
+seed: 0
+workers: 8
+
+identity:
+  P: 24
+  tilt_t: [1.0, 5.0, 20.0]
+  tilt_tol: 1.0e-10
+  decomp_tol: 1.0e-10
+
+j_scale:
+  P: 200
+  rho0: 0.12
+  rho1: 0.18
+  n_draws: 200
+  cosine_min: 0.999
+  scale_tol: 0.02
+
+group_adv:
+  G: [4, 8, 16]
+  p: [0.2, 0.5]
+  J: [0.4, 0.9]
+  n_groups: 20000
+  se_mult: 4.0
+
+mode:
+  P: 60
+  arm: fpF
+  eta: 2.0
+  steps: 800
+  modal_tol: 0.03
+  tilt_horizon: 80.0
+  tilt_tol: 1.0e-6
+  # Finite-beta equilibria are tilts at t = 1/beta, not mean precision.
+  betas: [0.5, 0.1]
+  beta_eta: 1.5
+  # beta=0.1 is a slow Euclidean approach to the tilt at t=10. 1200 steps
+  # leaves a gap of about 0.05; 4000 steps is inside beta_tol.
+  beta_steps: 4000
+  beta_tol: 0.02
+
+grpo:
+  seeds: [0, 1, 2]
+  hand_P: 300
+  hand_held_P: 300
+  rf_P: 400
+  rf_held_P: 400
+  d: 64
+  steps: 800
+  batch: 64
+  G: 8
+  lr_shared: 1.0
+  lr_tab: 2.0
+  adv: std
+  beta: 0.0
+  eval_every: 800
+  subset_fraction: 0.57
+
+forecast:
+  n_samples: 16
+  reliability_splits: 10
+
+gates:
+  fate_gap: 0.5
+  fate_close: 0.05
+  tau_abs: 0.10
+  tau_frac: 0.90
+  spearman: 0.8
+  reliability: 0.9
+
+# Impure skill atom. impurity_amp is 0.99 rather than 1 so prompt noise makes
+# the top-velocity output unique; at amplitude 1 the correct and impure atoms
+# tie and pi0-weighted tau is ~0.98, which still predicts success and still
+# collapses. These values land near the published (Prec0, J, tau) ≈ (0.56, 0.86, 0.75).
+knife:
+  seeds: [0, 1, 2]
+  P: 400
+  m_c: 0.15
+  m_h: 0.12
+  impurity_ratio: 0.02
+  impurity_amp: 0.99
+  exploit_amp: 1.10
+  noise: 0.008
+  d: 2
+  eta: 8.0
+  dt: 0.05
+  steps: 1600

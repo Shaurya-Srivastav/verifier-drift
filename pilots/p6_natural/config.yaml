@@ -1,0 +1,45 @@
+# P6 step-0 screen. Samples are the base policy on the training split only.
+seed: 0
+backend: mlx
+
+mbpp:
+  model: Qwen/Qwen2.5-Coder-1.5B-Instruct
+  # Default MLX batches (completion 128) abort with a Metal OOM on a 36 GB M4 Max.
+  generator_kwargs:
+    completion_batch_size: 8
+    prefill_batch_size: 4
+    max_sequences_per_call: 16
+  n_problems: 64
+  samples: 8
+  max_tokens: 512
+  temperature: 1.0
+  top_p: 1.0
+  heldout_fraction: 0.33
+  # Flat per-test limit. EvalPlus's floor is 4s; reference times sit under it.
+  per_test_timeout_s: 4.0
+  verifier_k: null
+  visible_only: false
+
+ifeval:
+  model: Qwen/Qwen2.5-1.5B-Instruct
+  generator_kwargs:
+    completion_batch_size: 8
+    prefill_batch_size: 4
+    max_sequences_per_call: 16
+  n_problems: 64
+  samples: 8
+  max_tokens: 384
+  temperature: 1.0
+  top_p: 1.0
+  heldout_fraction: 0.33
+  min_content_words: 12
+  max_repeat_ratio: 0.4
+  max_keyword_density: 0.5
+  # Set above 0 to score that many responses with LocalJudge at temperature 0.
+  local_judge_samples: 0
+
+gates:
+  # Share of base-test passes that fail the MBPP+ oracle.
+  mbpp_fp_share_among_accepted: 0.05
+  ifeval_checker_pass_min: 0.2
+  ifeval_checker_pass_max: 0.95

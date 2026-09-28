@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite both the software and the accompanying
+  paper (preferred-citation).
+type: software
+title: "vfates: Same Rate, Different Fates"
+abstract: >-
+  Step-zero screen for when verifier errors transfer in RL with verifiable
+  rewards. At matched false-positive and false-negative rates, resampled noise,
+  prompt-specific errors, and errors carried by a shared behaviour lead to
+  different held-out outcomes. Transfer precision, estimated before training,
+  predicts which.
+authors:
+  - family-names: Srivastav
+    given-names: Shaurya
+    email: ssrivastav@ucdavis.edu
+    affiliation: University of California, Davis
+repository-code: "https://github.com/Shaurya-Srivastav/verifier-drift"
+url: "https://github.com/Shaurya-Srivastav/verifier-drift"
+license: MIT
+version: 0.1.0
+keywords:
+  - reinforcement-learning
+  - RLVR
+  - GRPO
+  - verifiers
+  - reward-hacking
+preferred-citation:
+  type: unpublished
+  title: "Same Rate, Different Fates: A Step-Zero Screen for When Verifier Errors Transfer in RL"
+  authors:
+    - family-names: Srivastav
+      given-names: Shaurya
+      email: ssrivastav@ucdavis.edu
+      affiliation: University of California, Davis
+  year: 2026
+  notes: "Manuscript prepared for submission to ICML 2027."

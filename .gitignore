@@ -1,23 +1,51 @@
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+*.egg
 *.egg-info/
 .eggs/
 build/
 dist/
 .venv/
 venv/
+.python-version
 
-# Caches / tooling
+# Caches and tooling
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.ipynb_checkpoints/
 .DS_Store
 
-# Outputs / artifacts
-results/
+# Training outputs. Pilot reports are the exception below.
+runs/
+checkpoints/
+wandb/
 *.log
 *.pt
 *.safetensors
-wandb/
-checkpoints/
+
+# Pilot outputs stay local except the public record: every pilot's report,
+# the P5 gate report, and each audit's calibration, forecasts and lock (the
+# preregistered forecasts that training is scored against).
+pilots/*/results/**
+!pilots/*/results/
+!pilots/*/results/report.md
+!pilots/*/results/report.json
+!pilots/*/results/gate/
+!pilots/*/results/gate/report.md
+!pilots/*/results/gate/report.json
+!pilots/*/results/audit/
+!pilots/*/results/audit/calibration.json
+!pilots/*/results/audit/forecasts.json
+!pilots/*/results/audit/lock.json
+
+# Private chat exports. Do not match a home-directory cache; this is in-repo only.
+cursor_*.md

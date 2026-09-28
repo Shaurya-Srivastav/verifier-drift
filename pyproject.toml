@@ -1,20 +1,81 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "verifier-drift"
-version = "0.0.1"
-description = "Does a fixed verifier's error drift under RLVR and bias GRPO training?"
+name = "vfates"
+version = "0.1.0"
+description = "Same Rate, Different Fates: a step-zero screen for when imperfect-verifier errors transfer in RL with verifiable rewards."
 readme = "README.md"
-requires-python = ">=3.9"
-license = { text = "MIT" }
-dependencies = []  # analysis core is stdlib-only
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Shaurya Srivastav" }]
+keywords = ["reinforcement learning", "RLVR", "GRPO", "verifiers", "reward hacking", "LLM"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "numpy>=1.26",
+  "pyyaml>=6.0",
+]
 
 [project.optional-dependencies]
-oracle = ["sympy>=1.12"]
-train = ["torch>=2.2", "transformers>=4.44", "trl>=0.11", "datasets>=2.20", "sympy>=1.12", "numpy>=1.26"]
-dev = ["pytest>=8.0"]
+# Task generation and graders.
+tasks = ["reasoning-gym>=0.1.19", "sympy>=1.12", "datasets>=2.20"]
+# PyTorch path: hidden-state / LoRA-gradient features and the TRL trainer (MPS or CUDA).
+torch = ["torch>=2.3", "transformers>=4.46", "peft>=0.13", "accelerate>=0.34", "safetensors>=0.4"]
+# Apple-silicon path: MLX generation and the MLX GRPO trainer.
+mlx = ["mlx>=0.26; sys_platform == 'darwin' and platform_machine == 'arm64'",
+       "mlx-lm>=0.28; sys_platform == 'darwin' and platform_machine == 'arm64'"]
+# Rented-GPU production path (Linux + CUDA).
+gpu = ["trl>=0.25,<0.26", "vllm>=0.8; sys_platform == 'linux'"]
+analysis = ["matplotlib>=3.8", "pandas>=2.0", "scipy>=1.11"]
+dev = ["pytest>=8.0", "pytest-timeout>=2.3", "ruff>=0.6", "mypy>=1.10"]
+all = ["vfates[tasks,torch,mlx,analysis,dev]"]
+
+[project.scripts]
+vfates = "vfates.cli:main"
+
+[project.urls]
+Repository = "https://github.com/Shaurya-Srivastav/verifier-drift"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+vfates = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -ra --strict-markers"
+markers = [
+  "slow: long-running tests (deselect with -m 'not slow')",
+  "mlx: requires Apple-silicon MLX",
+  "torch: requires PyTorch",
+  "network: requires internet access (model or dataset download)",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests", "pilots"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "NPY", "SIM", "RUF"]
+# E741: `O` (oracle) and `V` (verifier) are the paper's notation and are kept as names.
+ignore = ["E501", "E741", "RUF001", "RUF002", "RUF003", "B905"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+no_implicit_optional = true

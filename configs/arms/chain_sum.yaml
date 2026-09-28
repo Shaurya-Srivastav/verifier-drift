@@ -1,0 +1,105 @@
+# Step-0 arms for experiment E1 (decimal chain sum).
+# Every imperfect arm is calibrated on the base model's own step-0 samples of
+# the frozen training pool to the shared targets below (matched Youden J).
+# Thresholds, tolerances and phrases are NOT stored here: calibrate_arms fits
+# them. Salts are fixed constants, chosen before seeing the audit.
+
+targets:
+  fpr: 0.15
+  fnr: 0.30
+
+arms:
+  # Clean reward. FPR = FNR = 0. The direction the other arms are compared to.
+  - name: oracle
+    type: oracle
+
+  # Prompt-specific false positives. A wrong canonical answer is accepted when
+  # u01(salt, pid, answer) < threshold, so identical answers on one prompt
+  # share a verdict and there is no feature shared across prompts.
+  - name: fp_hash
+    type: hash_fp
+    salt: chain_sum/fp_hash
+
+  # Shared false positives from sloppy or rounded arithmetic: accept a wrong
+  # answer when |value - gold| <= tol. The same numeric behavior applies on
+  # every prompt.
+  - name: fp_tolerance
+    type: tolerance_fp
+
+  # Shared false positives from a trigger phrase in the response (Egashira-style).
+  # The phrase is chosen so its pooled FPR on wrong rows matches the target,
+  # preferring phrases with non-positive oracle-conditional advantage
+  # P(O=1 | phrase) - P(O=1) (not enriched for correct answers).
+  - name: fp_trigger
+    type: trigger_fp
+    prefer: nonpositive_advantage
+    tolerance: 0.02
+    ngram_range: [1, 3]
+    min_chars: 4
+
+  # Resampled class-conditional noise matched to fp_tolerance's achieved
+  # pooled (FPR, FNR). Same rates, independent draw per completion: the
+  # control for "the rate, without the shared arithmetic feature". Like
+  # fp_tolerance and fp_hash it only accepts wrong outputs that state an
+  # answer, so the contrast is not confounded by answer formatting.
+  - name: noise_fp
+    type: resampled
+    match: fp_tolerance
+    support: answered
+    seed: 0
+
+  # Shared false negatives from a surface form the oracle still marks correct
+  # (a string-match bug: "12.5" versus gold "12.500"). The candidate whose
+  # FNR on correct rows is closest to the target is kept. A form rule fires
+  # only as often as the policy writes non-canonical answers (4-8% of correct
+  # answers for Qwen2.5-0.5B in P2), so this arm is capped below the target and
+  # is compared at its achieved rate against noise_fn_form.
+  - name: fn_form
+    type: form_fn
+    candidates:
+      - raw_differs_from_gold_string
+      - fewer_decimal_places_than_gold
+      - has_thousands_separator
+      - has_leading_plus
+      - not_plain_decimal
+
+  # Shared false negatives from a behavior phrase on correct responses.
+  # Prefer positive accuracy lift P(O=1 | b) - P(O=1 | not b): rejecting the
+  # phrase taxes a behavior that predicts correctness (a conformance tax).
+  - name: fn_behavior
+    type: behavior_fn
+    prefer: positive_lift
+    tolerance: 0.03
+    ngram_range: [1, 3]
+    min_chars: 4
+
+  # Prompt-specific false negatives. Every correct answer is rejected on
+  # prompts with u01(salt, pid) < fraction. No shared response feature.
+  - name: fn_prompt_subset
+    type: prompt_subset_fn
+    salt: chain_sum/fn_prompt_subset
+
+  # Resampled noise matched to fn_behavior's achieved pooled rates: the
+  # control for the shared FN behavior at the shared target.
+  - name: noise_fn
+    type: resampled
+    match: fn_behavior
+    seed: 0
+
+  # Resampled noise matched to the capped fn_form's achieved pooled rates.
+  - name: noise_fn_form
+    type: resampled
+    match: fn_form
+    seed: 0
+
+  # Oracle plus the fitted form FN and the fitted hash FP. On this composition
+  # the pooled FNR is the form rule's and the pooled FPR is the hash rule's.
+  - name: combo_fnform_fphash
+    type: composite
+    fn: [fn_form]
+    fp: [fp_hash]
+
+  # Natural verifier: stripped boxed text equals the gold string. It ignores
+  # the oracle, so a numerically correct "12.5" is rejected when gold is "12.500".
+  - name: natural_string_match
+    type: string_match

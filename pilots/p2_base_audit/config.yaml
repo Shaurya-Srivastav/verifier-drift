@@ -1,0 +1,84 @@
+# P2: base audit and difficulty sweep (Mac Studio, MLX generation).
+# One cell per (model, difficulty). Arms are fitted on each cell's own
+# train-pool samples to the shared targets in configs/arms/chain_sum.yaml.
+
+task:
+  type: chain_sum
+
+difficulties:
+  # Egashira et al. (arXiv:2605.02909): the configuration of the H100 study.
+  - name: egashira
+    overrides: {}
+  - name: medium
+    overrides: {min_terms: 2, max_terms: 4, min_digits: 2, max_digits: 4,
+                min_decimal_places: 2, max_decimal_places: 4}
+  - name: easy
+    overrides: {min_terms: 2, max_terms: 3, min_digits: 1, max_digits: 3,
+                min_decimal_places: 1, max_decimal_places: 2}
+
+models:
+  - name: qwen2.5-0.5b
+    model_id: Qwen/Qwen2.5-0.5B-Instruct
+    backend: mlx
+    kwargs: {completion_batch_size: 128, prefill_batch_size: 16}
+  - name: qwen2.5-1.5b
+    model_id: Qwen/Qwen2.5-1.5B-Instruct
+    backend: mlx
+    kwargs: {completion_batch_size: 128, prefill_batch_size: 16}
+  # The study model at the E1 token budget. At 512 tokens it truncates 13-15%
+  # of outputs on the in-band cells, so 512 cannot judge the E1 configuration.
+  - name: qwen2.5-1.5b-1024
+    model_id: Qwen/Qwen2.5-1.5B-Instruct
+    backend: mlx
+    kwargs: {completion_batch_size: 128, prefill_batch_size: 16}
+    sampling: {max_tokens: 1024}
+    difficulties: [egashira, medium]
+
+pools:
+  train: 128
+
+sampling:
+  n: 8
+  max_tokens: 512
+  temperature: 1.0
+  seed: 0
+  chunk_prompts: 64
+
+arms:
+  targets: {fpr: 0.15, fnr: 0.30}
+  n_boot: 200
+  seed: 0
+  # Same arm list as configs/arms/chain_sum.yaml (kept inline so the pilot is self-contained).
+  arms:
+    - {name: oracle, type: oracle}
+    - {name: fp_hash, type: hash_fp, salt: chain_sum/fp_hash}
+    - {name: fp_tolerance, type: tolerance_fp}
+    - {name: fp_trigger, type: trigger_fp, prefer: nonpositive_advantage, tolerance: 0.02,
+       ngram_range: [1, 3], min_chars: 4}
+    - {name: noise_fp, type: resampled, match: fp_tolerance, support: answered, seed: 0}
+    - {name: fn_form, type: form_fn, candidates: [raw_differs_from_gold_string,
+       fewer_decimal_places_than_gold, has_thousands_separator, has_leading_plus,
+       not_plain_decimal]}
+    - {name: fn_behavior, type: behavior_fn, prefer: positive_lift, tolerance: 0.03,
+       ngram_range: [1, 3], min_chars: 4}
+    - {name: fn_prompt_subset, type: prompt_subset_fn, salt: chain_sum/fn_prompt_subset}
+    - {name: noise_fn, type: resampled, match: fn_behavior, seed: 0}
+    - {name: noise_fn_form, type: resampled, match: fn_form, seed: 0}
+    - {name: natural_string_match, type: string_match}
+
+selection:
+  # GRPO needs mixed groups: at acc p a group of 8 is all-wrong with prob (1-p)^8.
+  # 0.3 leaves 6% uninformative groups and 70 points of headroom.
+  target_acc: 0.30
+  pilot_model: qwen2.5-0.5b     # the Mac pilots (P3, P4)
+  study_model: qwen2.5-1.5b-1024  # the H100 gate (P5) and E1, at their token budget
+
+gates:
+  acc_range: [0.15, 0.50]
+  # Unboxed outputs are wrong for every arm; noise_fp only draws on answered
+  # wrong outputs (support: answered), so formatting does not confound the FP
+  # contrast. The first sweep found 0.66-0.80 boxed for 0.5B (see README).
+  boxed_rate_min: 0.75
+  trunc_rate_max: 0.05
+  calibration_tol: 0.03
+  min_errors: 30

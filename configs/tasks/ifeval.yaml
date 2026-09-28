@@ -1,0 +1,15 @@
+# allenai/RLVR-IFeval. Natural verifier: the constraint checker.
+# Oracle: checker and a content judge (heuristic by default).
+name: ifeval
+dataset: allenai/RLVR-IFeval
+heldout_fraction: 0.33
+seed: 0
+n: null
+judge:
+  name: heuristic
+  min_content_words: 12
+  max_repeat_ratio: 0.4
+  max_keyword_density: 0.5
+verifier:
+  kind: natural
+  name: ifeval_checker

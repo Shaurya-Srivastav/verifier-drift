@@ -1,0 +1,86 @@
+# E1, confirmatory: decimal chain sum, Qwen2.5-1.5B-Instruct, 12 arms x 3 seeds.
+# Run after the P5 gate passes, on H100s:
+#   vfates study --config configs/experiments/e1_chain_sum.yaml --out runs/e1
+# The audit is locked before the first training step; PREREGISTRATION.md fixes
+# the endpoint, estimator and analysis. Every stage resumes.
+title: E1 decimal chain sum (confirmatory)
+
+audit:
+  task: {type: chain_sum}                     # Egashira et al. configuration
+  pools: {train: 1024, heldout: 384, seed: 0}
+  generator:
+    backend: vllm
+    model_id: Qwen/Qwen2.5-1.5B-Instruct
+    kwargs: {gpu_memory_utilization: 0.85, seed: 0, max_model_len: 2048}
+  sampling: {n: 16, max_tokens: 1024, temperature: 1.0, top_p: 1.0, seed: 0, chunk_prompts: 256}
+  arms: {file: configs/arms/chain_sum.yaml, n_boot: 1000, seed: 0}
+  features:
+    kind: lora_grad
+    model_id: Qwen/Qwen2.5-1.5B-Instruct
+    sketch_dim: 8192
+    lora_r: 16
+    lora_alpha: 32
+    lora_seed: 0
+    sketch_seed: 0
+    load: {dtype: float32, device: cuda}
+  forecast: {n_boot: 1000, reliability_splits: 20, seed: 0}
+  lock: true
+
+study:
+  backend: trl
+  seeds: [0, 1, 2]
+  arms: [oracle, fp_hash, fp_tolerance, fp_trigger, noise_fp, fn_form, noise_fn_form,
+         fn_behavior, fn_prompt_subset, noise_fn, combo_fnform_fphash, natural_string_match]
+  families:
+    - {control: noise_fp, kind: fp, shared: [fp_tolerance, fp_trigger], local: [fp_hash]}
+    - {control: noise_fn, kind: fn, shared: [fn_behavior], local: [fn_prompt_subset]}
+    - {control: noise_fn_form, kind: fn, shared: [fn_form]}
+  eval_generator:
+    backend: vllm
+    kwargs: {gpu_memory_utilization: 0.85, seed: 0, max_model_len: 2048}
+  train:
+    model_id: Qwen/Qwen2.5-1.5B-Instruct
+    steps: 300
+    prompts_per_step: 64
+    group_size: 8
+    max_tokens: 1024
+    temperature: 1.0
+    lr: 2.0e-5
+    warmup_steps: 10
+    beta_kl: 0.0
+    loss_agg: seq_mean
+    adv_mode: std
+    num_iterations: 1
+    grad_clip: 1.0
+    micro_batch_size: 32
+    gradient_checkpointing: true
+    data_regime: multi_epoch
+    eval_every: 25
+    save_every: 25
+    eval_heldout_n: 384
+    eval_train_n: 128
+    eval_samples_per_prompt: 4
+    eval_temperature: 1.0
+    use_vllm: true
+    vllm_mode: colocate
+    vllm_gpu_memory_utilization: 0.35
+    lora: {rank: 16, alpha: 32, dropout: 0.0, keys: [q, k, v, o, gate, up, down], num_layers: -1}
+  n_boot: 10000
+  gates:
+    alpha: 0.05
+    holm: true                # Holm-Bonferroni within H1 and within H2
+    oracle_gain: 0.10
+    fate_gap: 0.05
+    local_tol: 0.05
+    local_equivalence: true   # TOST: 90% interval inside +/- local_tol
+    spearman: 0.6
+    min_arms_for_rank_gate: 6
+  cost_model:
+    steps: 300
+    prompts_per_step: 64
+    group_size: 8
+    mean_completion_len: 350
+    runs: 36
+    h100_gen_tok_s: 10000
+    h100_train_tok_s: 30000
+    usd_per_h100_hour: 2.5

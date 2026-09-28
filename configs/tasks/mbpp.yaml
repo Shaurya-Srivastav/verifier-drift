@@ -1,0 +1,12 @@
+# MBPP+ (EvalPlus v0.2.0). Oracle: base and plus tests.
+# Natural verifier: the original MBPP asserts, optionally the first k.
+name: mbpp_plus
+heldout_fraction: 0.33
+seed: 0
+n: null
+per_test_timeout_s: 4.0
+verifier:
+  kind: natural
+  name: mbpp_base_tests
+  k: null
+  visible_only: false

@@ -1,0 +1,19 @@
+# Reasoning Gym decimal_chain_sum at the Egashira et al. (arXiv:2605.02909)
+# configuration. Gold answers are quantized to max_decimal_places, so a value
+# of 12.5 is emitted as "12.500". Held-out problems use
+# seed + heldout_seed_offset and are never used to fit a verifier.
+type: chain_sum
+name: decimal_chain_sum
+min_terms: 3
+max_terms: 6
+min_digits: 3
+max_digits: 6
+min_decimal_places: 3
+max_decimal_places: 6
+allow_negation: false
+instruction: "Please reason step by step, and put your final answer within \\boxed{}."
+heldout_seed_offset: 10000000
+pools:
+  train: 1024
+  heldout: 512
+  seed: 0
