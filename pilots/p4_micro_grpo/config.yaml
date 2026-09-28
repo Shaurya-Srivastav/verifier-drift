@@ -3,6 +3,10 @@
 # About 110 minutes per arm at 512 tokens; runs are resumable.
 
 audit_dir: pilots/p3_estimator/results/audit
+# Train on the first 256 of P3's 1,024 train prompts: 150 steps x 8 prompts
+# stay about 4.7 epochs, the regime P4.1's 0.10 gain was set for. The locked
+# forecasts use the whole audit pool.
+max_train: 256
 backend: mlx
 seeds: [0]
 n_boot: 2000

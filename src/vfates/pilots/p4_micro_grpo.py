@@ -6,8 +6,9 @@ scores the P3 lock. This pilot does not carry the E1 confirmatory rules.
 The go decision is P4.1 alone: the setup has signal. The fate contrasts are
 documented, because a pilot decides feasibility and not the confirmatory
 question. With one seed and 128 held-out prompts the P4.2 hit rule has power
-about 0.40 at a true gap of 0.05 and reaches 80% only near 0.078 (R4), so
-gating the study on it would mostly stop real effects of the size E1 tests.
+0.50 at a true gap of 0.05 and about 0.75 at 0.069, E1's 80% detectable gap
+(R4 model, :mod:`vfates.analysis.power`), so gating the study on it would stop
+about one real effect in four.
 
 * P4.1: the oracle arm's held-out gain clears the threshold. The only gate.
 * P4.2: a shared arm ends below its control by at least ``fate_gap``, with a

@@ -218,7 +218,7 @@ The pilots decide feasibility, not the confirmatory question. E1 starts only aft
 - P4.1 passes: on the Mac micro-GRPO pilot, the oracle arm raises held-out accuracy by at least 0.10.
 - The full P5 gate on one H100 shows an oracle held-out gain of at least 0.10 on the development pool: 512 train prompts at dataset seed 50,000,000 and 384 held-out prompts at 60,000,000, disjoint from E1 at the question level.
 
-The pilots' decodability probes and fate contrasts (P3.5, P3.6, P4.2 to P4.7, and P5's contrasts) are logged and do not decide whether E1 runs. With one seed and 128 held-out prompts, P4's hit rule (a shared arm at least 0.05 below its control with p < 0.05) has power of about 0.40 at a true gap of 0.05, so gating E1 on it would mostly stop the effects E1 is built to detect. P5 also fixes the E1 seed count by the rule above, and replaces the projected H100 cost with a measured cost per arm-seed.
+The pilots' decodability probes and fate contrasts (P3.5, P3.6, P4.2 to P4.7, and P5's contrasts) are logged and do not decide whether E1 runs. With one seed and 128 held-out prompts, P4's hit rule (a shared arm at least 0.05 below its control with p < 0.05) has power of about 0.75 at 0.069, E1's 80% detectable gap at its 0.05 margin (normal model in `vfates.analysis.power`), so gating E1 on it would stop about one real effect in four. P5 also fixes the E1 seed count by the rule above, and replaces the projected H100 cost with a measured cost per arm-seed.
 
 `pilots/README.md` has the order and the commands.
 

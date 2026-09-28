@@ -9,8 +9,8 @@
 audit:
   task: {type: chain_sum, min_terms: 2, max_terms: 3, min_digits: 1, max_digits: 3,
          min_decimal_places: 1, max_decimal_places: 2}
-  # E1's pool shape. At 256 train prompts the split-half cosine of g_V was 0.59
-  # to 0.80 across arms (gate 0.8), almost all of it within-prompt sampling
+  # E1's pool counts. At 256 train prompts the split-half cosine of g_V was 0.587
+  # to 0.796 across arms (gate 0.8), almost all of it within-prompt sampling
   # noise; P3.10 put the pool each arm needs at 281 to 719 prompts.
   pools: {train: 1024, heldout: 384, seed: 0}
   generator:
